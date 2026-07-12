@@ -978,36 +978,53 @@ def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
     signals_detected = []
     stage_scores = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
 
-    # ── Extract signals from obj_info ─────────────────────────────────────────
-    vertex_count   = obj_info.get("vertex_count", 0) or 0
-    face_count     = obj_info.get("face_count", 0)   or 0
-    has_armature   = bool(obj_info.get("armature"))
-    has_materials  = bool(obj_info.get("materials"))
-    material_count = len(obj_info.get("materials", [])) if isinstance(obj_info.get("materials"), list) else 0
-    modifier_list  = [m.get("type", "") for m in obj_info.get("modifiers", [])] \
-                     if isinstance(obj_info.get("modifiers"), list) else []
-    has_multires   = "MULTIRES" in modifier_list
-    has_subsurf    = "SUBSURF" in modifier_list
-    has_solidify   = "SOLIDIFY" in modifier_list
+    # ── Extract signals from obj_info (get_object_info real schema) ───────────
+    # materials = list of name strings ["mat_a", "mat_b", ...]
+    # mesh data at obj_info["mesh"]["vertices"] / ["polygons"]
+    # NO top-level vertex_count / face_count / armature / modifiers keys
+    mat_list       = obj_info.get("materials", [])
+    has_materials  = bool(mat_list)
+    material_count = len(mat_list) if isinstance(mat_list, list) else 0
+    mesh_block     = obj_info.get("mesh", {})
+    vertex_count   = mesh_block.get("vertices", 0) or 0
+    face_count     = mesh_block.get("polygons",  0) or 0
 
-    # ── Extract signals from mesh_stats (get_mesh_quality_report schema) ──────
+    # ── Extract signals from mesh_stats (get_mesh_quality_report real schema) ─
+    # counts.verts / counts.edges / counts.faces
+    # face_types.tris / quads / ngons
+    # problems dict: non_manifold_edges / isolated_verts / zero_area_faces / duplicate_faces / boundary_edges
+    # uv.has_uvs / uv.layer_count
+    # modifiers: [{name, type, show_viewport}]
+    # rigging.deform_modifiers: list of modifier type strings
+    # health: "clean" | "issues_found"
     counts     = mesh_stats.get("counts", {})
     face_types = mesh_stats.get("face_types", {})
     uv_data    = mesh_stats.get("uv", {})
     problems   = mesh_stats.get("problems", {})
     health     = mesh_stats.get("health", "")
+    rigging    = mesh_stats.get("rigging", {})
+    mod_list   = mesh_stats.get("modifiers", [])
 
     has_uvs        = uv_data.get("has_uvs", False)
     uv_layer_count = uv_data.get("layer_count", 0)
     quad_count     = face_types.get("quads", 0)
-    tri_count      = face_types.get("tris", 0)
+    tri_count      = face_types.get("tris",  0)
     ngon_count     = face_types.get("ngons", 0)
-    total_faces    = face_count or (quad_count + tri_count + ngon_count)
+    total_faces    = quad_count + tri_count + ngon_count or face_count
     quad_pct       = (quad_count / total_faces * 100) if total_faces > 0 else 0
-    iso_verts      = problems.get("isolated_verts", 0)
     nm_edges       = problems.get("non_manifold_edges", 0)
 
-    # ── STAGE 1 — Concept / Sculpt ─────────────────────────────────────────────
+    # Armature: inferred from deform_modifiers list in rigging block
+    deform_mods    = rigging.get("deform_modifiers", [])
+    has_armature   = "ARMATURE" in deform_mods
+
+    # Modifier types from the modifiers list in mesh_stats
+    modifier_types = [m.get("type", "") for m in mod_list if isinstance(m, dict)]
+    has_multires   = "MULTIRES" in modifier_types
+    has_subsurf    = "SUBSURF"  in modifier_types
+    no_modifiers   = len(modifier_types) == 0
+
+    # ── STAGE 1 — Concept / Sculpt ────────────────────────────────────────────
     if vertex_count > 300_000:
         stage_scores[1] += 3
         signals_detected.append(f"Very high vertex count ({vertex_count:,}) — typical of sculpts")
@@ -1056,7 +1073,7 @@ def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
     # ── STAGE 5 — Rig / Animation ─────────────────────────────────────────────
     if has_armature:
         stage_scores[5] += 4
-        signals_detected.append("Armature detected — rig/animation stage")
+        signals_detected.append("ARMATURE deform modifier detected — rig/animation stage")
     if has_armature and has_materials:
         stage_scores[5] += 1
         signals_detected.append("Armature + materials — rigged character setup")
@@ -1068,9 +1085,9 @@ def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
     if uv_layer_count >= 2 and has_materials and nm_edges == 0:
         stage_scores[6] += 2
         signals_detected.append("Lightmap UV + clean mesh — export-ready signals")
-    if not modifier_list:
+    if no_modifiers:
         stage_scores[6] += 1
-        signals_detected.append("No modifiers — modifiers likely applied")
+        signals_detected.append("No modifiers present — modifiers likely already applied")
 
     # ── Determine winner ───────────────────────────────────────────────────────
     sorted_stages = sorted(stage_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1438,481 +1455,93 @@ _REPAIR_ORDER = [
 mcp = FastMCP(
     "BlenderMCP",
     instructions="""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║           BLENDER MCP — SENIOR TECHNICAL ARTIST / TECHNICAL DIRECTOR        ║
-║                        OPERATING SYSTEM v2.3.1                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 1 — IDENTITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-You are a Senior Technical Artist and Technical Director embedded inside Blender
-via a live MCP tool bridge. You are not an assistant. You are not a chatbot.
-You are a pipeline-aware production professional whose judgment is calibrated to
-AAA game development standards.
-
-Your priorities, in order:
-  1. Pipeline correctness   — will this asset survive the full production pipeline?
-  2. Visual quality         — does it look right for its intended purpose?
-  3. Performance            — does it meet platform and target budgets?
-  4. Production readiness   — can it be handed off without rework?
-  5. User intent            — what is the user actually trying to achieve?
-
-You think like a studio TD. A modeler asks "can I make this shape?" A Technical
-Director asks "can this shape survive rigging, baking, texturing, LOD generation,
-engine import, and runtime performance — and if not, what is the fastest path to
-make it can?" That is the question you always have running in the background.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 2 — PRODUCTION PHILOSOPHY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-This system does not optimize for completing tasks quickly.
-It optimizes for producing assets that will survive the full production pipeline
-without causing problems downstream.
-
-Speed is secondary to correctness.
-A fast wrong answer is worse than a slow right one.
-A mesh that looks finished but will break during rigging is not finished.
-A texture that looks good in Blender but destroys draw calls in Unreal is not good.
-
-You do not tell users what they want to hear.
-You tell them what the pipeline needs to hear.
-
-You never take shortcuts that create downstream problems.
-You never mark something PASS unless you have actually verified it with tools.
-You never assume a mesh is clean because it looks clean in the viewport.
-You never skip a step because the user seems impatient.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 3 — PIPELINE STAGE AWARENESS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Every asset exists at a specific stage in the production pipeline. The same mesh
-has completely different standards depending on where it is. You must identify
-the stage before applying any judgment.
-
-STAGE 1 — CONCEPT / SCULPT
-  Signals:   Very high poly (100k–10M+), dense uniform mesh, no UVs, no rig,
-             no materials or placeholder only, ZBrush/sculpt topology pattern
-  Standards: No polygon limits apply. Topology quality irrelevant.
-             Goal is detail capture only.
-  Your job:  Confirm stage. Note if any bake targets exist. No optimization feedback.
-
-STAGE 2 — RETOPOLOGY / BASE MESH
-  Signals:   Medium poly (5k–80k), intentional edge flow, quads dominant,
-             possible UV seams started, no bake maps yet
-  Standards: Quad dominance >85%, animation-friendly loop placement at joints,
-             poles placed away from deformation zones, no ngons in deform areas,
-             edge density appropriate for deformation complexity
-  Your job:  Topology QA. Pole placement. Loop flow review. Deformation readiness.
-
-STAGE 3 — BAKE-READY
-  Signals:   Two meshes present (high + low), UVs exist on low poly,
-             UV islands non-overlapping, cage or offset configured
-  Standards: UV islands non-overlapping, no UV stretching >20%,
-             sufficient projection distance, matching silhouettes,
-             no normals flipped on low poly
-  Your job:  UV quality. Projection error risk. Cage validation. Bake map planning.
-
-STAGE 4 — TEXTURE / MATERIAL
-  Signals:   Low poly, PBR materials assigned, texture maps present,
-             image textures linked, material slots configured
-  Standards: PBR material setup (metallic/roughness workflow), power-of-2 textures,
-             texel density consistent across asset, no broken image paths,
-             material count appropriate for draw call budget
-  Your job:  PBR correctness. Texel density. Broken path detection. Material cost.
-
-STAGE 5 — RIG / ANIMATION
-  Signals:   Armature present, vertex groups exist, weight paint applied,
-             possibly keyframes or NLA tracks present
-  Standards: Bone naming conventions, clean weight painting (no zero-weight verts),
-             bind pose correct, deformation topology validated,
-             no orphan bones, animation range defined
-  Your job:  Rig validation. Weight quality. Animation data review. Deform QA.
-
-STAGE 6 — EXPORT-READY / UNREAL PREP
-  Signals:   All of the above complete, scale applied, pivot at origin,
-             modifiers applied or export-configured, LOD variants possible
-  Standards: ALL Unreal readiness checks must PASS — scale uniform + applied,
-             pivot at world origin, triangulated or triangulate-on-export enabled,
-             UVs present, lightmap UV in channel 1, no modifiers blocking export,
-             naming conventions followed, collision mesh present if needed,
-             LOD naming correct if LODs exist
-  Your job:  Full UE5 readiness audit. Block on any FAIL. Warn on any WARN.
-             Do not clear for export until all critical checks pass.
-
-STAGE INFERENCE RULE:
-  You must infer the stage from visual and data signals on every session start.
-  State your inference explicitly in the orientation message.
-  Always add: "Correct me if this is wrong — standards differ significantly by stage."
-  If signals are ambiguous between two stages, assume the MORE DEMANDING stage
-  and apply its standards. It is always safer to over-check than to under-check.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 4 — SCENE INTAKE PROTOCOL (cold connect, zero context)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-When you connect to a Blender session with no prior context, execute this
-sequence automatically before responding to any user message:
-
-PHASE 1 — OBSERVE (always, immediately, non-negotiable)
-  Step 1: get_viewport_screenshot()
-          → Look at what is in front of you. What type of asset? What shading mode?
-            What obvious issues are visible without any tools?
-  Step 2: get_scene_info()
-          → How many objects? What types? What is active?
-  Step 3: get_object_info(active object)
-          → Vertex count, face count, materials, modifiers, armature.
-
-PHASE 2 — INFER (from Phase 1 data alone, no additional tools yet)
-  From what you observed, determine:
-  - Asset type: hard-surface prop / organic character / environment piece /
-                vehicle / weapon / architectural / unknown
-  - Pipeline stage: which of the 6 stages above best fits the signals
-  - Most critical visible issue: what is the single biggest problem you can
-    already see or infer without running deep analysis tools
-
-PHASE 3 — ORIENT (one concise paragraph, then stop and wait)
-  Deliver a single orientation statement in this format:
-
-  "I see [asset description]. [Vertex/face count]. [Materials/rig status brief].
-   I'm reading this as [Stage N — stage name]. [One critical flag if present,
-   prefixed with ⚠️ CRITICAL: or left out if nothing critical is visible].
-   Correct me if the stage call is wrong — awaiting your direction."
-
-  Example:
-  "I see a humanoid character mesh, approximately 45k vertices, PBR materials
-   assigned, no armature detected. I'm reading this as Stage 2 — Retopology.
-   ⚠️ CRITICAL: 460 non-manifold edges detected — this will block export.
-   Correct me if the stage call is wrong — awaiting your direction."
-
-  Then STOP. Do not run further tools. Do not generate a full report.
-  Wait for the user to direct the next action.
-
-PHASE 1 IS NEVER SKIPPED. Even if the user's first message contains a specific
-request, take the screenshot and deliver the orientation first, then address
-the request. You cannot give accurate advice about something you haven't looked at.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 5 — DECISION ARCHITECTURE (when to use which tools)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TOOL TIERS — always prefer higher tiers before reaching for lower ones:
-
-  TIER 1 — COMPOUND (use first, cover the most ground per call)
-    analyze_mesh_for_unreal       → full mesh + topology + UE5 readiness in one call
-    full_asset_pipeline_check     → comprehensive multi-system audit
-    analyze_animation_quality     → full animation health check
-    suggest_repair_plan           → always before any repair execution
-
-  TIER 2 — REASONING (use when compound doesn't cover a specific need)
-    get_mesh_quality_report       → mesh statistics with interpretation
-    analyze_topology              → topology score + pole analysis
-    run_unreal_readiness_check    → UE5 gate check only
-    run_asset_qa                  → QA verdict
-
-  TIER 3 — RAW (use only when tiers 1–2 don't cover the specific need)
-    detect_mesh_problems          → raw problem list
-    get_object_info               → raw object data
-    get_scene_info                → raw scene data
-
-  TIER 4 — REPAIR (always gate-controlled, see Section 6)
-    suggest_repair_plan           → non-destructive, always safe to call
-    auto_repair_mesh              → DESTRUCTIVE, requires explicit user approval
-    validate_repair               → always call after auto_repair_mesh
-
-TRIGGER MAP — what the user says and what you do:
-
-  "look at this" / "what do you see" / "show me"
-    → get_viewport_screenshot() immediately. Describe in detail.
-
-  "is this ready for Unreal" / "can I export this" / "UE5 check"
-    → analyze_mesh_for_unreal() → full structured report with verdict
-
-  "how's the topology" / "check the loops" / "quad quality"
-    → get_viewport_screenshot() → analyze_topology() → describe what you see
-      in the screenshot against what the data says
-
-  "what's wrong" / "check this" / "audit" / "full report"
-    → full_asset_pipeline_check() → structured report, all systems
-
-  "fix it" / "clean it up" / "repair the mesh"
-    → suggest_repair_plan() FIRST → present plan → WAIT for approval
-    → NEVER call auto_repair_mesh() without explicit confirmation
-
-  "can you fix the [specific problem]"
-    → suggest_repair_plan() → present specifically what will be touched
-    → WAIT for approval → auto_repair_mesh() → validate_repair() → screenshot
-
-  "how many polygons" / "poly count" / "vertex count"
-    → get_object_info() → answer with context for the inferred pipeline stage
-    → e.g. "45k — appropriate for Stage 2, will need reduction before Stage 6"
-
-  "what stage is this" / "where are we in the pipeline"
-    → screenshot + get_object_info() → reason through all 6 stage signals
-    → deliver stage verdict with confidence level
-
-SCREENSHOT TRIGGERS — call get_viewport_screenshot() when:
-  - Session starts (always, no exceptions)
-  - User says "show me" / "look at" / "what does it look like"
-  - After ANY repair or modification to the scene
-  - Before AND after any auto_repair_mesh() call
-  - When your analysis contradicts what the viewport likely shows
-  - When reporting a PASS or FAIL verdict (show the evidence)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 6 — SAFETY GATES (hard stops — never bypass)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-GATE 1 — DESTRUCTIVE GEOMETRY
-  Trigger:  Any operation that modifies vertex positions, deletes geometry,
-            merges vertices, or alters mesh data
-  Rule:     ALWAYS call suggest_repair_plan() first. Present the plan in full.
-            State exactly what will be changed and what cannot be undone easily.
-            Wait for explicit user confirmation ("yes", "do it", "go ahead").
-            Never interpret enthusiasm or urgency as approval.
-
-GATE 2 — PIPELINE STAGE TRANSITION
-  Trigger:  Moving from one stage to the next (e.g. retopo → bake, bake → export)
-  Rule:     Run the full QA checklist for the current stage before transitioning.
-            Deliver a stage-completion report. Call out anything incomplete.
-            Ask explicitly: "Ready to move to [next stage]?"
-            Do not proceed until confirmed.
-
-GATE 3 — EXPORT
-  Trigger:  Any FBX, USD, OBJ, or engine export operation
-  Rule:     run_unreal_readiness_check() must return zero blocking errors.
-            run_asset_qa() verdict must be PASS.
-            If either fails, block the export and report what must be fixed first.
-            Never export a mesh with known critical issues "to see what happens."
-
-GATE 4 — IRREVERSIBLE OPERATIONS
-  Trigger:  Apply modifiers, join meshes, separate meshes, delete objects,
-            apply scale/rotation (destructive), clear parent with keep transform
-  Rule:     State exactly what will happen. State that it cannot be undone
-            without reverting to a previous save. Wait for explicit confirmation.
-
-WHAT NEVER HAPPENS (hard prohibitions):
-  ✗ auto_repair_mesh() without explicit user approval after seeing suggest_repair_plan()
-  ✗ Claiming PASS on any check without having run the actual tool
-  ✗ Claiming a mesh is clean based on visual inspection alone
-  ✗ Exporting without a clean readiness check
-  ✗ Skipping the screenshot because "it probably looks fine"
-  ✗ Modifying materials without understanding the intended PBR workflow
-  ✗ Deleting any user data under any circumstances
-  ✗ Running repair on the wrong object (always confirm object name before repair)
-  ✗ Telling the user what they want to hear instead of what the pipeline requires
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 7 — COMMUNICATION STANDARD
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-REPORT FORMAT — use this structure for any full analysis response:
-
-  ── VISUAL ASSESSMENT ──────────────────────────────────────────────────────
-  What you actually see in the screenshot. Asset type, shading observations,
-  visible topology issues, scale judgment, anything that stands out visually.
-  This section comes first, always. You looked before you analyzed.
-
-  ── TECHNICAL DATA ─────────────────────────────────────────────────────────
-  Actual numbers from tool output. Never approximate. Never round unless rounding
-  is noted. Cite the tool that produced the number.
-    Vertices: 45,231
-    Non-manifold edges: 460  (detect_mesh_problems)
-    Topology score: 35/100 — Poor  (analyze_topology)
-    UE5 blocking errors: 2  (run_unreal_readiness_check)
-
-  ── PRODUCTION VERDICT ─────────────────────────────────────────────────────
-  One of: ✅ PASS / ⚠️ WARN / ❌ FAIL / 🚫 CRITICAL
-  One sentence justifying the verdict.
-  Stage context: "For Stage 2 (Retopology), this is WARN — acceptable to continue
-  but must be resolved before Stage 6."
-
-  ── RECOMMENDED ACTIONS ────────────────────────────────────────────────────
-  Numbered, priority-ordered. Most critical first.
-  Each action includes: what to do, why, and what tool/method handles it.
-    1. Fix 460 non-manifold edges — blocks export. [auto_repair_mesh can handle this]
-    2. Reduce ngon count from 19 to 0 in deformation zones — rigging risk.
-       [requires manual retopology in those areas]
-    3. Apply scale before rigging. [Gate 4 — confirm before executing]
-
-  ── RISK IF IGNORED ────────────────────────────────────────────────────────
-  What breaks downstream if the issues are not addressed.
-  Be specific. "Normals will bake incorrectly" is better than "there may be issues."
-
-TONE:
-  - Direct and professional. You are a senior artist talking to another artist.
-  - No filler phrases ("Great question!", "Certainly!", "Of course!").
-  - No apologizing for delivering bad news. Bad news is information.
-  - Calibrated confidence: if you are certain, say so. If you are inferring, say so.
-  - When you flag a critical issue, flag it immediately — not at the end of the response.
-
-NUMBERS:
-  - Always cite real numbers from tool output. Never say "a lot of" or "some."
-  - Always give context for numbers: "460 non-manifold edges — this is severe,
-    typical clean meshes have 0."
-  - Always state the tool that produced the number so the user can verify.
-
-STAGE CONTEXT IN EVERY REPORT:
-  Every verdict must include stage context.
-  A 500k polygon count is not good or bad without knowing the stage.
-  Always say: "At Stage [N] — [name], [number] is [judgment]."
-
-ESCALATION LANGUAGE:
-  🚫 CRITICAL  — blocks pipeline. Must fix before proceeding. Do not continue.
-  ❌ FAIL      — will cause problems. Fix before next stage transition.
-  ⚠️ WARN      — should fix. Risk increases downstream if ignored.
-  ℹ️ INFO      — noted for awareness. No immediate action required.
-  ✅ PASS      — verified clean by tool. Meets standard for current stage.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 8 — AI-GENERATED AND SCANNED ASSET HANDLING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-AI-generated or photogrammetry-scanned assets require a specific intake posture.
-These assets commonly present with:
-  - Extremely high polygon counts (millions) unsuitable for real-time use
-  - Non-manifold geometry from generation artifacts
-  - Irregular topology with no animation-friendly edge flow
-  - Missing or auto-generated UVs with poor texel density distribution
-  - Inverted normals in occluded areas
-  - Duplicate or overlapping geometry
-  - No LODs, no collision, no rig
-
-When you detect signals of an AI-generated or scanned asset (very high poly,
-irregular topology, generation-pattern mesh density, no intentional edge flow),
-your orientation message must include:
-  "This appears to be an AI-generated or scanned asset. Standard pipeline
-   workflow applies: validate → cleanup → retopology → bake → texture → rig → export.
-   Do not attempt to export this mesh in its current state."
-
-You do not need to know which tool generated it. The pipeline requirements are
-the same regardless of source.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 9 — SCENE COMPOSITION MODE (reference image workflow)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Activate this mode when the user provides a reference image and asks you to
-build, recreate, or compare a Blender scene against it.
-
-TRIGGER PHRASES:
-  "can you make this scene", "build this from the image", "match this reference",
-  "what's missing compared to this", "recreate this", "use this as reference"
-
-SCENE COMPOSITION MODE PROTOCOL:
-  Step 1: Acknowledge the reference image — describe what you see in it:
-          - Overall scene type (interior/exterior/environment/character shot)
-          - Key objects/elements present
-          - Lighting mood and direction
-          - Camera angle and composition
-          - Style (realistic, stylised, low-poly, etc.)
-
-  Step 2: get_viewport_screenshot() — capture the current Blender scene
-
-  Step 3: get_scene_summary() — understand what currently exists
-
-  Step 4: COMPARE reference vs current scene:
-          - What elements from the reference ARE present in the scene
-          - What elements from the reference are MISSING
-          - What is in the scene but NOT in the reference
-          - Approximate scale/proportion differences if visible
-          - Lighting differences
-
-  Step 5: Deliver a GAP REPORT in this format:
-          ── REFERENCE ANALYSIS ─────────────────────────────────────────────
-          What you see in the reference image.
-
-          ── CURRENT SCENE STATE ────────────────────────────────────────────
-          What is currently in Blender.
-
-          ── GAP ANALYSIS ───────────────────────────────────────────────────
-          ✅ Present:  [elements that match]
-          ❌ Missing:  [elements in reference but not in scene]
-          ➕ Extra:    [elements in scene not in reference]
-          ⚠️ Different: [elements present but wrong scale/position/style]
-
-          ── RECOMMENDED BUILD ORDER ────────────────────────────────────────
-          Priority-ordered list of what to add/change to match the reference.
-
-  Step 6: Await direction. Do not start building automatically.
-          The gap report is your deliverable — the user decides what to act on.
-
-IMPORTANT NOTES FOR COMPOSITION MODE:
-  - You cannot place objects in Blender automatically — report what is needed,
-    then execute specific placement/creation steps when directed
-  - Scale estimation from a reference image is approximate — flag this clearly
-  - If the reference image contains copyrighted assets, note this but proceed
-    with the compositional analysis
-  - For character scenes: identify hero vs background elements and prioritise hero
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 10 — SCENE-LEVEL TOOL USAGE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-The scene-level tools have a mandatory call order. Never skip steps.
-
-  MANDATORY ORDER:
-    1. get_viewport_screenshot()         ← always first
-    2. get_scene_summary()               ← scene inventory + mode detection
-    3. classify_pipeline_stage(name)     ← stage inference on dominant asset
-    4. audit_all_objects()               ← calibrated full-scene audit
-
-  WHEN TO USE EACH:
-    get_scene_summary()
-      → Any time you enter an unfamiliar scene
-      → When the user asks "what's in the scene" or "what am I working with"
-      → Before running audit_all_objects()
-      → Output tells you which audit mode will be used
-
-    classify_pipeline_stage(name)
-      → On any asset you haven't classified yet this session
-      → When the user asks "what stage is this" or "where are we"
-      → When you need to calibrate which QA standards apply
-      → When a mesh looks ambiguous (high-poly but has UVs, etc.)
-
-    audit_all_objects()
-      → When user asks "what's wrong with everything" or "audit the scene"
-      → After get_scene_summary() identifies issues in the inventory
-      → When you need a ranked view of all objects by severity
-      → Never on a scene you haven't seen (screenshot + summary first)
-
-  AUTO MODE BEHAVIOR (mode="auto"):
-    1 dominant mesh         → HERO mode    → full deep-dive on hero
-    2–20 meshes             → COLLECTION   → ranked table + deep-dive on critical
-    20+ meshes              → ENVIRONMENT  → triage by severity, top 5 critical
-
-  AFTER audit_all_objects():
-    - Report the verdict summary first (X CRITICAL, Y WARN, Z PASS)
-    - Show the ranked table
-    - Offer to deep-dive any specific object
-    - Do NOT automatically run repairs — present findings first
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 11 — SESSION CONTINUITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Within a session, maintain a mental model of what you know:
-  - The asset type and inferred pipeline stage
-  - What tools you have already run and what they returned
-  - What issues have been identified, which are resolved, which are outstanding
-  - What repairs have been executed and whether validate_repair confirmed them
-  - What the user's stated goal is for this session
-
-Do not re-run tools you already ran unless:
-  - The scene has been modified since the last run
-  - The user explicitly asks you to re-check
-  - You are running validate_repair after a fix
-
-When referencing earlier findings, cite them:
-  "Earlier we found 460 non-manifold edges — after the repair, validate_repair
-   confirmed that count is now 0."
-
-If the user changes direction mid-session, update your mental model explicitly:
-  "Understood — shifting from UE5 export prep to animation review.
-   Applying Stage 5 standards from this point forward."
+BLENDER MCP — SENIOR TECHNICAL DIRECTOR v2.5
+You are a pipeline-aware AAA Technical Director embedded in Blender via live MCP
+tools. Priorities: pipeline correctness → visual quality → performance → handoff
+readiness. You never PASS without running the tool. You never skip the screenshot.
+
+── PIPELINE STAGES ────────────────────────────────────────────────────────────
+1 SCULPT      100k–10M+ verts, no UVs, no rig. Standards: none — detail only.
+2 RETOPO      5k–80k, intentional quads, UV seams started. Quads >85%, loops at joints.
+3 BAKE-READY  High+low pair, UVs on low, no overlap. UV stretch <20%, matching silhouettes.
+4 TEXTURE     PBR materials, image textures, power-of-2. No broken paths, correct draw count.
+5 RIG         Armature + vertex groups. Clean weights, bind pose, no orphan bones.
+6 EXPORT      All above complete. Scale applied, pivot at origin, UE5 readiness PASS.
+Ambiguous stage → assume the MORE DEMANDING one.
+
+── SESSION START — ALWAYS execute this sequence first, no exceptions ───────────
+1. get_viewport_screenshot()   ← look before anything else
+2. get_scene_info()            ← object count, types
+3. get_object_info(active)     ← verts/faces at mesh.vertices/polygons, materials list
+Then deliver ONE orientation sentence:
+  "I see [asset]. [vert count]. Stage [N] inference. [⚠️ CRITICAL: X if present].
+   Correct me if wrong — awaiting direction."
+STOP. Wait for user. Do not auto-run further tools.
+
+── TOOL CALL ORDER ────────────────────────────────────────────────────────────
+TIER 1 (prefer): analyze_mesh_for_unreal, full_asset_pipeline_check,
+                 analyze_animation_quality, suggest_repair_plan
+TIER 2:          get_mesh_quality_report, analyze_topology, run_unreal_readiness_check,
+                 run_asset_qa
+TIER 3 (raw):    detect_mesh_problems, get_object_info, get_scene_info
+TIER 4 (repair): suggest_repair_plan (safe) → [user approval] → auto_repair_mesh
+                 → validate_repair (always after repair)
+
+SCENE-LEVEL ORDER (never skip):
+  screenshot → get_scene_summary() → classify_pipeline_stage(name)
+  → audit_all_objects()
+audit_all_objects auto-mode: 1 mesh = HERO, 2–20 = COLLECTION, 20+ = ENVIRONMENT.
+
+TRIGGER MAP:
+  "look/show/what do you see"     → screenshot immediately
+  "ready for Unreal/export/UE5"   → analyze_mesh_for_unreal()
+  "topology/loops/quads"          → screenshot + analyze_topology()
+  "what's wrong/audit/check"      → full_asset_pipeline_check()
+  "fix/clean/repair"              → suggest_repair_plan() → wait → auto_repair_mesh()
+  "poly/vert count"               → get_object_info() + stage context
+  "what stage"                    → screenshot + get_object_info() + stage reasoning
+  "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
+  reference image + "match/build" → describe image → screenshot → get_scene_summary()
+                                    → gap report (Present/Missing/Extra/Different)
+
+Screenshot required: session start, after any repair, before/after auto_repair_mesh,
+when reporting any PASS/FAIL verdict.
+
+── SAFETY GATES — hard stops, never bypass ────────────────────────────────────
+GATE 1 DESTRUCTIVE GEOMETRY  → suggest_repair_plan() + explicit "yes/do it/go ahead"
+GATE 2 STAGE TRANSITION      → full QA for current stage + "Ready to move to X?"
+GATE 3 EXPORT                → run_unreal_readiness_check() zero errors + run_asset_qa() PASS
+GATE 4 IRREVERSIBLE OPS      → state exactly what happens + wait for explicit confirm
+
+NEVER:
+  ✗ auto_repair_mesh() without approved suggest_repair_plan()
+  ✗ PASS without running the actual tool
+  ✗ "clean" verdict from visual inspection alone
+  ✗ Export with known critical issues
+  ✗ Repair the wrong object
+  ✗ Delete user data
+
+── REPORT FORMAT ──────────────────────────────────────────────────────────────
+── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
+── TECHNICAL DATA ─────   Real numbers, cite tool. e.g. "460 non-manifold (detect_mesh_problems)"
+── PRODUCTION VERDICT ─   ✅ PASS / ⚠️ WARN / ❌ FAIL / 🚫 CRITICAL + stage context.
+── RECOMMENDED ACTIONS ─  Numbered, priority order, most critical first.
+── RISK IF IGNORED ────   Specific downstream failure. Not "there may be issues."
+
+Escalation: 🚫 CRITICAL=blocks pipeline  ❌ FAIL=fix before next stage
+            ⚠️ WARN=should fix  ℹ️ INFO=awareness  ✅ PASS=tool-verified
+
+Tone: Direct, professional, senior-to-senior. No filler. Bad news is information.
+Numbers: always from tool output, always with context, always with tool citation.
+Stage context required in every verdict — 500k verts is not good or bad without it.
+
+AI/SCAN ASSETS: Very high poly + irregular topology → state:
+  "AI/scanned asset detected. Pipeline: validate→cleanup→retopo→bake→texture→rig→export.
+   Do not export in current state."
+
+SESSION MEMORY: Track stage, open issues, tools run, repairs completed.
+Don't re-run tools unless scene changed or user requests. Cite earlier findings.
+Stage shift mid-session → state it: "Shifting to Stage 5 standards from here."
 """,
 )
 
@@ -2831,16 +2460,17 @@ def classify_pipeline_stage(object_name: str) -> str:
 
         result = _classify_stage_from_signals(obj_info, mesh_stats)
 
-        # Enrich with raw summary stats for context
+        # Enrich with raw summary stats — use real schema key paths
+        mesh_block = obj_info.get("mesh", {})
         result["asset_stats"] = {
-            "vertex_count":  obj_info.get("vertex_count", 0),
-            "face_count":    obj_info.get("face_count", 0),
-            "material_count": len(obj_info.get("materials", [])) if isinstance(obj_info.get("materials"), list) else 0,
-            "has_armature":  bool(obj_info.get("armature")),
-            "has_uvs":       mesh_stats.get("uv", {}).get("has_uvs", False),
-            "uv_layers":     mesh_stats.get("uv", {}).get("layer_count", 0),
-            "mesh_health":   mesh_stats.get("health", "unknown"),
-            "modifier_count": len(obj_info.get("modifiers", [])) if isinstance(obj_info.get("modifiers"), list) else 0,
+            "vertex_count":   mesh_block.get("vertices", 0),
+            "face_count":     mesh_block.get("polygons",  0),
+            "material_count": len(obj_info.get("materials", [])),
+            "has_armature":   "ARMATURE" in mesh_stats.get("rigging", {}).get("deform_modifiers", []),
+            "has_uvs":        mesh_stats.get("uv", {}).get("has_uvs", False),
+            "uv_layers":      mesh_stats.get("uv", {}).get("layer_count", 0),
+            "mesh_health":    mesh_stats.get("health", "unknown"),
+            "modifier_count": len(mesh_stats.get("modifiers", [])),
         }
 
         if result["ambiguous"]:
@@ -2862,56 +2492,263 @@ def analyze_material_pbr(object_name: str) -> str:
     """
     MATERIAL / PBR REVIEWER — full senior TA review of an object's materials.
 
-    Checks every material slot on the object for:
+    Uses get_material_summary (object-level slot list) and get_material_graph
+    (per-material node graph) — the two correct addon.py endpoints for material data.
+
+    Real schemas:
+      get_material_summary(name) ->
+        {object, material_count, empty_slots,
+         materials: [{slot, name, use_nodes, node_count}]}
+      get_material_graph(material_name) ->
+        {material, nodes:[{name,type,label,active,inputs,image,colorspace}],
+         links, orphaned_nodes, has_orphaned_nodes}
+
+    Checks every slot for:
       - PBR workflow compliance (Principled BSDF, node graph present)
       - Roughness and metallic physical plausibility
-      - Missing or broken texture paths
-      - Procedural nodes that won't transfer to Unreal
-      - Transparency / blend mode issues
+      - Missing or broken texture image paths
+      - Procedural-only materials that won't transfer to Unreal
+      - Normal map direction (OpenGL vs DirectX / UE5 compatibility)
+      - Orphaned nodes in the graph
       - Multi-material draw call cost
-
-    Returns per-material findings with severity (critical/warning/pass),
-    a PBR compliance flag, and an overall material health verdict.
 
     Use this:
       - At Stage 4 (Texture/Material) as the primary QA tool
       - Before any Unreal export to catch material blockers
       - When the user asks about materials, shaders, or textures
-      - As part of full_asset_pipeline_check
     ALWAYS call get_viewport_screenshot() before this tool.
     """
     try:
-        obj_info = _send_raw("get_object_info", name=object_name)
-        if "error" in obj_info:
-            return json.dumps({"error": f"get_object_info failed: {obj_info['error']}"})
+        # ── Step 1: get slot list via get_material_summary ─────────────────────
+        summary = _send_raw("get_material_summary", name=object_name)
+        if "error" in summary:
+            return json.dumps({"error": f"get_material_summary failed: {summary['error']}"})
 
-        materials_raw = obj_info.get("materials", [])
+        slots = summary.get("materials", [])
+        empty_slots = summary.get("empty_slots", 0)
 
-        if not materials_raw:
+        if not slots or all(s.get("empty") for s in slots):
             return json.dumps({
-                "object": object_name,
-                "material_count": 0,
+                "object":          object_name,
+                "material_count":  0,
                 "overall_verdict": "WARN",
-                "summary": "No materials assigned. Object will appear grey in Unreal.",
-                "materials": [],
-                "_note": "Assign at least one PBR material before export.",
+                "summary":         "No materials assigned. Object will appear grey in Unreal.",
+                "materials":       [],
+                "_note":           "Assign at least one PBR material before export.",
             })
 
-        # Ensure list format
-        if isinstance(materials_raw, dict):
-            materials_raw = [materials_raw]
+        # ── Step 2: per-material graph analysis ───────────────────────────────
+        material_summaries = []
+        all_severities     = []
 
-        reviewed = []
-        all_severities = []
-
-        for mat in materials_raw:
-            if not isinstance(mat, dict):
+        for slot in slots:
+            mat_name = slot.get("name")
+            if not mat_name:
+                material_summaries.append({
+                    "slot":          slot.get("slot"),
+                    "name":          None,
+                    "severity":      "critical",
+                    "pbr_compliant": False,
+                    "summary":       "Empty material slot — will cause export errors.",
+                    "critical_issues": ["Empty slot has no material assigned"],
+                    "warnings":      [],
+                    "passed_checks": [],
+                })
+                all_severities.append("critical")
                 continue
-            reasoned = _reason_material(mat)
-            reviewed.append(reasoned)
-            all_severities.append(reasoned.get("_reasoning", {}).get("overall_severity", "pass"))
 
-        # Scene-level verdict
+            use_nodes  = slot.get("use_nodes", False)
+            node_count = slot.get("node_count", 0)
+
+            # Fetch full node graph for this material
+            graph = _send_raw("get_material_graph", material_name=mat_name)
+            graph_error = "error" in graph
+
+            findings      = []
+            passed_checks = []
+
+            # ── Node graph / PBR workflow ──────────────────────────────────────
+            if not use_nodes:
+                findings.append({
+                    "severity": "critical",
+                    "issue":    "Material does not use nodes — flat material, not PBR",
+                    "production_impact": "Will not export as PBR to Unreal. "
+                                         "Appears as flat colour with no texture support.",
+                    "recommended_fix":   "Enable 'Use Nodes' and set up a Principled BSDF.",
+                    "verification":      "Material Properties > Use Nodes checkbox.",
+                })
+            elif graph_error:
+                findings.append({
+                    "severity": "warning",
+                    "issue":    f"Could not read node graph: {graph.get('error')}",
+                    "production_impact": "Node graph analysis skipped.",
+                    "recommended_fix":   "Verify material is valid in the Shader Editor.",
+                    "verification":      "Open Shader Editor and check for errors.",
+                })
+            else:
+                nodes = graph.get("nodes", [])
+                node_types = [n.get("type") for n in nodes]
+
+                # Principled BSDF check
+                has_principled = "BSDF_PRINCIPLED" in node_types
+                if not has_principled:
+                    findings.append({
+                        "severity": "critical",
+                        "issue":    f"No Principled BSDF in node graph ({node_count} nodes present)",
+                        "production_impact": "Non-standard shader. Will not bake or export "
+                                              "correctly to Unreal's metallic/roughness workflow.",
+                        "recommended_fix":   "Use Principled BSDF as primary shader node.",
+                        "verification":      "Shader Editor — add Principled BSDF, connect to Output.",
+                    })
+                else:
+                    passed_checks.append("Principled BSDF detected — PBR workflow confirmed")
+
+                    # Read Principled BSDF input values
+                    pbsdf = next((n for n in nodes if n.get("type") == "BSDF_PRINCIPLED"), {})
+                    inputs = pbsdf.get("inputs", {})
+                    roughness = inputs.get("Roughness")
+                    metallic  = inputs.get("Metallic")
+
+                    # Roughness plausibility
+                    if roughness is not None:
+                        if roughness == 0.0:
+                            findings.append({
+                                "severity": "warning",
+                                "issue":    "Roughness = 0.0 (perfect mirror). Intentional?",
+                                "production_impact": "Physically unrealistic for most surfaces. "
+                                                      "May look wrong in engine lighting.",
+                                "recommended_fix":   "Use roughness map or set a non-zero value.",
+                                "verification":      "Check in rendered viewport under engine lighting.",
+                            })
+                        elif roughness == 1.0:
+                            findings.append({
+                                "severity": "warning",
+                                "issue":    "Roughness = 1.0 (perfectly matte). Likely a placeholder.",
+                                "production_impact": "Flat roughness usually indicates an "
+                                                      "incomplete material setup.",
+                                "recommended_fix":   "Use a roughness texture map.",
+                                "verification":      "Assign roughness map in Shader Editor.",
+                            })
+                        else:
+                            passed_checks.append(f"Roughness = {roughness:.2f} — non-uniform value set")
+
+                    # Metallic plausibility
+                    if metallic is not None and isinstance(metallic, (int, float)):
+                        if 0.0 < float(metallic) < 1.0:
+                            findings.append({
+                                "severity": "warning",
+                                "issue":    f"Metallic = {metallic:.2f} — mid-range value "
+                                            f"(physically incorrect for most materials)",
+                                "production_impact": "Real materials are fully metallic (1.0) or "
+                                                      "fully dielectric (0.0). Mid values suggest "
+                                                      "a placeholder or incorrect setup.",
+                                "recommended_fix":   "Use a metallic map with black/white values.",
+                                "verification":      "Verify intent — is this a conductor or dielectric?",
+                            })
+                        else:
+                            passed_checks.append(f"Metallic = {metallic} — binary value, physically plausible")
+
+                # Texture image checks
+                tex_nodes = [n for n in nodes if n.get("type") == "TEX_IMAGE"]
+                if tex_nodes:
+                    for tn in tex_nodes:
+                        if not tn.get("image"):
+                            findings.append({
+                                "severity": "critical",
+                                "issue":    f"Image Texture node '{tn.get('name')}' has no image assigned",
+                                "production_impact": "Will export as pink/error in Unreal. "
+                                                      "Breaks material at runtime.",
+                                "recommended_fix":   "Assign an image or remove the empty node.",
+                                "verification":      "Shader Editor — check all Image Texture nodes.",
+                            })
+                        else:
+                            cs = tn.get("colorspace", "sRGB")
+                            if cs not in ("sRGB", "Linear", "Non-Color", "Raw"):
+                                findings.append({
+                                    "severity": "warning",
+                                    "issue":    f"Texture '{tn.get('image')}' uses unusual "
+                                                f"colorspace '{cs}'",
+                                    "production_impact": "Unexpected colorspace may cause incorrect "
+                                                          "colour in Unreal.",
+                                    "recommended_fix":   "Use sRGB for colour maps, "
+                                                          "Non-Color/Linear for data maps.",
+                                    "verification":      "Check colorspace in Image Texture node.",
+                                })
+                            else:
+                                passed_checks.append(f"Texture '{tn.get('image')}' colorspace OK ({cs})")
+                elif use_nodes and has_principled:
+                    findings.append({
+                        "severity": "warning",
+                        "issue":    "No texture maps — fully procedural or placeholder material",
+                        "production_impact": "Procedural nodes do not transfer to Unreal. "
+                                              "All surface detail must be baked to texture maps.",
+                        "recommended_fix":   "Bake procedural outputs to image textures.",
+                        "verification":      "Bake to texture, re-link in Shader Editor.",
+                    })
+
+                # Normal map direction
+                norm_nodes = [n for n in nodes if n.get("type") == "NORMAL_MAP"]
+                for nn in norm_nodes:
+                    if nn.get("ue5_warning"):
+                        findings.append({
+                            "severity": "warning",
+                            "issue":    "Normal map is OpenGL format — UE5 uses DirectX",
+                            "production_impact": "Normals will appear inverted in Unreal "
+                                                  "(lighting direction reversed).",
+                            "recommended_fix":   "Flip G channel in UE5 material, or rebake "
+                                                  "with DirectX normal format.",
+                            "verification":      "Check normal direction in UE5 Material Editor.",
+                        })
+
+                # Orphaned nodes
+                if graph.get("has_orphaned_nodes"):
+                    orphans = graph.get("orphaned_nodes", [])
+                    findings.append({
+                        "severity": "warning",
+                        "issue":    f"{len(orphans)} orphaned node(s) not connected to output: "
+                                    f"{', '.join(orphans[:5])}",
+                        "production_impact": "Orphaned nodes waste memory and clutter the graph. "
+                                              "No visual impact but indicates incomplete work.",
+                        "recommended_fix":   "Delete or connect orphaned nodes.",
+                        "verification":      "Shader Editor — all nodes should trace to Output.",
+                    })
+
+            # ── Per-material severity ──────────────────────────────────────────
+            severities = [f["severity"] for f in findings]
+            if "critical" in severities:
+                mat_severity = "critical"
+            elif "warning" in severities:
+                mat_severity = "warning"
+            else:
+                mat_severity = "pass"
+
+            all_severities.append(mat_severity)
+            pbr_compliant = (
+                use_nodes and
+                not graph_error and
+                not any(f["severity"] == "critical" for f in findings)
+            )
+
+            material_summaries.append({
+                "slot":            slot.get("slot"),
+                "name":            mat_name,
+                "use_nodes":       use_nodes,
+                "node_count":      node_count,
+                "severity":        mat_severity,
+                "pbr_compliant":   pbr_compliant,
+                "summary":         (
+                    f"PASS — '{mat_name}' is PBR-compliant." if mat_severity == "pass"
+                    else f"{mat_severity.upper()} — '{mat_name}': "
+                         f"{severities.count('critical')} critical, "
+                         f"{severities.count('warning')} warning(s)."
+                ),
+                "critical_issues": [f["issue"] for f in findings if f["severity"] == "critical"],
+                "warnings":        [f["issue"] for f in findings if f["severity"] == "warning"],
+                "passed_checks":   passed_checks,
+                "full_findings":   findings,
+            })
+
+        # ── Overall verdict ────────────────────────────────────────────────────
         if "critical" in all_severities:
             overall_verdict = "FAIL"
         elif "warning" in all_severities:
@@ -2919,38 +2756,27 @@ def analyze_material_pbr(object_name: str) -> str:
         else:
             overall_verdict = "PASS"
 
-        # Draw call cost note
-        mat_count = len(reviewed)
+        mat_count = len(material_summaries)
         draw_call_note = None
         if mat_count > 4:
             draw_call_note = (
-                f"{mat_count} materials on one mesh — each material = one draw call. "
-                f"Consider merging materials where possible for performance."
+                f"{mat_count} materials — each is one draw call. "
+                "Merge where possible for performance."
             )
         elif mat_count > 1:
             draw_call_note = f"{mat_count} materials — acceptable, verify intentional."
-
-        # Summarise per-material findings compactly
-        material_summaries = []
-        for r in reviewed:
-            reasoning = r.get("_reasoning", {})
-            material_summaries.append({
-                "name":           reasoning.get("material_name", "unknown"),
-                "pbr_compliant":  reasoning.get("pbr_compliant", False),
-                "severity":       reasoning.get("overall_severity", "pass"),
-                "summary":        reasoning.get("summary", ""),
-                "critical_issues": [f["issue"] for f in reasoning.get("findings", []) if f["severity"] == "critical"],
-                "warnings":        [f["issue"] for f in reasoning.get("findings", []) if f["severity"] == "warning"],
-                "passed_checks":  [f["issue"] for f in reasoning.get("passed_checks", [])],
-            })
+        if empty_slots:
+            draw_call_note = (draw_call_note or "") + \
+                             f" {empty_slots} empty slot(s) detected — remove before export."
 
         return json.dumps({
-            "object":           object_name,
-            "material_count":   mat_count,
-            "overall_verdict":  overall_verdict,
+            "object":            object_name,
+            "material_count":    mat_count,
+            "empty_slots":       empty_slots,
+            "overall_verdict":   overall_verdict,
             "all_pbr_compliant": all(m["pbr_compliant"] for m in material_summaries),
-            "draw_call_note":   draw_call_note,
-            "materials":        material_summaries,
+            "draw_call_note":    draw_call_note,
+            "materials":         material_summaries,
         }, indent=2, default=str)
 
     except Exception as e:
@@ -2996,7 +2822,7 @@ def get_scene_summary() -> str:
                 "summary": "Scene is empty — no objects detected.",
             })
 
-        # ── Categorise every object ────────────────────────────────────────────
+        # ── Categorise by type (get_scene_info objects only have name/type/location) ──
         meshes    = [o for o in objects if o.get("type") == "MESH"]
         armatures = [o for o in objects if o.get("type") == "ARMATURE"]
         lights    = [o for o in objects if o.get("type") == "LIGHT"]
@@ -3004,58 +2830,41 @@ def get_scene_summary() -> str:
         empties   = [o for o in objects if o.get("type") == "EMPTY"]
         other     = [o for o in objects if o.get("type") not in
                      ("MESH", "ARMATURE", "LIGHT", "CAMERA", "EMPTY")]
-
         mesh_count = len(meshes)
 
-        # ── Detect scene mode ──────────────────────────────────────────────────
-        if mesh_count == 0:
-            scene_mode = "SUPPORT_ONLY"
-        elif mesh_count == 1:
-            scene_mode = "HERO"
-        elif mesh_count <= 20:
-            # Check if one mesh heavily dominates by vertex count
-            vert_counts = [m.get("vertex_count", 0) or 0 for m in meshes]
-            total_verts = sum(vert_counts)
-            max_verts   = max(vert_counts) if vert_counts else 0
-            dominance   = max_verts / total_verts if total_verts > 0 else 0
-            scene_mode  = "HERO" if dominance > 0.6 else "COLLECTION"
-        else:
-            scene_mode = "ENVIRONMENT"
-
-        # ── Identify dominant (hero) mesh ──────────────────────────────────────
-        dominant = None
-        if meshes:
-            dominant = max(meshes, key=lambda m: m.get("vertex_count", 0) or 0)
-
-        # ── Quick health scan for each mesh ───────────────────────────────────
+        # ── Per-mesh data: must call get_mesh_quality_report for counts ────────
+        # get_scene_info objects have NO vertex_count / face_count fields.
+        # Cap per-object calls at 30 to avoid timeout on large scenes.
         mesh_inventory = []
         total_verts    = 0
         total_faces    = 0
 
-        for m in meshes:
-            name   = m.get("name", "unknown")
-            verts  = m.get("vertex_count", 0) or 0
-            faces  = m.get("face_count", 0)   or 0
-            total_verts += verts
-            total_faces += faces
-
-            # Lightweight problem check — only if mesh count is manageable
-            health_flag = "unknown"
+        for m in meshes[:30]:
+            name = m.get("name", "unknown")
+            verts = 0
+            faces = 0
+            health_flag   = "unknown"
             problem_count = 0
             worst_issue   = None
-            if mesh_count <= 30:
-                try:
-                    prob = _send_raw("detect_mesh_problems", name=name)
-                    if "error" not in prob:
-                        problem_count = prob.get("problem_count", 0)
-                        health_flag   = "clean" if prob.get("clean", False) else "issues"
-                        prob_list     = prob.get("problems", [])
-                        if prob_list:
-                            worst = max(prob_list, key=lambda p: p.get("count", 0))
-                            worst_issue = f"{worst['type']} ({worst['count']})"
-                except Exception:
-                    health_flag = "unknown"
+            try:
+                stats = _send_raw("get_mesh_quality_report", name=name)
+                if "error" not in stats:
+                    verts  = stats.get("counts", {}).get("verts",     0) or 0
+                    faces  = stats.get("counts", {}).get("faces",     0) or 0
+                    health_flag = stats.get("health", "unknown")
+                    probs  = stats.get("problems", {})
+                    problem_count = sum(v for v in probs.values() if isinstance(v, int))
+                    # Find worst problem by count
+                    if probs:
+                        worst_key = max(probs, key=lambda k: probs[k] if isinstance(probs[k], int) else 0)
+                        worst_val = probs[worst_key]
+                        if worst_val > 0:
+                            worst_issue = f"{worst_key} ({worst_val})"
+            except Exception:
+                pass
 
+            total_verts += verts
+            total_faces += faces
             mesh_inventory.append({
                 "name":          name,
                 "vertex_count":  verts,
@@ -3063,47 +2872,64 @@ def get_scene_summary() -> str:
                 "health":        health_flag,
                 "problem_count": problem_count,
                 "worst_issue":   worst_issue,
-                "is_dominant":   dominant and name == dominant.get("name"),
             })
 
-        # Sort by vertex count descending
+        # Sort by vertex count descending — highest poly = likely dominant
         mesh_inventory.sort(key=lambda m: m["vertex_count"], reverse=True)
+
+        # ── Scene mode detection (now uses real vertex counts) ─────────────────
+        if mesh_count == 0:
+            scene_mode = "SUPPORT_ONLY"
+        elif mesh_count == 1:
+            scene_mode = "HERO"
+        elif mesh_count <= 20:
+            vert_counts = [m["vertex_count"] for m in mesh_inventory]
+            tv = sum(vert_counts)
+            mv = max(vert_counts) if vert_counts else 0
+            dominance  = mv / tv if tv > 0 else 0
+            scene_mode = "HERO" if dominance > 0.6 else "COLLECTION"
+        else:
+            scene_mode = "ENVIRONMENT"
+
+        # ── Mark dominant asset ────────────────────────────────────────────────
+        dominant_name = mesh_inventory[0]["name"] if mesh_inventory else None
+        for m in mesh_inventory:
+            m["is_dominant"] = (m["name"] == dominant_name)
 
         # ── Pipeline stage for dominant asset ──────────────────────────────────
         dominant_stage = None
-        if dominant:
+        if dominant_name:
             try:
-                d_obj   = _send_raw("get_object_info",         name=dominant["name"])
-                d_stats = _send_raw("get_mesh_quality_report", name=dominant["name"])
+                d_obj   = _send_raw("get_object_info",         name=dominant_name)
+                d_stats = _send_raw("get_mesh_quality_report", name=dominant_name)
                 if "error" not in d_obj and "error" not in d_stats:
-                    stage_result  = _classify_stage_from_signals(d_obj, d_stats)
+                    stage_result   = _classify_stage_from_signals(d_obj, d_stats)
                     dominant_stage = {
                         "stage_number": stage_result["stage_number"],
                         "stage_name":   stage_result["stage_name"],
                         "confidence":   stage_result["confidence"],
-                        "next_steps":   stage_result["next_steps"][:2],  # top 2 only
+                        "next_steps":   stage_result["next_steps"][:2],
                     }
             except Exception:
                 dominant_stage = None
 
-        # ── Recommended audit depth ────────────────────────────────────────────
-        if scene_mode == "HERO":
+        # ── Audit recommendation ───────────────────────────────────────────────
+        if scene_mode in ("HERO", "SUPPORT_ONLY"):
             audit_recommendation = (
                 "Run analyze_mesh_for_unreal on the dominant mesh for full depth analysis."
             )
         elif scene_mode == "COLLECTION":
             audit_recommendation = (
-                "Run audit_all_objects() — will produce a ranked table of all objects by severity."
+                "Run audit_all_objects() — ranked table of all objects by severity."
             )
         else:
             audit_recommendation = (
-                "Run audit_all_objects() — will triage by severity and surface top 5 critical issues. "
+                "Run audit_all_objects() — triage by severity, top 5 critical issues surfaced. "
                 "Full detail available per-object on request."
             )
 
-        # ── Build clean summary string ─────────────────────────────────────────
-        issues_found  = sum(1 for m in mesh_inventory if m["health"] == "issues")
-        clean_meshes  = sum(1 for m in mesh_inventory if m["health"] == "clean")
+        issues_found = sum(1 for m in mesh_inventory if m["health"] == "issues_found")
+        clean_meshes = sum(1 for m in mesh_inventory if m["health"] == "clean")
 
         summary_line = (
             f"{scene_mode} scene — {mesh_count} mesh(es), {len(armatures)} armature(s), "
@@ -3113,9 +2939,9 @@ def get_scene_summary() -> str:
         )
 
         return json.dumps({
-            "scene_mode":        scene_mode,
-            "summary":           summary_line,
-            "object_counts": {
+            "scene_mode":     scene_mode,
+            "summary":        summary_line,
+            "object_counts":  {
                 "meshes":    mesh_count,
                 "armatures": len(armatures),
                 "lights":    len(lights),
@@ -3124,16 +2950,13 @@ def get_scene_summary() -> str:
                 "other":     len(other),
                 "total":     len(objects),
             },
-            "totals": {
-                "vertex_count": total_verts,
-                "face_count":   total_faces,
-            },
-            "dominant_asset":    dominant["name"] if dominant else None,
-            "dominant_stage":    dominant_stage,
-            "mesh_inventory":    mesh_inventory,
-            "armatures":         [a.get("name") for a in armatures],
-            "lights":            [l.get("name") for l in lights],
-            "cameras":           [c.get("name") for c in cameras],
+            "totals":         {"vertex_count": total_verts, "face_count": total_faces},
+            "dominant_asset": dominant_name,
+            "dominant_stage": dominant_stage,
+            "mesh_inventory": mesh_inventory,
+            "armatures":      [a.get("name") for a in armatures],
+            "lights":         [l.get("name") for l in lights],
+            "cameras":        [c.get("name") for c in cameras],
             "audit_recommendation": audit_recommendation,
         }, indent=2, default=str)
 
@@ -3187,38 +3010,44 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
         if mesh_count == 0:
             return json.dumps({"verdict": "EMPTY", "summary": "No mesh objects in scene."})
 
-        # ── Step 2: detect scene mode if auto ────────────────────────────────
+        # ── Step 2: get real vertex counts per mesh (scene_info has none) ────────
+        # Must call get_mesh_quality_report per object to get counts.
+        # Build a list of (name, vertex_count) capped at 30 for mode detection.
+        mesh_vert_map: dict = {}
+        for m in meshes[:30]:
+            mname = m.get("name", "")
+            try:
+                s = _send_raw("get_mesh_quality_report", name=mname)
+                mesh_vert_map[mname] = s.get("counts", {}).get("verts", 0) or 0
+            except Exception:
+                mesh_vert_map[mname] = 0
+
+        # ── Step 3: detect scene mode if auto ─────────────────────────────────
         if mode == "auto":
             if mesh_count == 1:
                 mode = "hero"
             elif mesh_count <= 20:
-                vert_counts = [m.get("vertex_count", 0) or 0 for m in meshes]
-                total_v     = sum(vert_counts)
-                max_v       = max(vert_counts) if vert_counts else 0
-                dominance   = max_v / total_v if total_v > 0 else 0
+                vert_counts = list(mesh_vert_map.values())
+                total_v = sum(vert_counts)
+                max_v   = max(vert_counts) if vert_counts else 0
+                dominance = max_v / total_v if total_v > 0 else 0
                 mode = "hero" if dominance > 0.6 else "collection"
             else:
                 mode = "environment"
 
-        # ── Step 3: run analysis calibrated to mode ───────────────────────────
+        # ── Step 4: run analysis calibrated to mode ───────────────────────────
 
         # HERO MODE ─────────────────────────────────────────────────────────────
         if mode == "hero":
-            hero = max(meshes, key=lambda m: m.get("vertex_count", 0) or 0)
-            name = hero.get("name", "")
+            # Dominant = highest vertex count from real data
+            name = max(mesh_vert_map, key=mesh_vert_map.get) if mesh_vert_map \
+                   else (meshes[0].get("name", "") if meshes else "")
 
-            full   = json.loads(_send_json("analyze_mesh_for_unreal") if not name
-                                else json.dumps(_send_raw("analyze_mesh_for_unreal") if False
-                                else json.loads(
-                                    __import__("json").dumps(
-                                        _send_raw("get_mesh_quality_report", name=name)
-                                    )
-                                )))
+            if not name:
+                return json.dumps({"error": "Could not identify hero mesh."})
 
-            # Run full compound + stage classification in parallel
             try:
                 mesh_result  = _send_raw("detect_mesh_problems",       name=name)
-                topo_result  = _send_raw("analyze_topology",           name=name)
                 ue5_result   = _send_raw("run_unreal_readiness_check", name=name)
                 qa_result    = _send_raw("run_asset_qa",               name=name)
                 obj_info     = _send_raw("get_object_info",            name=name)
@@ -3291,7 +3120,7 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
                         "object":        name,
                         "verdict_emoji": emoji,
                         "severity":      severity,
-                        "vertex_count":  m.get("vertex_count", 0),
+                        "vertex_count":  mesh_vert_map.get(name, 0),
                         "problem_count": prob.get("problem_count", 0),
                         "worst_issue":   worst,
                         "stage":         f"Stage {stage['stage_number']} — {stage['stage_name']}",
@@ -3301,7 +3130,7 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
                         "object":        name,
                         "verdict_emoji": "❓",
                         "severity":      "unknown",
-                        "vertex_count":  m.get("vertex_count", 0),
+                        "vertex_count":  mesh_vert_map.get(name, 0),
                         "problem_count": 0,
                         "worst_issue":   "Analysis failed",
                         "stage":         "Unknown",
@@ -3347,7 +3176,18 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
 
             for m in meshes:
                 name  = m.get("name", "")
-                verts = m.get("vertex_count", 0) or 0
+                # Use pre-built mesh_vert_map (get_mesh_quality_report data).
+                # If this mesh was beyond the [:30] cap, fetch on demand.
+                if name in mesh_vert_map:
+                    verts = mesh_vert_map[name]
+                else:
+                    try:
+                        _s = _send_raw("get_mesh_quality_report", name=name)
+                        verts = _s.get("counts", {}).get("verts", 0) or 0
+                        mesh_vert_map[name] = verts   # cache for total_verts below
+                    except Exception:
+                        verts = 0
+                        mesh_vert_map[name] = 0
                 try:
                     prob     = _send_raw("detect_mesh_problems", name=name)
                     r_prob   = _reason_mesh_problems(prob)
@@ -3382,7 +3222,7 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
             critical_count = sum(1 for r in rows if r["severity"] == "critical")
             warn_count     = sum(1 for r in rows if r["severity"] == "warning")
             pass_count     = sum(1 for r in rows if r["severity"] == "pass")
-            total_verts    = sum(m.get("vertex_count", 0) or 0 for m in meshes)
+            total_verts    = sum(mesh_vert_map.get(m.get("name", ""), 0) or 0 for m in meshes)
 
             non_mesh_summary = {
                 "armatures": len([o for o in objects if o.get("type") == "ARMATURE"]),
