@@ -957,6 +957,426 @@ def _reason_asset_qa(raw: dict) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE STAGE CLASSIFIER — internal helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
+    """
+    Infer the production pipeline stage from raw object and mesh data.
+
+    Returns a structured verdict with:
+      stage_number    : 1–6
+      stage_name      : human-readable name
+      confidence      : "high" | "medium" | "low"
+      signals_detected: list of str — what evidence drove the decision
+      standards       : list of str — what QA standards apply at this stage
+      next_steps      : list of str — recommended actions to progress
+      ambiguous       : bool — True if two stages are equally plausible
+      alternate_stage : optional stage_number if ambiguous
+    """
+    signals_detected = []
+    stage_scores = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
+
+    # ── Extract signals from obj_info ─────────────────────────────────────────
+    vertex_count   = obj_info.get("vertex_count", 0) or 0
+    face_count     = obj_info.get("face_count", 0)   or 0
+    has_armature   = bool(obj_info.get("armature"))
+    has_materials  = bool(obj_info.get("materials"))
+    material_count = len(obj_info.get("materials", [])) if isinstance(obj_info.get("materials"), list) else 0
+    modifier_list  = [m.get("type", "") for m in obj_info.get("modifiers", [])] \
+                     if isinstance(obj_info.get("modifiers"), list) else []
+    has_multires   = "MULTIRES" in modifier_list
+    has_subsurf    = "SUBSURF" in modifier_list
+    has_solidify   = "SOLIDIFY" in modifier_list
+
+    # ── Extract signals from mesh_stats (get_mesh_quality_report schema) ──────
+    counts     = mesh_stats.get("counts", {})
+    face_types = mesh_stats.get("face_types", {})
+    uv_data    = mesh_stats.get("uv", {})
+    problems   = mesh_stats.get("problems", {})
+    health     = mesh_stats.get("health", "")
+
+    has_uvs        = uv_data.get("has_uvs", False)
+    uv_layer_count = uv_data.get("layer_count", 0)
+    quad_count     = face_types.get("quads", 0)
+    tri_count      = face_types.get("tris", 0)
+    ngon_count     = face_types.get("ngons", 0)
+    total_faces    = face_count or (quad_count + tri_count + ngon_count)
+    quad_pct       = (quad_count / total_faces * 100) if total_faces > 0 else 0
+    iso_verts      = problems.get("isolated_verts", 0)
+    nm_edges       = problems.get("non_manifold_edges", 0)
+
+    # ── STAGE 1 — Concept / Sculpt ─────────────────────────────────────────────
+    if vertex_count > 300_000:
+        stage_scores[1] += 3
+        signals_detected.append(f"Very high vertex count ({vertex_count:,}) — typical of sculpts")
+    if has_multires:
+        stage_scores[1] += 3
+        signals_detected.append("Multires modifier present — sculpt workflow")
+    if not has_uvs and vertex_count > 100_000:
+        stage_scores[1] += 2
+        signals_detected.append("No UVs on high-poly mesh — pre-retopo")
+    if ngon_count > quad_count and vertex_count > 50_000:
+        stage_scores[1] += 1
+        signals_detected.append("Ngon-heavy topology — typical of sculpt/scan")
+
+    # ── STAGE 2 — Retopology / Base Mesh ──────────────────────────────────────
+    if 3_000 <= vertex_count <= 120_000:
+        stage_scores[2] += 2
+        signals_detected.append(f"Vertex count ({vertex_count:,}) in retopo/game-mesh range")
+    if quad_pct > 70 and total_faces > 100:
+        stage_scores[2] += 2
+        signals_detected.append(f"Quad-dominant mesh ({quad_pct:.0f}% quads) — intentional retopo")
+    if not has_uvs and vertex_count < 120_000:
+        stage_scores[2] += 1
+        signals_detected.append("No UVs yet — retopo may be in progress")
+    if has_subsurf:
+        stage_scores[2] += 1
+        signals_detected.append("Subsurf modifier — base mesh workflow")
+
+    # ── STAGE 3 — Bake-Ready ──────────────────────────────────────────────────
+    if has_uvs and not has_materials and vertex_count < 120_000:
+        stage_scores[3] += 3
+        signals_detected.append("UVs present, no material — classic bake-ready state")
+    if uv_layer_count >= 2:
+        stage_scores[3] += 2
+        signals_detected.append(f"{uv_layer_count} UV channels — lightmap/bake setup")
+    if has_uvs and vertex_count < 120_000 and not has_armature:
+        stage_scores[3] += 1
+
+    # ── STAGE 4 — Texture / Material ──────────────────────────────────────────
+    if has_uvs and has_materials and material_count >= 1:
+        stage_scores[4] += 3
+        signals_detected.append(f"UVs + {material_count} material(s) — texture/material stage")
+    if material_count > 1:
+        stage_scores[4] += 1
+        signals_detected.append(f"Multiple materials ({material_count}) — multi-material asset")
+
+    # ── STAGE 5 — Rig / Animation ─────────────────────────────────────────────
+    if has_armature:
+        stage_scores[5] += 4
+        signals_detected.append("Armature detected — rig/animation stage")
+    if has_armature and has_materials:
+        stage_scores[5] += 1
+        signals_detected.append("Armature + materials — rigged character setup")
+
+    # ── STAGE 6 — Export-Ready / Unreal Prep ──────────────────────────────────
+    if has_uvs and has_materials and nm_edges == 0 and health == "clean":
+        stage_scores[6] += 3
+        signals_detected.append("Clean mesh + UVs + materials — potential export candidate")
+    if uv_layer_count >= 2 and has_materials and nm_edges == 0:
+        stage_scores[6] += 2
+        signals_detected.append("Lightmap UV + clean mesh — export-ready signals")
+    if not modifier_list:
+        stage_scores[6] += 1
+        signals_detected.append("No modifiers — modifiers likely applied")
+
+    # ── Determine winner ───────────────────────────────────────────────────────
+    sorted_stages = sorted(stage_scores.items(), key=lambda x: x[1], reverse=True)
+    top_stage, top_score   = sorted_stages[0]
+    sec_stage, sec_score   = sorted_stages[1]
+
+    # Ambiguity: top two within 1 point → ambiguous, default to higher-demand stage
+    ambiguous = (top_score - sec_score) <= 1 and top_score > 0
+    if ambiguous:
+        # Higher stage number = more demanding standards
+        primary = max(top_stage, sec_stage)
+        alternate = min(top_stage, sec_stage)
+    else:
+        primary   = top_stage
+        alternate = sec_stage
+
+    confidence = "high" if (top_score - sec_score) >= 3 else \
+                 "medium" if (top_score - sec_score) >= 1 else "low"
+
+    # ── Stage metadata ─────────────────────────────────────────────────────────
+    STAGE_META = {
+        1: {
+            "name": "Concept / Sculpt",
+            "standards": [
+                "No polygon limits — detail capture is the goal",
+                "Topology quality not evaluated at this stage",
+                "Focus: sculpt fidelity and silhouette",
+            ],
+            "next_steps": [
+                "Retopology to game-ready mesh (~5k–80k verts depending on asset)",
+                "UV unwrap on the retopo mesh",
+                "Bake high-to-low normal/AO/curvature maps",
+            ],
+        },
+        2: {
+            "name": "Retopology / Base Mesh",
+            "standards": [
+                "Quad dominance >85% in deformation zones",
+                "Animation-friendly edge loops at all joints",
+                "Poles placed away from deformation areas",
+                "No ngons in areas that will deform",
+                "Density appropriate for deformation complexity",
+            ],
+            "next_steps": [
+                "UV unwrap with appropriate seam placement",
+                "Validate deformation topology before rigging",
+                "Set up high-poly bake source if not already done",
+            ],
+        },
+        3: {
+            "name": "Bake-Ready",
+            "standards": [
+                "UV islands non-overlapping (unless intentional)",
+                "No UV stretching >20%",
+                "Sufficient projection distance from high-poly",
+                "No flipped normals on low-poly",
+                "Matching silhouette with high-poly source",
+            ],
+            "next_steps": [
+                "Bake normal map, AO, curvature, and color ID",
+                "Validate bake output for projection errors",
+                "Set up PBR material with baked maps",
+            ],
+        },
+        4: {
+            "name": "Texture / Material",
+            "standards": [
+                "PBR metallic/roughness workflow (not specular)",
+                "Power-of-2 texture resolutions (512/1024/2048/4096)",
+                "Consistent texel density across the asset",
+                "No broken image paths",
+                "Material count appropriate for draw call budget",
+            ],
+            "next_steps": [
+                "Verify PBR material response in rendered view",
+                "Check texel density consistency",
+                "Begin rig setup if character asset",
+                "Export test to Unreal to verify material response",
+            ],
+        },
+        5: {
+            "name": "Rig / Animation",
+            "standards": [
+                "Bone naming follows project/engine convention",
+                "No zero-weight vertices",
+                "Clean weight painting — no hard seams",
+                "Bind pose in T-pose or A-pose",
+                "Deformation topology validated at joint areas",
+                "No orphan bones",
+            ],
+            "next_steps": [
+                "Test deformation at extreme poses",
+                "Validate weight painting at all joints",
+                "Apply animations and check for sliding/popping",
+                "Run Unreal readiness check before export",
+            ],
+        },
+        6: {
+            "name": "Export-Ready / Unreal Prep",
+            "standards": [
+                "Scale uniform and applied (1,1,1)",
+                "Pivot at world origin",
+                "Triangulated or triangulate-on-export enabled",
+                "UVs present in channel 0",
+                "Lightmap UV in channel 1",
+                "No blocking modifiers unapplied",
+                "Naming conventions followed",
+                "Collision mesh present if needed",
+                "LOD naming correct if LODs exist",
+                "Zero blocking errors in UE5 readiness check",
+            ],
+            "next_steps": [
+                "Run full UE5 readiness check — resolve all FAIL/CRITICAL",
+                "Export as FBX to Unreal",
+                "Validate in Unreal Editor (materials, LODs, collision, scale)",
+            ],
+        },
+    }
+
+    meta = STAGE_META[primary]
+
+    return {
+        "stage_number":     primary,
+        "stage_name":       meta["name"],
+        "confidence":       confidence,
+        "score_breakdown":  dict(sorted_stages),
+        "signals_detected": signals_detected,
+        "standards":        meta["standards"],
+        "next_steps":       meta["next_steps"],
+        "ambiguous":        ambiguous,
+        "alternate_stage":  alternate if ambiguous else None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MATERIAL / PBR REASONING — internal helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reason_material(raw: dict) -> dict:
+    """
+    Interpret get_material_info output as a senior TA doing a PBR review.
+
+    Expected raw schema (get_material_info / get_object_info materials list):
+      {
+        "name": str,
+        "use_nodes": bool,
+        "node_count": int,
+        "has_principled_bsdf": bool,
+        "texture_slots": [ {"name": str, "image": str|None, "type": str} ],
+        "roughness": float | None,
+        "metallic":  float | None,
+        "alpha":     float | None,
+        "blend_mode": str,
+      }
+    Multiple materials come in as a list; this function handles one dict.
+    """
+    findings = []
+
+    name               = raw.get("name", "Unknown")
+    use_nodes          = raw.get("use_nodes", False)
+    has_principled     = raw.get("has_principled_bsdf", False)
+    node_count         = raw.get("node_count", 0)
+    texture_slots      = raw.get("texture_slots", [])
+    roughness          = raw.get("roughness")
+    metallic           = raw.get("metallic")
+    alpha              = raw.get("alpha", 1.0)
+    blend_mode         = raw.get("blend_mode", "OPAQUE")
+
+    # ── PBR workflow check ─────────────────────────────────────────────────────
+    if not use_nodes:
+        findings.append({
+            "severity": "critical",
+            "check": "node_graph",
+            "issue": "Material does not use nodes — flat material, not PBR",
+            "why_it_matters": "Blender non-node materials do not translate to Unreal PBR shaders.",
+            "fix": "Enable 'Use Nodes' and set up a Principled BSDF graph.",
+        })
+    elif not has_principled:
+        findings.append({
+            "severity": "critical",
+            "check": "pbr_shader",
+            "issue": f"No Principled BSDF found in node graph (node count: {node_count})",
+            "why_it_matters": "Unreal expects metallic/roughness PBR workflow. Custom node setups "
+                              "may not bake or export correctly.",
+            "fix": "Use Principled BSDF as the primary shader node.",
+        })
+    else:
+        findings.append({
+            "severity": "pass",
+            "check": "pbr_shader",
+            "issue": "Principled BSDF detected — PBR workflow confirmed",
+            "fix": None,
+        })
+
+    # ── Roughness check ────────────────────────────────────────────────────────
+    if roughness is not None:
+        if roughness == 0.0:
+            findings.append({
+                "severity": "warning",
+                "check": "roughness",
+                "issue": f"Roughness = 0.0 — perfectly smooth (mirror-like). Intentional?",
+                "why_it_matters": "Zero roughness is physically unrealistic for most surfaces "
+                                  "and may look wrong in engine.",
+                "fix": "Use a roughness map or set a non-zero value unless intentionally a mirror.",
+            })
+        elif roughness == 1.0:
+            findings.append({
+                "severity": "warning",
+                "check": "roughness",
+                "issue": f"Roughness = 1.0 — perfectly matte. Intentional?",
+                "why_it_matters": "Flat roughness values usually indicate a placeholder material.",
+                "fix": "Use a roughness map for realistic surface variation.",
+            })
+        else:
+            findings.append({
+                "severity": "pass",
+                "check": "roughness",
+                "issue": f"Roughness = {roughness:.2f} — non-uniform value set",
+                "fix": None,
+            })
+
+    # ── Metallic check ─────────────────────────────────────────────────────────
+    if metallic is not None:
+        if 0.0 < metallic < 1.0 and metallic not in (0.0, 1.0):
+            findings.append({
+                "severity": "warning",
+                "check": "metallic",
+                "issue": f"Metallic = {metallic:.2f} — mid-range value (physically incorrect for most materials)",
+                "why_it_matters": "Real materials are either fully metallic (1.0) or fully dielectric (0.0). "
+                                  "Mid values suggest a placeholder or incorrect setup.",
+                "fix": "Use a metallic map with black (0) and white (1) values, not a grey scalar.",
+            })
+        else:
+            findings.append({
+                "severity": "pass",
+                "check": "metallic",
+                "issue": f"Metallic = {metallic:.2f} — binary value, physically plausible",
+                "fix": None,
+            })
+
+    # ── Texture slot checks ────────────────────────────────────────────────────
+    missing_images = [s for s in texture_slots if s.get("image") is None]
+    if missing_images:
+        for slot in missing_images:
+            findings.append({
+                "severity": "critical",
+                "check": "texture_path",
+                "issue": f"Texture slot '{slot.get('name', 'unknown')}' has no image assigned",
+                "why_it_matters": "Missing textures export as pink/error in Unreal. "
+                                  "Will break material in engine.",
+                "fix": "Assign a texture or remove the empty slot.",
+            })
+
+    if not texture_slots and has_principled:
+        findings.append({
+            "severity": "warning",
+            "check": "texture_maps",
+            "issue": "No texture maps found — material is fully procedural or placeholder",
+            "why_it_matters": "Procedural materials do not transfer to Unreal. "
+                              "All surface detail must be baked to texture maps.",
+            "fix": "Bake all procedural nodes to texture maps before export.",
+        })
+
+    # ── Alpha / blend mode ────────────────────────────────────────────────────
+    if blend_mode not in ("OPAQUE", "CLIP") and alpha is not None and alpha < 1.0:
+        findings.append({
+            "severity": "warning",
+            "check": "alpha",
+            "issue": f"Blend mode '{blend_mode}' with alpha {alpha:.2f} — transparent material",
+            "why_it_matters": "Transparency is expensive in Unreal. Verify this is intentional "
+                              "and the correct blend mode is set for engine import.",
+            "fix": "Use CLIP (masked) instead of BLEND where possible. "
+                   "Avoid BLEND unless soft transparency is required.",
+        })
+
+    # ── Overall severity ───────────────────────────────────────────────────────
+    severities = [f["severity"] for f in findings]
+    if "critical" in severities:
+        overall = "critical"
+    elif "warning" in severities:
+        overall = "warning"
+    else:
+        overall = "pass"
+
+    critical_count = severities.count("critical")
+    warning_count  = severities.count("warning")
+    pass_count     = severities.count("pass")
+
+    return {
+        **raw,
+        "_reasoning": {
+            "material_name":   name,
+            "overall_severity": overall,
+            "pbr_compliant":   has_principled and use_nodes and not missing_images,
+            "summary": (
+                f"PASS — '{name}' is PBR-compliant and export-ready." if overall == "pass"
+                else f"{overall.upper()} — '{name}': {critical_count} critical, "
+                     f"{warning_count} warning(s), {pass_count} checks passed."
+            ),
+            "findings":       [f for f in findings if f["severity"] != "pass"],
+            "passed_checks":  [f for f in findings if f["severity"] == "pass"],
+            "production_ready": overall == "pass",
+        }
+    }
+
+
 
 # Safe repair scripts — each is a standalone bpy code block
 _REPAIR_SCRIPTS = {
@@ -1372,7 +1792,106 @@ You do not need to know which tool generated it. The pipeline requirements are
 the same regardless of source.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 9 — SESSION CONTINUITY
+SECTION 9 — SCENE COMPOSITION MODE (reference image workflow)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Activate this mode when the user provides a reference image and asks you to
+build, recreate, or compare a Blender scene against it.
+
+TRIGGER PHRASES:
+  "can you make this scene", "build this from the image", "match this reference",
+  "what's missing compared to this", "recreate this", "use this as reference"
+
+SCENE COMPOSITION MODE PROTOCOL:
+  Step 1: Acknowledge the reference image — describe what you see in it:
+          - Overall scene type (interior/exterior/environment/character shot)
+          - Key objects/elements present
+          - Lighting mood and direction
+          - Camera angle and composition
+          - Style (realistic, stylised, low-poly, etc.)
+
+  Step 2: get_viewport_screenshot() — capture the current Blender scene
+
+  Step 3: get_scene_summary() — understand what currently exists
+
+  Step 4: COMPARE reference vs current scene:
+          - What elements from the reference ARE present in the scene
+          - What elements from the reference are MISSING
+          - What is in the scene but NOT in the reference
+          - Approximate scale/proportion differences if visible
+          - Lighting differences
+
+  Step 5: Deliver a GAP REPORT in this format:
+          ── REFERENCE ANALYSIS ─────────────────────────────────────────────
+          What you see in the reference image.
+
+          ── CURRENT SCENE STATE ────────────────────────────────────────────
+          What is currently in Blender.
+
+          ── GAP ANALYSIS ───────────────────────────────────────────────────
+          ✅ Present:  [elements that match]
+          ❌ Missing:  [elements in reference but not in scene]
+          ➕ Extra:    [elements in scene not in reference]
+          ⚠️ Different: [elements present but wrong scale/position/style]
+
+          ── RECOMMENDED BUILD ORDER ────────────────────────────────────────
+          Priority-ordered list of what to add/change to match the reference.
+
+  Step 6: Await direction. Do not start building automatically.
+          The gap report is your deliverable — the user decides what to act on.
+
+IMPORTANT NOTES FOR COMPOSITION MODE:
+  - You cannot place objects in Blender automatically — report what is needed,
+    then execute specific placement/creation steps when directed
+  - Scale estimation from a reference image is approximate — flag this clearly
+  - If the reference image contains copyrighted assets, note this but proceed
+    with the compositional analysis
+  - For character scenes: identify hero vs background elements and prioritise hero
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 10 — SCENE-LEVEL TOOL USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The scene-level tools have a mandatory call order. Never skip steps.
+
+  MANDATORY ORDER:
+    1. get_viewport_screenshot()         ← always first
+    2. get_scene_summary()               ← scene inventory + mode detection
+    3. classify_pipeline_stage(name)     ← stage inference on dominant asset
+    4. audit_all_objects()               ← calibrated full-scene audit
+
+  WHEN TO USE EACH:
+    get_scene_summary()
+      → Any time you enter an unfamiliar scene
+      → When the user asks "what's in the scene" or "what am I working with"
+      → Before running audit_all_objects()
+      → Output tells you which audit mode will be used
+
+    classify_pipeline_stage(name)
+      → On any asset you haven't classified yet this session
+      → When the user asks "what stage is this" or "where are we"
+      → When you need to calibrate which QA standards apply
+      → When a mesh looks ambiguous (high-poly but has UVs, etc.)
+
+    audit_all_objects()
+      → When user asks "what's wrong with everything" or "audit the scene"
+      → After get_scene_summary() identifies issues in the inventory
+      → When you need a ranked view of all objects by severity
+      → Never on a scene you haven't seen (screenshot + summary first)
+
+  AUTO MODE BEHAVIOR (mode="auto"):
+    1 dominant mesh         → HERO mode    → full deep-dive on hero
+    2–20 meshes             → COLLECTION   → ranked table + deep-dive on critical
+    20+ meshes              → ENVIRONMENT  → triage by severity, top 5 critical
+
+  AFTER audit_all_objects():
+    - Report the verdict summary first (X CRITICAL, Y WARN, Z PASS)
+    - Show the ranked table
+    - Offer to deep-dive any specific object
+    - Do NOT automatically run repairs — present findings first
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 11 — SESSION CONTINUITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Within a session, maintain a mental model of what you know:
@@ -2268,6 +2787,633 @@ def critique_animation(name: str, frame_start: Optional[int] = None, frame_end: 
 
     except Exception as e:
         logger.error(f"Error in critique_animation: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.5 — LIFECYCLE + MATERIAL + SCENE TOOLS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def classify_pipeline_stage(object_name: str) -> str:
+    """
+    PIPELINE STAGE CLASSIFIER — determines where an asset is in the production pipeline.
+
+    Analyses vertex count, topology, UV status, materials, armature, modifiers,
+    and mesh health to infer which of the 6 production stages the asset is in:
+      1 — Concept / Sculpt
+      2 — Retopology / Base Mesh
+      3 — Bake-Ready
+      4 — Texture / Material
+      5 — Rig / Animation
+      6 — Export-Ready / Unreal Prep
+
+    Returns:
+      - stage_number and stage_name
+      - confidence (high/medium/low)
+      - signals_detected: the evidence that drove the classification
+      - standards: QA standards that apply at this stage
+      - next_steps: what should happen next in the pipeline
+      - ambiguous flag + alternate_stage if two stages are equally plausible
+
+    Use this at session start on any unfamiliar asset, or when you need to
+    calibrate your analysis standards to the correct pipeline phase.
+    ALWAYS call get_viewport_screenshot() before this tool.
+    """
+    try:
+        obj_info   = _send_raw("get_object_info",          name=object_name)
+        mesh_stats = _send_raw("get_mesh_quality_report",  name=object_name)
+
+        if "error" in obj_info:
+            return json.dumps({"error": f"get_object_info failed: {obj_info['error']}"})
+        if "error" in mesh_stats:
+            return json.dumps({"error": f"get_mesh_quality_report failed: {mesh_stats['error']}"})
+
+        result = _classify_stage_from_signals(obj_info, mesh_stats)
+
+        # Enrich with raw summary stats for context
+        result["asset_stats"] = {
+            "vertex_count":  obj_info.get("vertex_count", 0),
+            "face_count":    obj_info.get("face_count", 0),
+            "material_count": len(obj_info.get("materials", [])) if isinstance(obj_info.get("materials"), list) else 0,
+            "has_armature":  bool(obj_info.get("armature")),
+            "has_uvs":       mesh_stats.get("uv", {}).get("has_uvs", False),
+            "uv_layers":     mesh_stats.get("uv", {}).get("layer_count", 0),
+            "mesh_health":   mesh_stats.get("health", "unknown"),
+            "modifier_count": len(obj_info.get("modifiers", [])) if isinstance(obj_info.get("modifiers"), list) else 0,
+        }
+
+        if result["ambiguous"]:
+            result["_note"] = (
+                f"Stage is ambiguous between Stage {result['alternate_stage']} and "
+                f"Stage {result['stage_number']}. Defaulting to Stage {result['stage_number']} "
+                f"(more demanding standards) — correct me if wrong."
+            )
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in classify_pipeline_stage: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def analyze_material_pbr(object_name: str) -> str:
+    """
+    MATERIAL / PBR REVIEWER — full senior TA review of an object's materials.
+
+    Checks every material slot on the object for:
+      - PBR workflow compliance (Principled BSDF, node graph present)
+      - Roughness and metallic physical plausibility
+      - Missing or broken texture paths
+      - Procedural nodes that won't transfer to Unreal
+      - Transparency / blend mode issues
+      - Multi-material draw call cost
+
+    Returns per-material findings with severity (critical/warning/pass),
+    a PBR compliance flag, and an overall material health verdict.
+
+    Use this:
+      - At Stage 4 (Texture/Material) as the primary QA tool
+      - Before any Unreal export to catch material blockers
+      - When the user asks about materials, shaders, or textures
+      - As part of full_asset_pipeline_check
+    ALWAYS call get_viewport_screenshot() before this tool.
+    """
+    try:
+        obj_info = _send_raw("get_object_info", name=object_name)
+        if "error" in obj_info:
+            return json.dumps({"error": f"get_object_info failed: {obj_info['error']}"})
+
+        materials_raw = obj_info.get("materials", [])
+
+        if not materials_raw:
+            return json.dumps({
+                "object": object_name,
+                "material_count": 0,
+                "overall_verdict": "WARN",
+                "summary": "No materials assigned. Object will appear grey in Unreal.",
+                "materials": [],
+                "_note": "Assign at least one PBR material before export.",
+            })
+
+        # Ensure list format
+        if isinstance(materials_raw, dict):
+            materials_raw = [materials_raw]
+
+        reviewed = []
+        all_severities = []
+
+        for mat in materials_raw:
+            if not isinstance(mat, dict):
+                continue
+            reasoned = _reason_material(mat)
+            reviewed.append(reasoned)
+            all_severities.append(reasoned.get("_reasoning", {}).get("overall_severity", "pass"))
+
+        # Scene-level verdict
+        if "critical" in all_severities:
+            overall_verdict = "FAIL"
+        elif "warning" in all_severities:
+            overall_verdict = "WARN"
+        else:
+            overall_verdict = "PASS"
+
+        # Draw call cost note
+        mat_count = len(reviewed)
+        draw_call_note = None
+        if mat_count > 4:
+            draw_call_note = (
+                f"{mat_count} materials on one mesh — each material = one draw call. "
+                f"Consider merging materials where possible for performance."
+            )
+        elif mat_count > 1:
+            draw_call_note = f"{mat_count} materials — acceptable, verify intentional."
+
+        # Summarise per-material findings compactly
+        material_summaries = []
+        for r in reviewed:
+            reasoning = r.get("_reasoning", {})
+            material_summaries.append({
+                "name":           reasoning.get("material_name", "unknown"),
+                "pbr_compliant":  reasoning.get("pbr_compliant", False),
+                "severity":       reasoning.get("overall_severity", "pass"),
+                "summary":        reasoning.get("summary", ""),
+                "critical_issues": [f["issue"] for f in reasoning.get("findings", []) if f["severity"] == "critical"],
+                "warnings":        [f["issue"] for f in reasoning.get("findings", []) if f["severity"] == "warning"],
+                "passed_checks":  [f["issue"] for f in reasoning.get("passed_checks", [])],
+            })
+
+        return json.dumps({
+            "object":           object_name,
+            "material_count":   mat_count,
+            "overall_verdict":  overall_verdict,
+            "all_pbr_compliant": all(m["pbr_compliant"] for m in material_summaries),
+            "draw_call_note":   draw_call_note,
+            "materials":        material_summaries,
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in analyze_material_pbr: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_scene_summary() -> str:
+    """
+    SCENE CLASSIFIER — zero-argument scene inventory and mode detection.
+
+    Scans every object in the scene and returns:
+      - scene_mode: HERO | COLLECTION | ENVIRONMENT
+      - object inventory by type (meshes, armatures, lights, cameras, empties)
+      - dominant asset identification (the hero mesh if HERO mode)
+      - per-object quick health flag (clean/issues/unknown)
+      - total poly count across all meshes
+      - pipeline stage inference for the dominant asset
+      - recommended audit depth
+
+    Scene modes:
+      HERO         — 1 dominant mesh (by poly count), possibly with armature/support objects
+      COLLECTION   — 2–20 mesh objects, no single dominant, prop/batch workflow
+      ENVIRONMENT  — 20+ objects, mix of mesh/light/camera, spatial scene
+
+    This is the mandatory second step after get_viewport_screenshot() on any
+    scene you haven't seen before. It tells you what you're working with before
+    you commit to any analysis strategy.
+
+    Never run audit_all_objects() without running get_scene_summary() first.
+    """
+    try:
+        scene_raw = _send_raw("get_scene_info")
+        if "error" in scene_raw:
+            return json.dumps({"error": f"get_scene_info failed: {scene_raw['error']}"})
+
+        objects = scene_raw.get("objects", [])
+        if not objects:
+            return json.dumps({
+                "scene_mode": "EMPTY",
+                "object_count": 0,
+                "summary": "Scene is empty — no objects detected.",
+            })
+
+        # ── Categorise every object ────────────────────────────────────────────
+        meshes    = [o for o in objects if o.get("type") == "MESH"]
+        armatures = [o for o in objects if o.get("type") == "ARMATURE"]
+        lights    = [o for o in objects if o.get("type") == "LIGHT"]
+        cameras   = [o for o in objects if o.get("type") == "CAMERA"]
+        empties   = [o for o in objects if o.get("type") == "EMPTY"]
+        other     = [o for o in objects if o.get("type") not in
+                     ("MESH", "ARMATURE", "LIGHT", "CAMERA", "EMPTY")]
+
+        mesh_count = len(meshes)
+
+        # ── Detect scene mode ──────────────────────────────────────────────────
+        if mesh_count == 0:
+            scene_mode = "SUPPORT_ONLY"
+        elif mesh_count == 1:
+            scene_mode = "HERO"
+        elif mesh_count <= 20:
+            # Check if one mesh heavily dominates by vertex count
+            vert_counts = [m.get("vertex_count", 0) or 0 for m in meshes]
+            total_verts = sum(vert_counts)
+            max_verts   = max(vert_counts) if vert_counts else 0
+            dominance   = max_verts / total_verts if total_verts > 0 else 0
+            scene_mode  = "HERO" if dominance > 0.6 else "COLLECTION"
+        else:
+            scene_mode = "ENVIRONMENT"
+
+        # ── Identify dominant (hero) mesh ──────────────────────────────────────
+        dominant = None
+        if meshes:
+            dominant = max(meshes, key=lambda m: m.get("vertex_count", 0) or 0)
+
+        # ── Quick health scan for each mesh ───────────────────────────────────
+        mesh_inventory = []
+        total_verts    = 0
+        total_faces    = 0
+
+        for m in meshes:
+            name   = m.get("name", "unknown")
+            verts  = m.get("vertex_count", 0) or 0
+            faces  = m.get("face_count", 0)   or 0
+            total_verts += verts
+            total_faces += faces
+
+            # Lightweight problem check — only if mesh count is manageable
+            health_flag = "unknown"
+            problem_count = 0
+            worst_issue   = None
+            if mesh_count <= 30:
+                try:
+                    prob = _send_raw("detect_mesh_problems", name=name)
+                    if "error" not in prob:
+                        problem_count = prob.get("problem_count", 0)
+                        health_flag   = "clean" if prob.get("clean", False) else "issues"
+                        prob_list     = prob.get("problems", [])
+                        if prob_list:
+                            worst = max(prob_list, key=lambda p: p.get("count", 0))
+                            worst_issue = f"{worst['type']} ({worst['count']})"
+                except Exception:
+                    health_flag = "unknown"
+
+            mesh_inventory.append({
+                "name":          name,
+                "vertex_count":  verts,
+                "face_count":    faces,
+                "health":        health_flag,
+                "problem_count": problem_count,
+                "worst_issue":   worst_issue,
+                "is_dominant":   dominant and name == dominant.get("name"),
+            })
+
+        # Sort by vertex count descending
+        mesh_inventory.sort(key=lambda m: m["vertex_count"], reverse=True)
+
+        # ── Pipeline stage for dominant asset ──────────────────────────────────
+        dominant_stage = None
+        if dominant:
+            try:
+                d_obj   = _send_raw("get_object_info",         name=dominant["name"])
+                d_stats = _send_raw("get_mesh_quality_report", name=dominant["name"])
+                if "error" not in d_obj and "error" not in d_stats:
+                    stage_result  = _classify_stage_from_signals(d_obj, d_stats)
+                    dominant_stage = {
+                        "stage_number": stage_result["stage_number"],
+                        "stage_name":   stage_result["stage_name"],
+                        "confidence":   stage_result["confidence"],
+                        "next_steps":   stage_result["next_steps"][:2],  # top 2 only
+                    }
+            except Exception:
+                dominant_stage = None
+
+        # ── Recommended audit depth ────────────────────────────────────────────
+        if scene_mode == "HERO":
+            audit_recommendation = (
+                "Run analyze_mesh_for_unreal on the dominant mesh for full depth analysis."
+            )
+        elif scene_mode == "COLLECTION":
+            audit_recommendation = (
+                "Run audit_all_objects() — will produce a ranked table of all objects by severity."
+            )
+        else:
+            audit_recommendation = (
+                "Run audit_all_objects() — will triage by severity and surface top 5 critical issues. "
+                "Full detail available per-object on request."
+            )
+
+        # ── Build clean summary string ─────────────────────────────────────────
+        issues_found  = sum(1 for m in mesh_inventory if m["health"] == "issues")
+        clean_meshes  = sum(1 for m in mesh_inventory if m["health"] == "clean")
+
+        summary_line = (
+            f"{scene_mode} scene — {mesh_count} mesh(es), {len(armatures)} armature(s), "
+            f"{len(lights)} light(s), {len(cameras)} camera(s). "
+            f"Total: {total_verts:,} verts / {total_faces:,} faces. "
+            f"Health: {clean_meshes} clean, {issues_found} with issues."
+        )
+
+        return json.dumps({
+            "scene_mode":        scene_mode,
+            "summary":           summary_line,
+            "object_counts": {
+                "meshes":    mesh_count,
+                "armatures": len(armatures),
+                "lights":    len(lights),
+                "cameras":   len(cameras),
+                "empties":   len(empties),
+                "other":     len(other),
+                "total":     len(objects),
+            },
+            "totals": {
+                "vertex_count": total_verts,
+                "face_count":   total_faces,
+            },
+            "dominant_asset":    dominant["name"] if dominant else None,
+            "dominant_stage":    dominant_stage,
+            "mesh_inventory":    mesh_inventory,
+            "armatures":         [a.get("name") for a in armatures],
+            "lights":            [l.get("name") for l in lights],
+            "cameras":           [c.get("name") for c in cameras],
+            "audit_recommendation": audit_recommendation,
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in get_scene_summary: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
+    """
+    SCENE AUDIT — calibrated multi-object analysis across the entire scene.
+
+    Automatically detects scene type and adjusts analysis depth:
+
+      HERO mode (1 dominant mesh):
+        Full analyze_mesh_for_unreal + classify_pipeline_stage on the hero.
+        Support objects (armature, lights, cameras) noted but not deep-analysed.
+
+      COLLECTION mode (2–20 mesh objects):
+        detect_mesh_problems + classify_pipeline_stage on each mesh.
+        Returns a ranked table — worst first.
+        Deep-dive (analyze_mesh_for_unreal) on objects with CRITICAL/FAIL verdict,
+        capped at max_deep_dive to prevent timeout.
+
+      ENVIRONMENT mode (20+ objects):
+        Triage by severity — surfaces critical issues only.
+        Categorises objects (hero prop / background / light / camera).
+        Full table if <=20 objects, severity summary if >20.
+        Top 5 critical issues surfaced explicitly.
+
+    Parameters:
+      mode          : "auto" (recommended) | "hero" | "collection" | "environment"
+      max_deep_dive : max objects to run full analysis on (default 5, cap 10)
+
+    Always run get_scene_summary() before this tool.
+    Always take a get_viewport_screenshot() before reporting results.
+    """
+    try:
+        max_deep_dive = min(max_deep_dive, 10)  # hard cap
+
+        # ── Step 1: get scene inventory ────────────────────────────────────────
+        scene_raw = _send_raw("get_scene_info")
+        if "error" in scene_raw:
+            return json.dumps({"error": f"get_scene_info failed: {scene_raw['error']}"})
+
+        objects   = scene_raw.get("objects", [])
+        meshes    = [o for o in objects if o.get("type") == "MESH"]
+        mesh_count = len(meshes)
+
+        if mesh_count == 0:
+            return json.dumps({"verdict": "EMPTY", "summary": "No mesh objects in scene."})
+
+        # ── Step 2: detect scene mode if auto ────────────────────────────────
+        if mode == "auto":
+            if mesh_count == 1:
+                mode = "hero"
+            elif mesh_count <= 20:
+                vert_counts = [m.get("vertex_count", 0) or 0 for m in meshes]
+                total_v     = sum(vert_counts)
+                max_v       = max(vert_counts) if vert_counts else 0
+                dominance   = max_v / total_v if total_v > 0 else 0
+                mode = "hero" if dominance > 0.6 else "collection"
+            else:
+                mode = "environment"
+
+        # ── Step 3: run analysis calibrated to mode ───────────────────────────
+
+        # HERO MODE ─────────────────────────────────────────────────────────────
+        if mode == "hero":
+            hero = max(meshes, key=lambda m: m.get("vertex_count", 0) or 0)
+            name = hero.get("name", "")
+
+            full   = json.loads(_send_json("analyze_mesh_for_unreal") if not name
+                                else json.dumps(_send_raw("analyze_mesh_for_unreal") if False
+                                else json.loads(
+                                    __import__("json").dumps(
+                                        _send_raw("get_mesh_quality_report", name=name)
+                                    )
+                                )))
+
+            # Run full compound + stage classification in parallel
+            try:
+                mesh_result  = _send_raw("detect_mesh_problems",       name=name)
+                topo_result  = _send_raw("analyze_topology",           name=name)
+                ue5_result   = _send_raw("run_unreal_readiness_check", name=name)
+                qa_result    = _send_raw("run_asset_qa",               name=name)
+                obj_info     = _send_raw("get_object_info",            name=name)
+                mesh_stats   = _send_raw("get_mesh_quality_report",    name=name)
+                stage_result = _classify_stage_from_signals(obj_info, mesh_stats)
+            except Exception as inner_e:
+                return json.dumps({"error": f"Hero analysis failed: {inner_e}"})
+
+            r_mesh = _reason_mesh_problems(mesh_result)
+            r_ue5  = _reason_unreal_readiness(ue5_result)
+            r_qa   = _reason_asset_qa(qa_result)
+
+            mesh_r   = r_mesh.get("_reasoning", {})
+            ue5_r    = r_ue5.get("_reasoning",  {})
+            qa_r     = r_qa.get("_reasoning",   {})
+
+            blocking = ue5_result.get("blocking_errors", 0)
+            verdict  = "🚫 CRITICAL" if mesh_r.get("overall_severity") == "critical" \
+                       else "❌ FAIL"  if blocking > 0 \
+                       else "⚠️ WARN"  if ue5_result.get("warnings", 0) > 0 \
+                       else "✅ PASS"
+
+            return json.dumps({
+                "mode":           "HERO",
+                "hero_object":    name,
+                "stage":          f"Stage {stage_result['stage_number']} — {stage_result['stage_name']}",
+                "stage_confidence": stage_result["confidence"],
+                "verdict":        verdict,
+                "mesh_severity":  mesh_r.get("overall_severity"),
+                "ue5_blocking_errors": blocking,
+                "ue5_warnings":   ue5_result.get("warnings", 0),
+                "qa_verdict":     qa_result.get("verdict"),
+                "mesh_findings":  mesh_r.get("findings", []),
+                "ue5_findings":   ue5_r.get("findings", []),
+                "next_steps":     stage_result["next_steps"],
+                "support_objects": {
+                    "armatures": [o["name"] for o in objects if o.get("type") == "ARMATURE"],
+                    "lights":    [o["name"] for o in objects if o.get("type") == "LIGHT"],
+                    "cameras":   [o["name"] for o in objects if o.get("type") == "CAMERA"],
+                },
+            }, indent=2, default=str)
+
+        # COLLECTION MODE ───────────────────────────────────────────────────────
+        elif mode == "collection":
+            rows         = []
+            critical_objs = []
+
+            for m in meshes:
+                name = m.get("name", "")
+                try:
+                    prob     = _send_raw("detect_mesh_problems", name=name)
+                    obj_info = _send_raw("get_object_info",      name=name)
+                    stats    = _send_raw("get_mesh_quality_report", name=name)
+                    stage    = _classify_stage_from_signals(obj_info, stats)
+
+                    r_prob   = _reason_mesh_problems(prob)
+                    severity = r_prob.get("_reasoning", {}).get("overall_severity", "pass")
+                    findings = r_prob.get("_reasoning", {}).get("findings", [])
+                    worst    = findings[0]["issue"] if findings else "Clean"
+
+                    if severity == "critical":
+                        emoji = "🚫"
+                        critical_objs.append(name)
+                    elif severity == "warning":
+                        emoji = "⚠️"
+                    else:
+                        emoji = "✅"
+
+                    rows.append({
+                        "object":        name,
+                        "verdict_emoji": emoji,
+                        "severity":      severity,
+                        "vertex_count":  m.get("vertex_count", 0),
+                        "problem_count": prob.get("problem_count", 0),
+                        "worst_issue":   worst,
+                        "stage":         f"Stage {stage['stage_number']} — {stage['stage_name']}",
+                    })
+                except Exception:
+                    rows.append({
+                        "object":        name,
+                        "verdict_emoji": "❓",
+                        "severity":      "unknown",
+                        "vertex_count":  m.get("vertex_count", 0),
+                        "problem_count": 0,
+                        "worst_issue":   "Analysis failed",
+                        "stage":         "Unknown",
+                    })
+
+            # Sort worst first
+            sev_order = {"critical": 0, "warning": 1, "pass": 2, "unknown": 3}
+            rows.sort(key=lambda r: sev_order.get(r["severity"], 3))
+
+            # Deep-dive on critical objects up to cap
+            deep_results = {}
+            for crit_name in critical_objs[:max_deep_dive]:
+                try:
+                    ue5 = _send_raw("run_unreal_readiness_check", name=crit_name)
+                    r   = _reason_unreal_readiness(ue5)
+                    deep_results[crit_name] = {
+                        "blocking_errors": ue5.get("blocking_errors", 0),
+                        "ue5_findings":    r.get("_reasoning", {}).get("findings", [])[:5],
+                    }
+                except Exception:
+                    pass
+
+            critical_count = sum(1 for r in rows if r["severity"] == "critical")
+            warn_count     = sum(1 for r in rows if r["severity"] == "warning")
+            pass_count     = sum(1 for r in rows if r["severity"] == "pass")
+
+            return json.dumps({
+                "mode":           "COLLECTION",
+                "object_count":   mesh_count,
+                "verdict_summary": f"{critical_count} CRITICAL, {warn_count} WARN, {pass_count} PASS",
+                "ranked_table":   rows,
+                "deep_dive_results": deep_results,
+                "_note": (
+                    f"Deep analysis run on {len(deep_results)} critical object(s). "
+                    f"Ask about any specific object for full detail."
+                ) if deep_results else "All objects clean — no deep-dive needed.",
+            }, indent=2, default=str)
+
+        # ENVIRONMENT MODE ──────────────────────────────────────────────────────
+        else:
+            rows         = []
+            critical_top = []
+
+            for m in meshes:
+                name  = m.get("name", "")
+                verts = m.get("vertex_count", 0) or 0
+                try:
+                    prob     = _send_raw("detect_mesh_problems", name=name)
+                    r_prob   = _reason_mesh_problems(prob)
+                    severity = r_prob.get("_reasoning", {}).get("overall_severity", "pass")
+                    findings = r_prob.get("_reasoning", {}).get("findings", [])
+                    worst    = findings[0]["issue"] if findings else "Clean"
+                    prob_ct  = prob.get("problem_count", 0)
+                except Exception:
+                    severity = "unknown"
+                    worst    = "Analysis failed"
+                    prob_ct  = 0
+
+                emoji = {"critical": "🚫", "warning": "⚠️", "pass": "✅"}.get(severity, "❓")
+
+                row = {
+                    "object":        name,
+                    "verdict_emoji": emoji,
+                    "severity":      severity,
+                    "vertex_count":  verts,
+                    "problem_count": prob_ct,
+                    "worst_issue":   worst,
+                }
+                rows.append(row)
+
+                if severity == "critical":
+                    critical_top.append(row)
+
+            sev_order = {"critical": 0, "warning": 1, "pass": 2, "unknown": 3}
+            rows.sort(key=lambda r: sev_order.get(r["severity"], 3))
+            critical_top = rows[:5]  # top 5 worst
+
+            critical_count = sum(1 for r in rows if r["severity"] == "critical")
+            warn_count     = sum(1 for r in rows if r["severity"] == "warning")
+            pass_count     = sum(1 for r in rows if r["severity"] == "pass")
+            total_verts    = sum(m.get("vertex_count", 0) or 0 for m in meshes)
+
+            non_mesh_summary = {
+                "armatures": len([o for o in objects if o.get("type") == "ARMATURE"]),
+                "lights":    len([o for o in objects if o.get("type") == "LIGHT"]),
+                "cameras":   len([o for o in objects if o.get("type") == "CAMERA"]),
+                "empties":   len([o for o in objects if o.get("type") == "EMPTY"]),
+            }
+
+            # Full table for small environments, severity summary for large
+            output_table = rows if mesh_count <= 20 else rows[:20]
+            truncated    = mesh_count > 20
+
+            return json.dumps({
+                "mode":            "ENVIRONMENT",
+                "total_objects":   len(objects),
+                "mesh_count":      mesh_count,
+                "total_verts":     total_verts,
+                "verdict_summary": f"{critical_count} CRITICAL, {warn_count} WARN, {pass_count} PASS",
+                "top_5_critical":  critical_top,
+                "non_mesh_objects": non_mesh_summary,
+                "object_table":    output_table,
+                "table_truncated": truncated,
+                "_note": (
+                    f"Showing worst 20 of {mesh_count} meshes. "
+                    "Ask about any specific object for full detail."
+                ) if truncated else
+                    "Ask about any specific object for full depth analysis.",
+            }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in audit_all_objects: {e}")
         return json.dumps({"error": str(e)})
 
 
