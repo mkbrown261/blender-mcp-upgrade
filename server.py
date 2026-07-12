@@ -3052,8 +3052,11 @@ else:
         blender = get_blender_connection()
         raw = blender.send_command("execute_code_safe", {"code": script})
 
-        # Parse the JSON printed by the script
-        output_text = raw.get("output", "") if isinstance(raw, dict) else str(raw)
+        # Parse the JSON printed by the script.
+        # FIX: execute_code_safe's captured stdout is under "result", not "output"
+        # (addon.py execute_code returns {"executed": bool, "result": str} —
+        # confirmed live this session, e.g. {"executed": true, "result": "...", ...}).
+        output_text = raw.get("result", "") if isinstance(raw, dict) else str(raw)
         result = None
         for line in output_text.splitlines():
             line = line.strip()
@@ -3318,7 +3321,8 @@ else:
         blender = get_blender_connection()
         raw = blender.send_command("execute_code_safe", {"code": script})
 
-        output_text = raw.get("output", "") if isinstance(raw, dict) else str(raw)
+        # FIX: same as analyze_rig_weights — captured stdout is under "result".
+        output_text = raw.get("result", "") if isinstance(raw, dict) else str(raw)
         result = None
         for line in output_text.splitlines():
             line = line.strip()
