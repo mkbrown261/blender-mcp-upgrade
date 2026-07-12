@@ -1532,6 +1532,8 @@ TIER 2 (targeted):
   run_asset_qa                 QA pass/fail verdict
   classify_pipeline_stage      infer production stage from signals
   analyze_material_pbr         full PBR node graph review
+  analyze_rig_weights          weight QA: unweighted verts, >8 influences, zero-weight
+  analyze_rig_skeleton         skeleton QA: root at origin, orphan bones, naming
 TIER 3 (raw — only when Tier 1-2 don't cover it):
   detect_mesh_problems         raw problem list
   get_object_info              raw object data
@@ -1561,6 +1563,7 @@ TRIGGER MAP:
                                     → auto_repair_mesh() → screenshot + run_asset_qa()
   "poly/vert count"               → get_object_info() + stage context
   "what stage"                    → classify_pipeline_stage() + screenshot
+  "rig/weights/skinning/bones"    → analyze_rig_weights() then analyze_rig_skeleton()
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → get_scene_summary()
                                     → gap report (Present/Missing/Extra/Different)
@@ -2775,18 +2778,31 @@ def what_next(object_name: str, context: str = "") -> str:
             blocking_ct = material_count
             after_this  = "If materials pass, move to rigging setup or direct export depending on asset type."
 
-        # PRIORITY 7 — Stage 5: rigged but not validated for export
+        # PRIORITY 7 — Stage 5: rigged — run rig QA first, then export gate
         elif stage_num == 5 and has_armature:
-            action      = "Validate rig and run full export readiness check"
+            action      = "Run rig QA: check weights and skeleton before export gate"
             why         = (
-                f"Armature modifier detected — this is a rigged asset. Before export, "
-                f"the full export gate must pass: scale applied, pivot at origin, "
-                f"no blocking modifiers, UE5 naming conventions. Rig issues caught "
-                f"here are far cheaper to fix than after engine import."
+                f"Armature modifier detected — this is a rigged asset at Stage 5. "
+                f"Before running the export gate, rig weight and skeleton quality must "
+                f"be confirmed. Unweighted vertices snap to world origin at runtime. "
+                f"Over-influence vertices (>8 groups) are silently truncated by UE5. "
+                f"A mis-placed root bone causes animation drift in engine. "
+                f"These failures are invisible until first pose frame in engine — "
+                f"catch them here."
             )
-            how         = "run_unreal_readiness_check() for the full gate, then analyze_mesh_for_unreal() for complete report."
+            how         = (
+                "Step 1: analyze_rig_weights(object_name) — unweighted verts, "
+                "influence count, zero-weight assignments. "
+                "Step 2: analyze_rig_skeleton(object_name) — root bone position, "
+                "orphan bones, bone count, UE5 naming. "
+                "Step 3 (if both pass): run_unreal_readiness_check() then "
+                "analyze_mesh_for_unreal() for full export gate."
+            )
             blocking_ct = 0
-            after_this  = "If readiness check passes, export_for_unreal() with verified settings."
+            after_this  = (
+                "If rig QA passes, run run_unreal_readiness_check() — "
+                "the full export gate (scale, pivot, modifiers, UE5 conventions)."
+            )
 
         # PRIORITY 8 — Stage 6 or clean mesh with materials: run full readiness check
         elif stage_num == 6 or (has_uvs and has_materials and health == "clean"):
@@ -2859,6 +2875,472 @@ def what_next(object_name: str, context: str = "") -> str:
 
     except Exception as e:
         logger.error(f"Error in what_next: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def analyze_rig_weights(object_name: str) -> str:
+    """
+    RIG WEIGHT QA — checks vertex group weights for catastrophic skinning failures.
+
+    Runs three checks on the mesh's vertex groups (deformation weights):
+
+      CRITICAL — Unweighted vertices
+        Vertices assigned to NO group at all. At runtime these snap to the world
+        origin on first pose frame. Even one unweighted vertex is a hard failure.
+
+      CRITICAL — Over-influence vertices (>8 groups)
+        UE5 hard-truncates to 8 influences per vertex. Excess influences are silently
+        discarded, causing unpredictable deformation. Sampled across first 1000 verts.
+
+      WARNING  — Zero-weight assignments
+        Vertex assigned to a group with weight 0.0. These cost memory/CPU in the
+        vertex shader and indicate painting errors. Not a hard failure but should be
+        cleaned before export.
+
+    Parameters:
+      object_name : the MESH object to inspect (not the armature)
+
+    Returns:
+      checks       : list of {check, severity, count, detail}
+      summary      : plain-English verdict
+      verdict      : CRITICAL | WARNING | PASS
+      group_count  : number of vertex groups on the object
+      vertex_count : total vertices inspected
+    """
+    try:
+        # Build inspection script to run inside Blender
+        script = r"""
+import bpy
+import json
+
+obj = bpy.data.objects.get('{OBJECT_NAME}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJECT_NAME}"}))
+else:
+    mesh = obj.data
+    groups = obj.vertex_groups
+    group_count = len(groups)
+    total_verts = len(mesh.vertices)
+
+    unweighted = []       # verts with NO group assignment
+    over_influence = []   # verts with >8 group assignments
+    zero_weight = []      # (vert_idx, group_name) with weight == 0.0
+
+    # Sample cap for influence check — 1000 verts for performance
+    sample_cap = 1000
+
+    for i, v in enumerate(mesh.vertices):
+        assignments = v.groups  # BGeoVertexGroupElement list
+        n_assigned = len(assignments)
+
+        if n_assigned == 0:
+            unweighted.append(i)
+        else:
+            # Zero-weight: any assignment with weight 0.0
+            for g in assignments:
+                if g.weight == 0.0:
+                    gname = groups[g.group].name if g.group < len(groups) else f"grp_{g.group}"
+                    zero_weight.append((i, gname))
+
+        # Influence count only on first sample_cap verts
+        if i < sample_cap and n_assigned > 8:
+            over_influence.append({"vert": i, "influences": n_assigned})
+
+    checks = []
+
+    # CRITICAL: unweighted
+    if unweighted:
+        checks.append({
+            "check":    "unweighted_vertices",
+            "severity": "CRITICAL",
+            "count":    len(unweighted),
+            "detail":   (
+                f"{len(unweighted)} vertex/vertices assigned to NO group. "
+                f"Will snap to world origin at runtime. First 5 indices: "
+                + str(unweighted[:5])
+            ),
+        })
+    else:
+        checks.append({
+            "check":    "unweighted_vertices",
+            "severity": "PASS",
+            "count":    0,
+            "detail":   "All vertices have at least one group assignment.",
+        })
+
+    # CRITICAL: over-influence (reported as sampled)
+    if over_influence:
+        checks.append({
+            "check":    "over_influence_vertices",
+            "severity": "CRITICAL",
+            "count":    len(over_influence),
+            "detail":   (
+                f"{len(over_influence)} vertex/vertices exceed 8 influences "
+                f"(UE5 hard limit) in first {min(sample_cap, total_verts)} sampled. "
+                f"UE5 silently truncates extras causing unpredictable deformation. "
+                f"Sample: " + str(over_influence[:3])
+            ),
+            "sampled":  min(sample_cap, total_verts),
+        })
+    else:
+        checks.append({
+            "check":    "over_influence_vertices",
+            "severity": "PASS",
+            "count":    0,
+            "detail":   (
+                f"No vertices exceed 8 influences in first "
+                f"{min(sample_cap, total_verts)} sampled."
+            ),
+            "sampled":  min(sample_cap, total_verts),
+        })
+
+    # WARNING: zero-weight
+    if zero_weight:
+        # Collect unique groups involved
+        zw_groups = list(dict.fromkeys(g for _, g in zero_weight))[:10]
+        checks.append({
+            "check":    "zero_weight_assignments",
+            "severity": "WARNING",
+            "count":    len(zero_weight),
+            "detail":   (
+                f"{len(zero_weight)} zero-weight assignment(s). "
+                f"Groups involved (up to 10): {zw_groups}. "
+                f"Clean with Weight Paint > Clean Weights."
+            ),
+        })
+    else:
+        checks.append({
+            "check":    "zero_weight_assignments",
+            "severity": "PASS",
+            "count":    0,
+            "detail":   "No zero-weight assignments found.",
+        })
+
+    # Overall verdict
+    has_critical = any(c["severity"] == "CRITICAL" for c in checks)
+    has_warning  = any(c["severity"] == "WARNING"  for c in checks)
+    verdict      = "CRITICAL" if has_critical else "WARNING" if has_warning else "PASS"
+
+    if has_critical:
+        summary = (
+            "Rig has CRITICAL weight failures. Fix before any export attempt. "
+            "Unweighted vertices and/or over-influence vertices cause silent or "
+            "catastrophic deformation failures in engine."
+        )
+    elif has_warning:
+        summary = (
+            "Rig weights are functional but have zero-weight assignments that "
+            "should be cleaned before export. Not a hard blocker."
+        )
+    else:
+        summary = (
+            f"Rig weights appear clean across {total_verts} vertices "
+            f"({group_count} group(s)). No catastrophic failures detected."
+        )
+
+    print(json.dumps({
+        "verdict":      verdict,
+        "summary":      summary,
+        "group_count":  group_count,
+        "vertex_count": total_verts,
+        "checks":       checks,
+    }))
+""".replace("{OBJECT_NAME}", object_name.replace("'", "\\'"))
+
+        # Run inside Blender via execute_code_safe
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script})
+
+        # Parse the JSON printed by the script
+        output_text = raw.get("output", "") if isinstance(raw, dict) else str(raw)
+        result = None
+        for line in output_text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+        if result is None:
+            return json.dumps({
+                "error": "No JSON output from rig weight inspection script.",
+                "raw_output": output_text[:500],
+            })
+        if "error" in result:
+            return json.dumps(result)
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in analyze_rig_weights: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def analyze_rig_skeleton(object_name: str) -> str:
+    """
+    RIG SKELETON QA — inspects the armature linked to a mesh object.
+
+    Finds the armature via the object's ARMATURE modifier and runs four checks:
+
+      CRITICAL — Root bone not at world origin
+        The root bone's head must be at or near (0, 0, 0). A mis-placed root means
+        the skeleton is offset from the mesh in engine, causing animation drift.
+        Threshold: 0.01 units in any axis.
+
+      WARNING  — Orphan bones
+        Bones with no corresponding vertex group anywhere in the scene's mesh
+        objects. Orphan bones waste memory and may indicate naming mismatches
+        between rig and weights. Pure control/IK bones are expected orphans —
+        the check names them so you can confirm intentionality.
+
+      INFO     — Bone count
+        Total bone count. UE5 has no hard limit but >256 bones requires special
+        handling. Reported for awareness.
+
+      INFO     — UE5 naming conventions
+        Common UE5 skeleton root names: "root", "Root", "pelvis", "Pelvis",
+        "hips", "Hips". If none of the root-candidate bones match, reported as
+        INFO (not FAIL — custom naming is valid, just requires manual mapping).
+
+    Parameters:
+      object_name : the MESH object to inspect (not the armature directly)
+
+    Returns:
+      armature_name : name of the linked armature object
+      checks        : list of {check, severity, detail}
+      summary       : plain-English verdict
+      verdict       : CRITICAL | WARNING | INFO | PASS
+      bone_count    : total bones in armature
+    """
+    try:
+        script = r"""
+import bpy
+import json
+import math
+
+obj = bpy.data.objects.get('{OBJECT_NAME}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJECT_NAME}"}))
+else:
+    # Find armature via ARMATURE modifier
+    armature_obj = None
+    for mod in obj.modifiers:
+        if mod.type == 'ARMATURE' and mod.object is not None:
+            armature_obj = mod.object
+            break
+
+    if armature_obj is None:
+        print(json.dumps({
+            "error": (
+                "No ARMATURE modifier with a linked armature found on "
+                "'{OBJECT_NAME}'. Is the armature modifier set up correctly?"
+            )
+        }))
+    else:
+        arm_data   = armature_obj.data
+        bones      = arm_data.bones
+        bone_count = len(bones)
+
+        checks = []
+
+        # ── CHECK 1: Root bone at world origin ──────────────────────────────
+        # Find root bones (bones with no parent)
+        root_bones = [b for b in bones if b.parent is None]
+        origin_threshold = 0.01
+
+        origin_fail = []
+        for rb in root_bones:
+            # head_local is in armature local space; apply armature world transform
+            arm_world = armature_obj.matrix_world
+            head_world = arm_world @ rb.head_local
+            dist = math.sqrt(
+                head_world.x**2 + head_world.y**2 + head_world.z**2
+            )
+            if dist > origin_threshold:
+                origin_fail.append({
+                    "bone":     rb.name,
+                    "position": [round(head_world.x, 4),
+                                 round(head_world.y, 4),
+                                 round(head_world.z, 4)],
+                    "distance": round(dist, 4),
+                })
+
+        if origin_fail:
+            checks.append({
+                "check":    "root_bone_at_origin",
+                "severity": "CRITICAL",
+                "detail":   (
+                    f"{len(origin_fail)} root bone(s) not at world origin "
+                    f"(threshold {origin_threshold} units). "
+                    f"Skeleton will be offset from mesh in engine. "
+                    f"Details: {origin_fail}"
+                ),
+            })
+        else:
+            root_names = [rb.name for rb in root_bones]
+            checks.append({
+                "check":    "root_bone_at_origin",
+                "severity": "PASS",
+                "detail":   (
+                    f"Root bone(s) {root_names} are at or near world origin."
+                ),
+            })
+
+        # ── CHECK 2: Orphan bones ───────────────────────────────────────────
+        # Collect all vertex group names from all mesh objects that use this armature
+        all_vg_names = set()
+        for scene_obj in bpy.data.objects:
+            if scene_obj.type != 'MESH':
+                continue
+            uses_this_arm = any(
+                mod.type == 'ARMATURE' and mod.object == armature_obj
+                for mod in scene_obj.modifiers
+            )
+            if uses_this_arm:
+                for vg in scene_obj.vertex_groups:
+                    all_vg_names.add(vg.name)
+
+        orphan_bones = [
+            b.name for b in bones if b.name not in all_vg_names
+        ]
+
+        if orphan_bones:
+            checks.append({
+                "check":    "orphan_bones",
+                "severity": "WARNING",
+                "count":    len(orphan_bones),
+                "detail":   (
+                    f"{len(orphan_bones)} bone(s) have no matching vertex group "
+                    f"in any mesh that uses this armature. May be intentional "
+                    f"control/IK bones — confirm intentionality. "
+                    f"Names (up to 20): {orphan_bones[:20]}"
+                ),
+            })
+        else:
+            checks.append({
+                "check":    "orphan_bones",
+                "severity": "PASS",
+                "count":    0,
+                "detail":   "All bones have a corresponding vertex group.",
+            })
+
+        # ── CHECK 3: Bone count ─────────────────────────────────────────────
+        if bone_count > 256:
+            bc_note = (
+                f"{bone_count} bones. Exceeds 256 — requires explicit "
+                f"'Max Bones' setting in UE5 skeletal mesh import. "
+                f"Not a hard fail but requires attention."
+            )
+        else:
+            bc_note = f"{bone_count} bone(s). Within standard UE5 range (<256)."
+
+        checks.append({
+            "check":    "bone_count",
+            "severity": "INFO",
+            "count":    bone_count,
+            "detail":   bc_note,
+        })
+
+        # ── CHECK 4: UE5 naming conventions ────────────────────────────────
+        ue5_root_names = {
+            "root", "Root", "pelvis", "Pelvis", "hips", "Hips",
+            "ROOT", "PELVIS", "HIPS"
+        }
+        root_bone_names = {b.name for b in root_bones}
+        all_bone_names  = {b.name for b in bones}
+
+        has_ue5_root  = bool(root_bone_names & ue5_root_names)
+        has_ue5_in_all = bool(all_bone_names & ue5_root_names)
+
+        if not has_ue5_root and not has_ue5_in_all:
+            naming_note = (
+                f"No standard UE5 root bone name found "
+                f"(expected: root, Root, pelvis, hips, etc.). "
+                f"Root bone(s): {list(root_bone_names)[:5]}. "
+                f"Custom naming is valid — requires manual bone mapping in UE5 import."
+            )
+            naming_sev = "INFO"
+        elif not has_ue5_root and has_ue5_in_all:
+            naming_note = (
+                f"UE5-style name found in hierarchy but not at root level. "
+                f"Root bone(s): {list(root_bone_names)[:5]}. "
+                f"Confirm root is the correct top-level bone for engine import."
+            )
+            naming_sev = "INFO"
+        else:
+            naming_note = (
+                f"Root bone name matches UE5 convention: "
+                f"{list(root_bone_names & ue5_root_names)}."
+            )
+            naming_sev = "PASS"
+
+        checks.append({
+            "check":    "ue5_naming_convention",
+            "severity": naming_sev,
+            "detail":   naming_note,
+        })
+
+        # ── Overall verdict ─────────────────────────────────────────────────
+        has_critical = any(c["severity"] == "CRITICAL" for c in checks)
+        has_warning  = any(c["severity"] == "WARNING"  for c in checks)
+        verdict      = "CRITICAL" if has_critical else "WARNING" if has_warning else "PASS"
+
+        if has_critical:
+            summary = (
+                "Skeleton has CRITICAL structural issues. Root bone position "
+                "must be fixed before any export or animation baking."
+            )
+        elif has_warning:
+            summary = (
+                f"Skeleton structure is functional ({bone_count} bones) but has "
+                f"orphan bones that should be reviewed before export."
+            )
+        else:
+            summary = (
+                f"Skeleton structure checks out: {bone_count} bone(s), "
+                f"root at origin, no orphans detected."
+            )
+
+        print(json.dumps({
+            "verdict":       verdict,
+            "summary":       summary,
+            "armature_name": armature_obj.name,
+            "bone_count":    bone_count,
+            "root_bones":    [b.name for b in root_bones],
+            "checks":        checks,
+        }))
+""".replace("{OBJECT_NAME}", object_name.replace("'", "\\'"))
+
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script})
+
+        output_text = raw.get("output", "") if isinstance(raw, dict) else str(raw)
+        result = None
+        for line in output_text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+        if result is None:
+            return json.dumps({
+                "error": "No JSON output from rig skeleton inspection script.",
+                "raw_output": output_text[:500],
+            })
+        if "error" in result:
+            return json.dumps(result)
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in analyze_rig_skeleton: {e}")
         return json.dumps({"error": str(e)})
 
 
