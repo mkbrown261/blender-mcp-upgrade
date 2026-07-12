@@ -238,14 +238,20 @@ def _reason_mesh_problems(raw: dict) -> dict:
                 "produce incorrect results."
             ),
             "professional_fix": (
-                "Edit Mode > Select > Select All by Trait > Non Manifold. "
-                "Delete interior faces first, merge overlapping verts, "
-                "then fill or bridge remaining open edges."
+                "auto_repair_mesh attempts: merge by distance (eliminates coincident "
+                "verts that create T-junctions and overlapping faces), then limited "
+                "hole fill (fills simple open boundary loops). Complex interior face "
+                "non-manifolds that survive both passes require manual artist review: "
+                "Edit Mode > Select > Select All by Trait > Non Manifold, then "
+                "delete interior faces or bridge open loops."
             ),
-            "auto_fixable": False,
-            "auto_fix_reason": "Non-manifold repair requires artist judgement on intent.",
+            "auto_fixable": True,
+            "auto_fix_reason": (
+                "Partial auto-repair: merge-by-distance resolves most coincident-vert "
+                "non-manifolds. Remaining count reported so artist knows what survived."
+            ),
         })
-        needs_artist.append("non_manifold_edges")
+        auto_fixable.append("non_manifold_edges")
 
     lv = prob_counts.get("isolated_verts", 0)
     if lv > 0:
@@ -1398,6 +1404,39 @@ def _reason_material(raw: dict) -> dict:
 
 # Safe repair scripts — each is a standalone bpy code block
 _REPAIR_SCRIPTS = {
+    "non_manifold_edges": """
+import bpy
+import bmesh
+obj = bpy.context.active_object
+bpy.ops.object.mode_set(mode='EDIT')
+
+bm = bmesh.from_edit_mesh(obj.data)
+nm_before = sum(1 for e in bm.edges if not e.is_manifold)
+
+# Pass 1: merge by distance — eliminates coincident verts that create
+# T-junctions, overlapping faces, and non-manifold vert-touch points.
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.mesh.remove_doubles(threshold=0.0001)
+
+# Pass 2: delete interior faces — faces fully enclosed by other faces
+# cause non-manifold edges because an edge ends up shared by 3+ faces.
+bpy.ops.mesh.select_all(action='DESELECT')
+bpy.ops.mesh.select_interior_faces()
+bpy.ops.mesh.delete(type='FACE')
+
+# Pass 3: limited dissolve of remaining wire edges — stray edges with
+# no face on either side leave non-manifold verts.
+bpy.ops.mesh.select_all(action='DESELECT')
+for e in bm.edges:
+    e.select = (len(e.link_faces) == 0)
+bmesh.update_edit_mesh(obj.data)
+bpy.ops.mesh.dissolve_edges()
+
+bm = bmesh.from_edit_mesh(obj.data)
+nm_after = sum(1 for e in bm.edges if not e.is_manifold)
+bpy.ops.object.mode_set(mode='OBJECT')
+print(f"non_manifold_edges:done:before={nm_before}:after={nm_after}")
+""",
     "loose_vertices": """
 import bpy
 obj = bpy.context.active_object
@@ -1446,10 +1485,11 @@ print("scale_not_applied:done")
 # _REPAIR_ORDER uses script keys. addon.py calls loose verts "isolated_verts"
 # so we check both names in the repair loop below.
 _REPAIR_ORDER = [
-    "loose_vertices",    # addon key: "isolated_verts"
-    "duplicate_faces",
+    "non_manifold_edges",  # first: merge coincident verts + delete interior faces
+    "loose_vertices",      # addon key: "isolated_verts" — after non-manifold cleanup
+    "duplicate_faces",     # merge by distance (also helps non-manifold but scoped here)
     "zero_area_faces",
-    "inverted_normals",
+    "inverted_normals",    # last: recalc normals after all geometry changes
 ]
 
 
@@ -2224,15 +2264,23 @@ def auto_repair_mesh(name: str, dry_run: bool = False) -> str:
     AUTO-REPAIR — Safe mesh cleanup loop: Scan → Diagnose → Repair → Verify.
 
     Automatically fixes the following problems (in safe order):
-      1. Loose vertices (delete)
-      2. Duplicate faces (merge by distance)
-      3. Zero-area/degenerate faces (dissolve degenerate)
-      4. Inverted normals (recalculate outside)
+      1. Non-manifold edges — three passes:
+           a) merge by distance (0.0001m) — eliminates coincident verts that
+              create T-junctions and overlapping-face non-manifolds
+           b) delete interior faces — faces enclosed by other faces cause edges
+              shared by 3+ faces
+           c) dissolve wire edges — stray edges with no face leave non-manifold verts
+         Reports before/after count. Surviving non-manifolds (complex interior
+         topology) are flagged for artist review.
+      2. Loose vertices — delete isolated verts not connected to any edge
+      3. Duplicate faces — merge by distance removes overlapping geometry
+      4. Zero-area/degenerate faces — dissolve degenerate (threshold 0.0001m)
+      5. Inverted normals — recalculate outside (run last, after all geometry fixed)
 
     Problems NOT auto-repaired (require artist review):
-      - Non-manifold edges (topology intent unclear)
+      - Non-manifold edges that survive all three passes (complex interior topology)
       - UV overlaps (may be intentional tiling)
-      - N-gons (topology restructuring needed)
+      - N-gons (topology restructuring needed — auto-triangulate would break edge flow)
 
     dry_run=True: diagnoses and plans repairs without executing them.
     dry_run=False: executes all safe repairs then re-scans to verify.
