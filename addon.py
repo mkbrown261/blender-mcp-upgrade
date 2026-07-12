@@ -380,7 +380,13 @@ class BlenderMCPServer:
                             and hasattr(obj.animation_data, 'action_slot')):
                         slot = obj.animation_data.action_slot
                     if slot is not None:
-                        cb = strip.channelbags.get(slot)
+                        # FIX: strip.channelbags is a plain collection — its .get()
+                        # does not accept a slot object (raises, doesn't return None).
+                        # The real lookup is the *singular* strip.channelbag(slot) method.
+                        try:
+                            cb = strip.channelbag(slot)
+                        except Exception:
+                            cb = None
                         if cb:
                             fcurves.extend(cb.fcurves)
                             continue
