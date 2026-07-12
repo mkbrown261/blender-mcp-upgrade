@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "blender": {
+      "command": "uv",
+      "args": ["run", "/Users/masonbrown/Desktop/blender-mcp-upgrade-main/server.py"]
+    }
+  }
+}
