@@ -2865,17 +2865,22 @@ def get_scene_summary() -> str:
                     verts  = stats.get("counts", {}).get("verts",     0) or 0
                     faces  = stats.get("counts", {}).get("faces",     0) or 0
                     health_flag = stats.get("health", "unknown")
-                    probs  = stats.get("problems", {})
-                    # Count distinct problem TYPES that have at least one instance.
-                    # Do NOT sum the raw counts — those are edge/vertex quantities,
-                    # not a count of problem categories.
+                    probs      = stats.get("problems", {})
+                    face_types = stats.get("face_types", {})
+                    ngon_count = face_types.get("ngons", 0) or 0
+                    # Count distinct problem TYPES with at least one instance.
+                    # Ngons live under face_types, not problems — add them explicitly
+                    # so problem_count matches detect_mesh_problems semantics.
                     problem_count = sum(1 for v in probs.values() if isinstance(v, int) and v > 0)
-                    # Find worst problem by count
-                    if probs:
-                        worst_key = max(probs, key=lambda k: probs[k] if isinstance(probs[k], int) else 0)
-                        worst_val = probs[worst_key]
-                        if worst_val > 0:
-                            worst_issue = f"{worst_key} ({worst_val})"
+                    if ngon_count > 0:
+                        problem_count += 1
+                    # Worst issue: check problems dict AND ngons, surface whichever is largest
+                    candidates = {k: v for k, v in probs.items() if isinstance(v, int) and v > 0}
+                    if ngon_count > 0:
+                        candidates["ngons"] = ngon_count
+                    if candidates:
+                        worst_key = max(candidates, key=candidates.get)
+                        worst_issue = f"{worst_key} ({candidates[worst_key]})"
             except Exception:
                 pass
 
