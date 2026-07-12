@@ -1521,6 +1521,7 @@ STOP. Wait for user. Do not auto-run further tools.
 
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
 TIER 1 (prefer — most coverage per call):
+  what_next                    ONE priority action: what to do right now and why
   analyze_mesh_for_unreal      full mesh + topology + UE5 readiness in one call
   analyze_animation_quality    full animation health check
   critique_animation           animation critique with stage context
@@ -1529,6 +1530,8 @@ TIER 2 (targeted):
   analyze_topology             topology score + pole analysis
   run_unreal_readiness_check   UE5 gate check
   run_asset_qa                 QA pass/fail verdict
+  classify_pipeline_stage      infer production stage from signals
+  analyze_material_pbr         full PBR node graph review
 TIER 3 (raw — only when Tier 1-2 don't cover it):
   detect_mesh_problems         raw problem list
   get_object_info              raw object data
@@ -1541,7 +1544,15 @@ SCENE-LEVEL ORDER (never skip):
   screenshot → get_scene_summary() → classify_pipeline_stage(name) → audit_all_objects()
 audit_all_objects auto-mode: 1 mesh = HERO, 2–20 = COLLECTION, 20+ = ENVIRONMENT.
 
+BUDGET ASSUMPTION RULE:
+  analyze_mesh_for_unreal and what_next both state their assumed asset context.
+  Always read the assumed_context and correct_me fields in their output.
+  If the assumption is wrong, tell the user immediately and re-run with context=
+  parameter set to the correct asset description before giving any verdict.
+
 TRIGGER MAP:
+  "what do I do next" / "where do I start" / "what should I do"
+                                  → what_next(object_name) immediately
   "look/show/what do you see"     → get_viewport_screenshot() immediately
   "ready for Unreal/export/UE5"   → analyze_mesh_for_unreal()
   "topology/loops/quads"          → screenshot + analyze_topology()
@@ -1549,7 +1560,7 @@ TRIGGER MAP:
   "fix/clean/repair"              → describe plan explicitly → WAIT for "yes/do it"
                                     → auto_repair_mesh() → screenshot + run_asset_qa()
   "poly/vert count"               → get_object_info() + stage context
-  "what stage"                    → screenshot + get_object_info() + stage reasoning
+  "what stage"                    → classify_pipeline_stage() + screenshot
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → get_scene_summary()
                                     → gap report (Present/Missing/Extra/Different)
@@ -2228,8 +2239,43 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic") -> str
             verdict = "EXPORT READY"
             overall = "pass"
 
+        # ── Infer asset context for budget assumption statement ────────────────
+        vert_count = raw_quality.get("counts", {}).get("verts", 0) or 0
+        has_arm    = any(
+            m.get("type") == "ARMATURE"
+            for m in raw_quality.get("modifiers", [])
+            if isinstance(m, dict)
+        )
+        has_mat    = bool(r_ue5.get("_reasoning", {}).get("findings"))  # rough proxy
+        has_uv     = raw_quality.get("uv", {}).get("has_uvs", False)
+
+        if vert_count > 300_000:
+            assumed_tier = "high-poly sculpt or scan source"
+            budget_note  = "No polygon budget applies — this is a source mesh, not a runtime asset."
+        elif has_arm and vert_count > 50_000:
+            assumed_tier = "hero or main character (rigged)"
+            budget_note  = f"Evaluating at hero-character standards. {vert_count:,} verts is within typical range for a hero character (40k–80k). Correct me if this is a background character or NPC — budget expectations differ significantly."
+        elif has_arm:
+            assumed_tier = "character asset (rigged)"
+            budget_note  = f"Evaluating as a rigged character. {vert_count:,} verts. Tell me if this is a hero, enemy, NPC, or crowd character — each has a different acceptable budget."
+        elif vert_count < 5_000:
+            assumed_tier = "small prop or environment detail"
+            budget_note  = f"{vert_count:,} verts — low-poly asset, evaluating as a prop or environment detail piece."
+        elif vert_count < 30_000:
+            assumed_tier = "mid-complexity prop or weapon"
+            budget_note  = f"{vert_count:,} verts — evaluating as a mid-complexity prop or weapon. Correct me if this is a character or hero asset."
+        else:
+            assumed_tier = "game asset (unknown tier)"
+            budget_note  = f"{vert_count:,} verts. I don't have enough context to assign a budget tier. Tell me what this asset is and who it's for — hero character, NPC, prop, environment piece — and I'll give you a verdict calibrated to that standard."
+
         report = {
             "object": name,
+            "assumed_context": assumed_tier,
+            "assumed_context_note": budget_note,
+            "correct_me": (
+                f"I'm evaluating this as: {assumed_tier}. "
+                "If the asset type or target is different, say so and I'll re-evaluate."
+            ),
             "verdict": verdict,
             "overall_severity": overall,
             "summary": (
@@ -2545,6 +2591,274 @@ def classify_pipeline_stage(object_name: str) -> str:
 
     except Exception as e:
         logger.error(f"Error in classify_pipeline_stage: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def what_next(object_name: str, context: str = "") -> str:
+    """
+    PRIORITY ACTION — answers "what is the single most important thing to do right now?"
+
+    Looks at the asset's current state and returns ONE action: the highest-leverage
+    step that unblocks the most pipeline progress. Not a plan. Not a list. One thing.
+
+    Collects: object info, mesh quality, mesh problems, pipeline stage.
+    Applies a priority decision tree calibrated to the inferred stage.
+    States its assumptions about asset purpose explicitly — correct it if wrong.
+
+    Parameters:
+      object_name : the Blender object to evaluate
+      context     : optional one-line hint about the asset's purpose or target
+                    e.g. "hero character for UE5" or "background prop" or "weapon"
+                    Leave empty and the tool will state its own assumption.
+
+    Returns:
+      - assumed_context : what the tool is assuming about this asset
+      - stage           : inferred pipeline stage
+      - action          : the one thing to do right now
+      - why             : why this is the priority over everything else
+      - how             : which tool or method executes this action
+      - blocking_count  : how many issues this unblocks downstream
+      - after_this      : what becomes the next priority once this is done
+      - correct_me      : prompt for the user to correct any wrong assumption
+    """
+    try:
+        # ── Gather all data in parallel ────────────────────────────────────────
+        obj_info   = _send_raw("get_object_info",         name=object_name)
+        mesh_stats = _send_raw("get_mesh_quality_report", name=object_name)
+        problems   = _send_raw("detect_mesh_problems",    name=object_name)
+
+        if "error" in obj_info:
+            return json.dumps({"error": f"get_object_info failed: {obj_info['error']}"})
+        if "error" in mesh_stats:
+            return json.dumps({"error": f"get_mesh_quality_report failed: {mesh_stats['error']}"})
+
+        # ── Extract key signals ────────────────────────────────────────────────
+        mesh_block     = obj_info.get("mesh", {})
+        vertex_count   = mesh_block.get("vertices", 0) or 0
+        face_count     = mesh_block.get("polygons",  0) or 0
+        mat_list       = obj_info.get("materials", [])
+        has_materials  = bool(mat_list)
+        material_count = len(mat_list) if isinstance(mat_list, list) else 0
+
+        uv_data        = mesh_stats.get("uv", {})
+        has_uvs        = uv_data.get("has_uvs", False)
+        uv_layers      = uv_data.get("layer_count", 0)
+        health         = mesh_stats.get("health", "unknown")
+        face_types     = mesh_stats.get("face_types", {})
+        ngon_count     = face_types.get("ngons", 0) or 0
+        mod_list       = mesh_stats.get("modifiers", [])
+        modifier_types = [m.get("type", "") for m in mod_list if isinstance(m, dict)]
+        has_armature   = "ARMATURE" in modifier_types
+        has_multires   = "MULTIRES" in modifier_types
+
+        # Problem counts from detect_mesh_problems (list schema)
+        prob_list = problems.get("problems", []) if "error" not in problems else []
+        prob_map  = {p.get("type", ""): p.get("count", 0) for p in prob_list}
+        nm_edges  = prob_map.get("non_manifold_edges", 0)
+        iso_verts = prob_map.get("isolated_verts",     0)
+        zero_area = prob_map.get("zero_area_faces",    0)
+        dup_faces = prob_map.get("duplicate_faces",    0)
+        bd_edges  = prob_map.get("boundary_edges",     0)
+
+        # ── Infer stage ────────────────────────────────────────────────────────
+        stage_result = _classify_stage_from_signals(obj_info, mesh_stats)
+        stage_num    = stage_result.get("stage_number", 0)
+        stage_name   = stage_result.get("stage_name",   "Unknown")
+        confidence   = stage_result.get("confidence",   "low")
+
+        # ── Infer asset context (state assumption, invite correction) ──────────
+        if context:
+            assumed_context = context
+        else:
+            # Derive a plain-language assumption from signals
+            if vertex_count > 300_000:
+                assumed_context = "high-poly sculpt or scan source mesh"
+            elif has_armature and has_materials and has_uvs:
+                assumed_context = "rigged character asset"
+            elif has_armature:
+                assumed_context = "character asset (rigged, materials/UVs incomplete)"
+            elif has_materials and has_uvs and vertex_count < 100_000:
+                assumed_context = "game-ready prop or character"
+            elif has_uvs and not has_materials and vertex_count < 100_000:
+                assumed_context = "low-poly mesh ready for texturing"
+            elif not has_uvs and vertex_count < 120_000:
+                assumed_context = "retopo or base mesh (no UVs yet)"
+            else:
+                assumed_context = "game asset at an undetermined stage"
+
+        # ── Priority decision tree ─────────────────────────────────────────────
+        # Order of priority: blocking errors > missing stage requirements > next stage gate
+        # Each entry: (condition, action, why, how, blocking_count, after_this)
+
+        action       = None
+        why          = None
+        how          = None
+        blocking_ct  = 0
+        after_this   = None
+
+        # PRIORITY 1 — Non-manifold edges (blocks export, baking, subdivision)
+        if nm_edges > 0:
+            action      = f"Fix {nm_edges} non-manifold edge(s)"
+            why         = (
+                f"{nm_edges} non-manifold edge(s) are present. This is a hard blocker: "
+                f"UE5 will reject or misimport this mesh, normal baking will produce "
+                f"incorrect results, and subdivision modifiers will fail. Everything "
+                f"else — UVs, materials, rigging — is wasted work if this isn't fixed first."
+            )
+            how         = "auto_repair_mesh() — three-pass repair (merge by distance, interior face deletion, wire edge dissolve). Verify remaining count after."
+            blocking_ct = nm_edges
+            after_this  = "Re-run what_next() — non-manifold repair may expose other issues."
+
+        # PRIORITY 2 — Other auto-repairable geometry errors
+        elif zero_area > 0 or dup_faces > 0 or iso_verts > 0:
+            issues = []
+            if zero_area  > 0: issues.append(f"{zero_area} zero-area face(s)")
+            if dup_faces  > 0: issues.append(f"{dup_faces} duplicate face(s)")
+            if iso_verts  > 0: issues.append(f"{iso_verts} isolated vertex/vertices")
+            action      = f"Run auto-repair: {', '.join(issues)}"
+            why         = (
+                f"Geometry errors present that auto_repair_mesh can fix safely. "
+                f"These cause undefined normals, z-fighting, and inflated vertex counts. "
+                f"They take seconds to fix automatically and should never go to the next stage."
+            )
+            how         = "auto_repair_mesh() — safe, undo-checkpointed, verifies after."
+            blocking_ct = sum([zero_area, dup_faces, iso_verts])
+            after_this  = "Check mesh health then continue to the next stage requirement."
+
+        # PRIORITY 3 — Stage 1: sculpt has no UV, no material — next gate is retopo
+        elif stage_num == 1:
+            action      = "Begin retopology — create a game-ready low-poly mesh"
+            why         = (
+                f"This mesh has {vertex_count:,} vertices and reads as a sculpt/high-poly "
+                f"source. It is not suitable as a runtime asset. The next required step is "
+                f"retopology to a game mesh, which will then receive UVs, baking, and materials."
+            )
+            how         = "Create new mesh object and retopo manually, or use Blender's Remesh modifier as a starting point. Target vertex count depends on asset type — correct my assumption if needed."
+            blocking_ct = 0
+            after_this  = "UV unwrap the retopo mesh, then bake normal/AO maps from this high-poly source."
+
+        # PRIORITY 4 — Stage 2: retopo present but no UVs
+        elif stage_num == 2 and not has_uvs:
+            action      = "UV unwrap this mesh"
+            why         = (
+                f"Topology looks game-ready ({vertex_count:,} verts, quad-dominant) "
+                f"but no UV map exists. UVs are required before baking and before "
+                f"any material work. Nothing downstream can proceed without them."
+            )
+            how         = "Blender UV Editor — mark seams, Unwrap (U). Check for stretching in the UV editor. Use Smart UV Project as a starting point on hard-surface assets."
+            blocking_ct = 0
+            after_this  = "Set up high-poly bake source, then bake normal/AO/curvature maps."
+
+        # PRIORITY 5 — Stage 3: UVs exist but no materials (bake-ready state)
+        elif stage_num == 3 and has_uvs and not has_materials:
+            action      = "Bake maps and create PBR material"
+            why         = (
+                f"UVs are present and the mesh is in bake-ready state — no materials yet. "
+                f"The correct next step is to bake normal/AO/curvature maps from a high-poly "
+                f"source (if one exists) and set up a Principled BSDF material with those maps."
+            )
+            how         = "Blender Cycles bake (normal, AO, curvature). Then create_pbr_material() to set up the Principled BSDF node graph."
+            blocking_ct = 0
+            after_this  = "Validate PBR material with analyze_material_pbr(), then check Unreal readiness."
+
+        # PRIORITY 6 — Stage 4: materials exist but PBR not validated
+        elif stage_num == 4 and has_materials and not has_armature:
+            action      = "Validate PBR materials and check Unreal readiness"
+            why         = (
+                f"{material_count} material(s) assigned. Before this asset moves to export "
+                f"or rigging, the material setup needs validation — broken texture paths, "
+                f"procedural-only nodes, and incorrect normal map direction all cause "
+                f"silent failures in UE5."
+            )
+            how         = "analyze_material_pbr() for full PBR review, then run_unreal_readiness_check() for export gate."
+            blocking_ct = material_count
+            after_this  = "If materials pass, move to rigging setup or direct export depending on asset type."
+
+        # PRIORITY 7 — Stage 5: rigged but not validated for export
+        elif stage_num == 5 and has_armature:
+            action      = "Validate rig and run full export readiness check"
+            why         = (
+                f"Armature modifier detected — this is a rigged asset. Before export, "
+                f"the full export gate must pass: scale applied, pivot at origin, "
+                f"no blocking modifiers, UE5 naming conventions. Rig issues caught "
+                f"here are far cheaper to fix than after engine import."
+            )
+            how         = "run_unreal_readiness_check() for the full gate, then analyze_mesh_for_unreal() for complete report."
+            blocking_ct = 0
+            after_this  = "If readiness check passes, export_for_unreal() with verified settings."
+
+        # PRIORITY 8 — Stage 6 or clean mesh with materials: run full readiness check
+        elif stage_num == 6 or (has_uvs and has_materials and health == "clean"):
+            action      = "Run full Unreal readiness check"
+            why         = (
+                f"This mesh has UVs, materials, and appears clean — it looks export-ready. "
+                f"Run the full readiness gate to confirm before export. Scale, pivot, "
+                f"triangulation, and lightmap UV requirements must all be verified."
+            )
+            how         = "analyze_mesh_for_unreal() — runs all four checks in one call and gives a structured verdict."
+            blocking_ct = 0
+            after_this  = "If all checks pass, export_for_unreal(). If not, address each blocking issue in order."
+
+        # PRIORITY 9 — Ngons present (non-critical but stage-gated)
+        elif ngon_count > 0 and stage_num in (2, 3, 5, 6):
+            action      = f"Address {ngon_count} n-gon(s) in the mesh"
+            why         = (
+                f"{ngon_count} n-gon face(s) detected. At Stage {stage_num} ({stage_name}), "
+                f"n-gons are a risk: UE5 auto-triangulation produces star patterns and "
+                f"shading errors, and subdivision modifiers pinch at n-gon boundaries. "
+                f"In deforming areas this will cause visible skinning artefacts."
+            )
+            how         = "Edit Mode > Select All by Trait > Face Sides (>4). Dissolve edges and re-route topology using quads. Cannot be auto-repaired — requires artist judgment on edge flow."
+            blocking_ct = ngon_count
+            after_this  = "Re-run analyze_topology() to confirm quad dominance before proceeding."
+
+        # PRIORITY 10 — No issues found, state confidence
+        else:
+            action      = "No critical actions required at this stage"
+            why         = (
+                f"No blocking issues detected for Stage {stage_num} ({stage_name}). "
+                f"Mesh health: {health}. "
+                f"This assessment is based on data signals — run analyze_mesh_for_unreal() "
+                f"for a comprehensive pre-export verification before treating this as done."
+            )
+            how         = "analyze_mesh_for_unreal() for full report if approaching export."
+            blocking_ct = 0
+            after_this  = "Proceed to the next stage requirement when ready."
+
+        return json.dumps({
+            "object":          object_name,
+            "assumed_context": assumed_context,
+            "correct_me":      (
+                f"I'm evaluating this as: {assumed_context}. "
+                f"If the asset type, target platform, or usage is different, "
+                f"tell me and I'll re-evaluate with the correct standards."
+            ),
+            "stage": {
+                "number":     stage_num,
+                "name":       stage_name,
+                "confidence": confidence,
+            },
+            "action":         action,
+            "why":            why,
+            "how":            how,
+            "blocking_count": blocking_ct,
+            "after_this":     after_this,
+            "asset_snapshot": {
+                "vertices":       vertex_count,
+                "faces":          face_count,
+                "has_uvs":        has_uvs,
+                "uv_layers":      uv_layers,
+                "materials":      material_count,
+                "has_armature":   has_armature,
+                "mesh_health":    health,
+                "nm_edges":       nm_edges,
+                "ngons":          ngon_count,
+            },
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in what_next: {e}")
         return json.dumps({"error": str(e)})
 
 
