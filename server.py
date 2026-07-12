@@ -200,18 +200,32 @@ def _process_bbox(original_bbox):
 def _reason_mesh_problems(raw: dict) -> dict:
     """
     Interpret detect_mesh_problems output like a senior technical artist.
-    Returns an enriched dict with severity, impact, fix recommendation, and
-    whether the MCP can safely auto-repair it.
+
+    Real addon.py schema (detect_mesh_problems):
+      {
+        "clean": bool,
+        "problem_count": int,
+        "problems": [
+          {"type": "non_manifold_edges"|"isolated_verts"|"zero_area_faces"|"ngons"
+                   |"boundary_edges"|"duplicate_faces",
+           "count": int, "fix": str}
+        ]
+      }
+    problems is a LIST of dicts, not a flat dict.
     """
     findings = []
     auto_fixable = []
     needs_artist = []
 
-    problems = raw.get("problems", {})
-    counts = raw.get("counts", {})
+    # Real schema: problems is a LIST of {type, count, fix}
+    problems_list = raw.get("problems", [])
 
-    # Non-manifold edges
-    nm = counts.get("non_manifold_edges", 0)
+    # Build lookup: type -> count
+    prob_counts: dict = {}
+    for p in problems_list:
+        prob_counts[p.get("type", "")] = p.get("count", 0)
+
+    nm = prob_counts.get("non_manifold_edges", 0)
     if nm > 0:
         sev = "critical" if nm > 20 else "warning"
         findings.append({
@@ -219,40 +233,37 @@ def _reason_mesh_problems(raw: dict) -> dict:
             "severity": sev,
             "why_it_matters": (
                 "Non-manifold geometry means edges shared by more than two faces or "
-                "faces with no volume. UE5's import pipeline and subdivision modifiers "
-                "both fail unpredictably on non-manifold meshes. Physics simulation and "
-                "normal baking will produce incorrect results."
+                "faces with no volume. UE5 import pipeline and subdivision modifiers "
+                "both fail unpredictably on non-manifold meshes. Normal baking will "
+                "produce incorrect results."
             ),
             "professional_fix": (
-                "In Edit Mode select Non-Manifold (Select > Select All by Trait > "
-                "Non-Manifold). Identify whether the cause is interior faces, naked "
-                "edges, or open holes. Delete interior faces first, then merge "
-                "overlapping vertices, then fill or bridge remaining open edges."
+                "Edit Mode > Select > Select All by Trait > Non Manifold. "
+                "Delete interior faces first, merge overlapping verts, "
+                "then fill or bridge remaining open edges."
             ),
             "auto_fixable": False,
             "auto_fix_reason": "Non-manifold repair requires artist judgement on intent.",
         })
         needs_artist.append("non_manifold_edges")
 
-    # Loose vertices
-    lv = counts.get("loose_vertices", 0)
+    lv = prob_counts.get("isolated_verts", 0)
     if lv > 0:
         findings.append({
-            "issue": f"{lv} loose vertex/vertices (not connected to any edge)",
+            "issue": f"{lv} isolated vertex/vertices (not connected to any edge)",
             "severity": "warning",
             "why_it_matters": (
                 "Loose vertices inflate vertex count with zero visual contribution, "
-                "confuse UV unwrapping, and can shift the object's bounding box, "
-                "causing incorrect pivot placement in UE5."
+                "confuse UV unwrapping, and shift the bounding box causing incorrect "
+                "pivot placement in UE5."
             ),
-            "professional_fix": "Delete with: Edit Mode > Mesh > Clean Up > Delete Loose.",
+            "professional_fix": "Edit Mode > Mesh > Clean Up > Delete Loose.",
             "auto_fixable": True,
-            "auto_fix_reason": "Safe to delete automatically — no topology is affected.",
+            "auto_fix_reason": "Safe to delete automatically — no topology affected.",
         })
-        auto_fixable.append("loose_vertices")
+        auto_fixable.append("isolated_verts")
 
-    # Zero-area faces
-    zf = counts.get("zero_area_faces", 0)
+    zf = prob_counts.get("zero_area_faces", 0)
     if zf > 0:
         sev = "critical" if zf > 5 else "warning"
         findings.append({
@@ -263,80 +274,66 @@ def _reason_mesh_problems(raw: dict) -> dict:
                 "They cause black patches under baked lighting, NaN values in normal "
                 "maps, and crashes in some physics solvers."
             ),
-            "professional_fix": (
-                "Mesh > Clean Up > Degenerate Dissolve (threshold 0.0001). "
-                "Inspect results — some may indicate underlying topology errors."
-            ),
+            "professional_fix": "Mesh > Clean Up > Degenerate Dissolve (threshold 0.0001).",
             "auto_fixable": True,
             "auto_fix_reason": "Degenerate dissolve is non-destructive at low threshold.",
         })
         auto_fixable.append("zero_area_faces")
 
-    # Duplicate faces
-    df = counts.get("duplicate_faces", 0)
+    df = prob_counts.get("duplicate_faces", 0)
     if df > 0:
         findings.append({
             "issue": f"{df} duplicate face(s) (same vertex set as another face)",
             "severity": "critical",
             "why_it_matters": (
-                "Duplicate faces cause z-fighting in real-time rendering — flickering "
-                "surfaces visible at all distances. They also double the draw cost for "
-                "zero visual benefit and corrupt normal baking."
+                "Duplicate faces cause z-fighting — flickering surfaces at all distances. "
+                "They double draw cost for zero visual benefit and corrupt normal baking."
             ),
-            "professional_fix": (
-                "Mesh > Clean Up > Merge by Distance (0.0001m) then "
-                "Select > Select All by Trait > Face Sides with Faces = 0 to catch "
-                "remaining duplicates. Delete them."
-            ),
+            "professional_fix": "Mesh > Clean Up > Merge by Distance (0.0001m).",
             "auto_fixable": True,
             "auto_fix_reason": "Merge by distance reliably eliminates duplicates.",
         })
         auto_fixable.append("duplicate_faces")
 
-    # Inverted normals
-    inv = counts.get("inverted_normals", 0)
-    if inv > 0:
-        sev = "critical" if inv > 0 else "info"
+    ng = prob_counts.get("ngons", 0)
+    if ng > 0:
+        sev = "critical" if ng > 20 else "warning"
         findings.append({
-            "issue": f"{inv} face(s) with inverted normals",
+            "issue": f"{ng} n-gon face(s) (5+ sides)",
             "severity": sev,
             "why_it_matters": (
-                "Inverted normals appear black or invisible in UE5's default backface-culled "
-                "rendering. They also cause incorrect shadow casting and break two-sided "
-                "material setups."
+                "N-gons tessellate unpredictably in UE5. The auto-triangulator often "
+                "produces star patterns and shading errors under normal maps and "
+                "dynamic lighting. Subdivision modifiers pinch at n-gon boundaries."
             ),
             "professional_fix": (
-                "Edit Mode > select all > Mesh > Normals > Recalculate Outside (Shift+N). "
-                "For complex enclosed meshes, manually flip individual faces."
-            ),
-            "auto_fixable": True,
-            "auto_fix_reason": "Recalculate Outside is safe for closed, non-overlapping meshes.",
-        })
-        auto_fixable.append("inverted_normals")
-
-    # Overlapping UVs
-    uv_ov = counts.get("uv_overlaps", 0)
-    if uv_ov > 0:
-        findings.append({
-            "issue": f"{uv_ov} overlapping UV island(s)",
-            "severity": "warning",
-            "why_it_matters": (
-                "Overlapping UVs mean multiple surface regions share the same texture "
-                "space. This is intentional for tiling but catastrophic for lightmap "
-                "baking — UE5 will produce incorrect lightmaps and shadowing artifacts."
-            ),
-            "professional_fix": (
-                "Use UV Channel 0 for texture mapping (overlaps allowed intentionally). "
-                "Create UV Channel 1 as a dedicated non-overlapping lightmap UV — "
-                "Smart UV Project or Lightmap Pack in Blender. Set this as the lightmap "
-                "UV index in UE5's Static Mesh Editor."
+                "Edit Mode > Select All by Trait > Face Sides (>4). "
+                "Knife-cut or dissolve edges to convert to quads."
             ),
             "auto_fixable": False,
-            "auto_fix_reason": "UV layout decisions require artist review of intent.",
+            "auto_fix_reason": "N-gon conversion requires artist review of edge flow.",
         })
-        needs_artist.append("uv_overlaps")
+        needs_artist.append("ngons")
 
-    # Overall severity
+    bd = prob_counts.get("boundary_edges", 0)
+    if bd > 0:
+        findings.append({
+            "issue": f"{bd} boundary edge(s) — mesh is not watertight/closed",
+            "severity": "warning",
+            "why_it_matters": (
+                "Open boundary edges mean the mesh has holes. This causes issues with "
+                "boolean operations, physics collision generation in UE5, and may "
+                "indicate missing geometry."
+            ),
+            "professional_fix": (
+                "Edit Mode > Select > Select All by Trait > Non Manifold. "
+                "Alt+click boundary loops, then F to fill or Bridge Edge Loops."
+            ),
+            "auto_fixable": False,
+            "auto_fix_reason": "Hole-filling requires artist decision on correct topology.",
+        })
+        needs_artist.append("boundary_edges")
+
     severities = [f["severity"] for f in findings]
     if "critical" in severities:
         overall = "critical"
@@ -348,7 +345,7 @@ def _reason_mesh_problems(raw: dict) -> dict:
         overall = "pass"
 
     summary = (
-        f"PASS — mesh is clean." if overall == "pass"
+        "PASS — mesh is clean." if overall == "pass"
         else f"{overall.upper()} — {len(findings)} issue(s) found. "
              f"{len(auto_fixable)} can be auto-repaired, {len(needs_artist)} require artist review."
     )
@@ -367,72 +364,121 @@ def _reason_mesh_problems(raw: dict) -> dict:
 
 
 def _reason_mesh_quality(raw: dict) -> dict:
-    """Interpret get_mesh_quality_report output with professional context."""
+    """
+    Interpret get_mesh_quality_report output with professional context.
+
+    Real addon.py schema (get_mesh_quality_report):
+      {
+        "counts":     {"verts": int, "edges": int, "faces": int},
+        "face_types": {"tris": int, "quads": int, "ngons": int},
+        "problems":   {"non_manifold_edges": int, "isolated_verts": int,
+                       "zero_area_faces": int, "duplicate_faces": int,
+                       "boundary_edges": int},   <- DICT not list
+        "poles":      {"n3_not_boundary": int, "n5_not_boundary": int, "high_valence": int},
+        "uv":         {"out_of_bounds_loops": int, "has_uvs": bool, "layer_count": int},
+        "health":     "clean"|"issues_found"
+      }
+    """
     findings = []
 
-    vert_count = raw.get("vertex_count", 0)
-    face_count = raw.get("face_count", 0)
-    ngon_count = raw.get("ngon_count", 0)
-    tri_count  = raw.get("tri_count", 0)
-    uv_oob     = raw.get("uv_out_of_bounds", 0)
-    dup_faces  = raw.get("duplicate_faces", 0)
+    counts     = raw.get("counts", {})
+    face_types = raw.get("face_types", {})
+    problems   = raw.get("problems", {})  # dict: key -> count
+    poles      = raw.get("poles", {})
+    uv         = raw.get("uv", {})
 
-    # N-gon check
+    vert_count = counts.get("verts", 0)
+    face_count = counts.get("faces", 0)
+    ngon_count = face_types.get("ngons", 0)
+    uv_oob     = uv.get("out_of_bounds_loops", 0)
+    dup_faces  = problems.get("duplicate_faces", 0)
+    nm_edges   = problems.get("non_manifold_edges", 0)
+    iso_verts  = problems.get("isolated_verts", 0)
+    zero_area  = problems.get("zero_area_faces", 0)
+    high_val   = poles.get("high_valence", 0)
+
     if ngon_count > 0 and face_count > 0:
         ngon_pct = (ngon_count / face_count) * 100
         sev = "critical" if ngon_pct > 20 else "warning"
         findings.append({
-            "issue": f"{ngon_count} n-gons ({ngon_pct:.1f}% of faces)",
+            "issue": f"{ngon_count} n-gon(s) ({ngon_pct:.1f}% of faces)",
             "severity": sev,
             "why_it_matters": (
                 "N-gons (5+ sided faces) tessellate unpredictably in real-time engines. "
                 "UE5 will auto-triangulate them but the result often produces star "
-                "patterns and shading errors under normal maps and dynamic lighting. "
-                "Subdivision modifiers will also pinch at n-gon boundaries."
+                "patterns and shading errors under normal maps and dynamic lighting."
             ),
             "professional_fix": (
                 "Manually dissolve n-gon edges and re-route topology using quads. "
-                "Use Loop Cut tools to redirect edge flow. Target areas near curved "
-                "surfaces and deforming joints first."
+                "Target areas near curved surfaces and deforming joints first."
             ),
         })
 
-    # Vertex density check
-    if face_count > 0:
+    if nm_edges > 0:
+        findings.append({
+            "issue": f"{nm_edges} non-manifold edge(s)",
+            "severity": "critical" if nm_edges > 20 else "warning",
+            "why_it_matters": (
+                "Non-manifold geometry causes UE5 import failures, breaks subdivision, "
+                "and produces incorrect normal baking results."
+            ),
+            "professional_fix": (
+                "Select All by Trait > Non Manifold. "
+                "Delete interior faces, merge overlapping verts, fill open edges."
+            ),
+        })
+
+    if iso_verts > 0:
+        findings.append({
+            "issue": f"{iso_verts} isolated vertex/vertices",
+            "severity": "warning",
+            "why_it_matters": "Inflate vertex count and shift bounding box with zero visual contribution.",
+            "professional_fix": "Mesh > Clean Up > Delete Loose.",
+        })
+
+    if zero_area > 0:
+        findings.append({
+            "issue": f"{zero_area} zero-area (degenerate) face(s)",
+            "severity": "critical" if zero_area > 5 else "warning",
+            "why_it_matters": "Undefined normals cause black bake patches and physics solver crashes.",
+            "professional_fix": "Mesh > Clean Up > Degenerate Dissolve (0.0001).",
+        })
+
+    if face_count > 0 and vert_count > 0:
         vpf = vert_count / face_count
         if vpf > 4.5:
             findings.append({
-                "issue": f"High vertex-to-face ratio ({vpf:.2f} verts/face — expected ~4.0 for quads)",
+                "issue": f"High vertex-to-face ratio ({vpf:.2f} — expected ~4.0 for quads)",
                 "severity": "warning",
                 "why_it_matters": (
-                    "A ratio significantly above 4.0 indicates many triangulated patches "
-                    "or redundant edge loops. This inflates GPU vertex processing cost "
-                    "without adding surface detail."
+                    "Ratio above 4.0 indicates triangulated patches or redundant edge "
+                    "loops inflating GPU vertex cost."
                 ),
-                "professional_fix": (
-                    "Dissolve redundant edge loops that don't support surface curvature. "
-                    "Target straight runs of edges on flat surfaces."
-                ),
+                "professional_fix": "Dissolve redundant edge loops on flat surfaces.",
             })
 
-    # UV out-of-bounds
+    if high_val > 5:
+        findings.append({
+            "issue": f"{high_val} high-valence pole(s) (6+ edges at one vertex)",
+            "severity": "info",
+            "why_it_matters": "Excessive poles cause pinching under subdivision and complicate skin weighting.",
+            "professional_fix": "Dissolve edges around 6+ pole verts to reduce valence.",
+        })
+
     if uv_oob > 0:
         findings.append({
             "issue": f"{uv_oob} UV loop(s) outside 0–1 UV space",
             "severity": "warning",
             "why_it_matters": (
-                "UVs outside the 0–1 tile are valid for tiling textures but will "
-                "cause issues with lightmap baking and trim-sheet workflows in UE5 "
-                "if they appear on the lightmap UV channel."
+                "UVs outside 0–1 tile are valid for tiling textures but catastrophic "
+                "for lightmap baking — check which UV channel these appear on."
             ),
             "professional_fix": (
-                "Verify which UV channel these loops are on. If on Channel 0 (colour "
-                "texture) this may be intentional tiling — acceptable. If on Channel 1 "
-                "(lightmap), pack all islands inside 0–1 space."
+                "Channel 0 (colour): may be intentional tiling — acceptable. "
+                "Channel 1 (lightmap): pack all islands inside 0–1 space."
             ),
         })
 
-    # Duplicate faces
     if dup_faces > 0:
         findings.append({
             "issue": f"{dup_faces} duplicate face(s)",
@@ -442,14 +488,19 @@ def _reason_mesh_quality(raw: dict) -> dict:
         })
 
     severities = [f["severity"] for f in findings]
-    overall = "critical" if "critical" in severities else ("warning" if "warning" in severities else ("info" if findings else "pass"))
+    overall = (
+        "critical" if "critical" in severities
+        else "warning" if "warning" in severities
+        else "info" if findings
+        else "pass"
+    )
 
     return {
         **raw,
         "_reasoning": {
             "overall_severity": overall,
             "summary": (
-                f"PASS — mesh quality is acceptable." if overall == "pass"
+                "PASS — mesh quality is acceptable." if overall == "pass"
                 else f"{overall.upper()} — {len(findings)} quality issue(s) found."
             ),
             "findings": findings,
@@ -459,23 +510,48 @@ def _reason_mesh_quality(raw: dict) -> dict:
 
 
 def _reason_topology(raw: dict) -> dict:
-    """Interpret analyze_topology output with professional context."""
+    """
+    Interpret analyze_topology output with professional context.
+
+    Real addon.py schema (analyze_topology):
+      {
+        "context": str,
+        "topology_score": int,   # 0-100
+        "rating": "excellent"|"good"|"acceptable"|"poor",
+        "stats": {
+          "total_faces": int,
+          "quads": int, "tris": int, "ngons": int,
+          "quad_ratio_pct": float,
+          "tris_pct": float,
+          "avg_vert_valence": float,
+          "boundary_edges": int,
+          "non_manifold_edges": int,
+          "pole_distribution": {"3": int, "4": int, ...}  # string keys
+        },
+        "issues": [str],
+        "recommendations": [str]
+      }
+    """
     findings = []
 
-    quad_ratio  = raw.get("quad_ratio", 100)
-    tri_ratio   = raw.get("tri_ratio", 0)
-    ngon_ratio  = raw.get("ngon_ratio", 0)
-    pole_count  = raw.get("pole_count", 0)
-    face_count  = raw.get("face_count", 0)
-    context     = raw.get("context", "generic")
+    context = raw.get("context", "generic")
+    stats   = raw.get("stats", {})
+    score   = raw.get("topology_score", 100)
 
-    # Context-aware thresholds
+    quad_ratio = stats.get("quad_ratio_pct", 100.0)
+    tris_pct   = stats.get("tris_pct", 0.0)
+    ngon_count = stats.get("ngons", 0)
+    face_count = stats.get("total_faces", 0)
+    nm_edges   = stats.get("non_manifold_edges", 0)
+    bd_edges   = stats.get("boundary_edges", 0)
+    pole_dist  = stats.get("pole_distribution", {})
+
     thresholds = {
-        "character_body": {"min_quad": 85, "max_tri": 10, "max_ngon": 2},
-        "face":           {"min_quad": 90, "max_tri":  5, "max_ngon": 1},
-        "hand":           {"min_quad": 88, "max_tri":  8, "max_ngon": 1},
-        "hard_surface":   {"min_quad": 70, "max_tri": 25, "max_ngon": 5},
-        "generic":        {"min_quad": 75, "max_tri": 20, "max_ngon": 5},
+        "character_body": {"min_quad": 85, "max_tri": 10},
+        "face":           {"min_quad": 90, "max_tri":  5},
+        "hand":           {"min_quad": 90, "max_tri":  5},
+        "hard_surface":   {"min_quad": 70, "max_tri": 25},
+        "generic":        {"min_quad": 75, "max_tri": 20},
     }
     t = thresholds.get(context, thresholds["generic"])
 
@@ -483,63 +559,87 @@ def _reason_topology(raw: dict) -> dict:
         gap = t["min_quad"] - quad_ratio
         sev = "critical" if gap > 20 else "warning"
         findings.append({
-            "issue": f"Quad ratio {quad_ratio:.1f}% — below {t['min_quad']}% target for context '{context}'",
+            "issue": f"Quad ratio {quad_ratio:.1f}% — below {t['min_quad']}% target for '{context}'",
             "severity": sev,
             "why_it_matters": (
-                "Low quad ratio degrades deformation quality for skinned meshes, "
-                "produces unpredictable subdivision surface results, and indicates "
-                "topology that was likely generated rather than modelled intentionally. "
-                f"For '{context}' work, studios target {t['min_quad']}%+ quads."
+                f"Low quad ratio degrades deformation quality for skinned meshes, "
+                f"produces unpredictable subdivision results. "
+                f"Studios target {t['min_quad']}%+ quads for '{context}' assets."
             ),
             "professional_fix": (
-                "Manually retopologise high-tri areas using Blender's Poly Build tool "
-                "or RetopoFlow. Prioritise areas that deform (joints, face muscles). "
-                "Hard-surface areas can tolerate more tris at surface terminations."
+                "Retopologise high-tri areas using Poly Build or RetopoFlow. "
+                "Prioritise deforming areas (joints, face muscles)."
             ),
         })
 
-    if tri_ratio > t["max_tri"]:
+    if tris_pct > t["max_tri"]:
         findings.append({
-            "issue": f"Triangle ratio {tri_ratio:.1f}% — exceeds {t['max_tri']}% limit for context '{context}'",
+            "issue": f"Triangle ratio {tris_pct:.1f}% — exceeds {t['max_tri']}% limit for '{context}'",
             "severity": "warning",
             "why_it_matters": (
                 "Excessive triangles in deforming areas cause skin-weighting artefacts "
-                "and normal map shading errors under animation. Acceptable in hard-surface "
-                "termination loops but not on organic forms."
+                "and normal map shading errors under animation."
             ),
             "professional_fix": (
-                "Identify tri clusters using Face Select mode filtered by Sides = 3. "
-                "Redirect edge flow to convert tri fans into clean quad patches."
+                "Face Select > Select All by Trait > Face Sides = 3. "
+                "Redirect edge flow to convert tri fans into quad patches."
             ),
         })
 
-    if ngon_ratio > t["max_ngon"]:
+    if ngon_count > 0:
+        ngon_pct = (ngon_count / face_count * 100) if face_count > 0 else 0
         findings.append({
-            "issue": f"N-gon ratio {ngon_ratio:.1f}% — exceeds {t['max_ngon']}% limit",
-            "severity": "warning" if ngon_ratio < 10 else "critical",
+            "issue": f"{ngon_count} n-gon(s) ({ngon_pct:.1f}% of faces)",
+            "severity": "warning" if ngon_pct < 10 else "critical",
             "why_it_matters": "N-gons tessellate unpredictably and produce shading artifacts in UE5.",
             "professional_fix": "Dissolve n-gon edges and re-route as quad patches.",
         })
 
-    # Pole density
-    if face_count > 0 and pole_count > 0:
-        pole_density = pole_count / face_count
-        if pole_density > 0.15:
-            findings.append({
-                "issue": f"High pole density ({pole_count} poles / {face_count} faces = {pole_density:.2%})",
-                "severity": "info",
-                "why_it_matters": (
-                    "Poles (vertices with ≠4 edges) are necessary at surface transitions but "
-                    "excessive poles cause pinching under subdivision and complicate skin weighting."
-                ),
-                "professional_fix": (
-                    "Review pole placement — ensure 5-poles are at convex transitions "
-                    "and 3-poles at concave ones. Avoid poles in deforming joint areas."
-                ),
-            })
+    high_poles = (
+        int(pole_dist.get("6", 0)) +
+        int(pole_dist.get("7", 0)) +
+        int(pole_dist.get("8", 0))
+    )
+    if high_poles > 5:
+        findings.append({
+            "issue": f"{high_poles} high-valence pole(s) (6+ edges)",
+            "severity": "info",
+            "why_it_matters": "Excessive poles cause pinching under subdivision and complicate skin weighting.",
+            "professional_fix": "Dissolve edges around 6+ pole verts. Aim for mostly 4-5 edge vertices.",
+        })
+
+    if nm_edges > 0:
+        findings.append({
+            "issue": f"{nm_edges} non-manifold edge(s) affecting topology score",
+            "severity": "critical",
+            "why_it_matters": "Non-manifold geometry is incompatible with subdivision and UE5 import.",
+            "professional_fix": "Mesh > Clean Up > Fill Holes; check for interior faces.",
+        })
+
+    if bd_edges > 0:
+        findings.append({
+            "issue": f"{bd_edges} boundary edge(s) — mesh is not watertight",
+            "severity": "warning",
+            "why_it_matters": "Open mesh causes issues with collision generation and boolean operations.",
+            "professional_fix": "Alt+click boundary loops then F to fill, or Bridge Edge Loops.",
+        })
 
     severities = [f["severity"] for f in findings]
-    overall = "critical" if "critical" in severities else ("warning" if "warning" in severities else ("info" if findings else "pass"))
+    overall = (
+        "critical" if "critical" in severities
+        else "warning" if "warning" in severities
+        else "info" if findings
+        else "pass"
+    )
+
+    if score >= 90:
+        grade = "Excellent"
+    elif score >= 70:
+        grade = "Good"
+    elif score >= 50:
+        grade = "Acceptable"
+    else:
+        grade = "Poor — retopology recommended"
 
     return {
         **raw,
@@ -547,10 +647,12 @@ def _reason_topology(raw: dict) -> dict:
             "overall_severity": overall,
             "context_evaluated": context,
             "thresholds_applied": t,
+            "score": score,
+            "grade": grade,
             "summary": (
-                f"PASS — topology meets '{context}' production standard." if overall == "pass"
+                f"PASS — topology meets '{context}' standard. Score: {score}/100 ({grade})." if overall == "pass"
                 else f"{overall.upper()} — topology does not meet '{context}' standard. "
-                     f"{len(findings)} issue(s) found."
+                     f"Score: {score}/100 ({grade}). {len(findings)} issue(s) found."
             ),
             "findings": findings,
             "production_ready": overall == "pass",
@@ -559,88 +661,131 @@ def _reason_topology(raw: dict) -> dict:
 
 
 def _reason_unreal_readiness(raw: dict) -> dict:
-    """Interpret run_unreal_readiness_check output with UE5 pipeline context."""
+    """
+    Interpret run_unreal_readiness_check output with UE5 pipeline context.
+
+    Real addon.py schema — 11 checks, all in checks dict:
+      naming_convention, scale_uniform, scale_applied, pivot_at_origin,
+      triangulated, has_uvs, lightmap_uv, collision_mesh, lod_naming,
+      modifiers_applied, normal_map_direction
+    Each check: {"pass": bool, "severity": str, "detail": str}
+    """
     findings = []
     checks = raw.get("checks", {})
 
     check_meta = {
-        "scale_applied": {
-            "label": "Object scale not applied (non-unit scale)",
-            "severity": "critical",
+        "naming_convention": {
+            "label": "Naming convention not followed (SM_/SK_/T_ prefix missing)",
             "why": (
-                "Non-applied scale is the single most common source of UE5 import bugs. "
-                "The object will import at the wrong size, physics collision will be "
-                "incorrectly scaled, and skeletal mesh bind poses will be broken."
+                "UE5 asset pipelines rely on prefix conventions: SM_ (Static Mesh), "
+                "SK_ (Skeletal Mesh), T_ (Texture), M_ (Material), MI_ (Material Instance). "
+                "Without them, asset management tools, import rules, and Blueprint "
+                "references become inconsistent across the project."
             ),
-            "fix": "Object Mode > Object > Apply > Scale (Ctrl+A > Scale) before export.",
+            "fix": "Rename: SM_AssetName (static), SK_AssetName (skeletal), T_AssetName (texture).",
+            "auto_fixable": False,
+        },
+        "scale_uniform": {
+            "label": "Non-uniform scale (X/Y/Z scale values differ)",
+            "why": (
+                "Non-uniform scale distorts the mesh non-proportionally in UE5. "
+                "Physics collision boxes will be incorrectly shaped and skeletal "
+                "mesh bind poses break along the non-uniform axis."
+            ),
+            "fix": "Object Mode > Ctrl+A > Scale to apply. Verify geometry shape afterward.",
+            "auto_fixable": True,
+        },
+        "scale_applied": {
+            "label": "Scale not applied — object has non-unit scale (not 1,1,1)",
+            "why": (
+                "Non-applied scale is the single most common UE5 import bug. "
+                "The object imports at the wrong size, physics collision is incorrectly "
+                "scaled, and FBX export multiplies Blender units by unapplied scale "
+                "causing double-scaling."
+            ),
+            "fix": "Object Mode > Ctrl+A > Scale. Verify dimensions after applying.",
             "auto_fixable": True,
         },
         "pivot_at_origin": {
             "label": "Pivot not at world origin",
-            "severity": "warning",
             "why": (
-                "UE5 uses the mesh pivot as the actor origin. A pivot offset from geometry "
-                "centre causes unintuitive placement, rotation around wrong point, and "
-                "incorrect socket/attachment positions."
+                "UE5 uses the mesh pivot as the actor spawn point and rotation origin. "
+                "An off-origin pivot causes offset level placement, rotation around the "
+                "wrong point, and incorrect socket/attachment positions."
             ),
-            "fix": "Set origin to geometry (Object > Set Origin > Origin to Geometry) or to scene origin for characters.",
-            "auto_fixable": False,
-        },
-        "naming_convention": {
-            "label": "Naming convention not followed (SM_ / SK_ prefix missing)",
-            "severity": "warning",
-            "why": (
-                "UE5 uses SM_ (Static Mesh) and SK_ (Skeletal Mesh) prefixes as pipeline "
-                "conventions. Without them, asset management tools, import rules, and "
-                "Blueprint references become inconsistent."
-            ),
-            "fix": "Rename object: SM_AssetName for static meshes, SK_AssetName for skeletal meshes.",
+            "fix": "Object > Set Origin > Origin to Geometry, or move to scene origin for characters.",
             "auto_fixable": False,
         },
         "triangulated": {
-            "label": "Mesh not pre-triangulated",
-            "severity": "info",
+            "label": "Mesh not pre-triangulated (contains quads/n-gons)",
             "why": (
-                "UE5 auto-triangulates on import — this is generally fine. Pre-triangulating "
-                "in Blender gives you control over the triangulation pattern, which matters "
-                "for normal map accuracy on curved surfaces."
+                "UE5 auto-triangulates on import — fine for static meshes. "
+                "Pre-triangulating gives control over tessellation pattern, "
+                "which matters for normal map accuracy on curved surfaces."
             ),
-            "fix": "Optional: Add Triangulate modifier and apply before export, or enable Triangulate in the FBX export dialog.",
+            "fix": "Optional: Triangulate modifier (apply before export) or enable in FBX export dialog.",
             "auto_fixable": True,
         },
         "has_uvs": {
             "label": "No UV maps found",
-            "severity": "critical",
             "why": (
-                "Without UVs, no texture can be applied in UE5. Lightmap baking will also "
-                "fail. This asset cannot be used in production without UV unwrapping."
+                "Without UVs, no texture can be applied in UE5 and lightmap baking "
+                "will fail entirely. Asset cannot be used in any textured production "
+                "context without UV unwrapping."
             ),
-            "fix": "Unwrap in UV Editor (U in Edit Mode). Create a second UV channel for lightmaps.",
+            "fix": "Edit Mode > U > Smart UV Project. Create UV Channel 1 for lightmaps.",
             "auto_fixable": False,
         },
         "lightmap_uv": {
-            "label": "No dedicated lightmap UV channel (UV channel 1)",
-            "severity": "warning",
+            "label": "No dedicated lightmap UV channel (UV Channel 1 missing)",
             "why": (
-                "Without a non-overlapping lightmap UV, Unreal's Lightmass cannot bake "
-                "correct shadows onto this mesh. It will show uniform shadowing or artifacts."
+                "Without a non-overlapping UV Channel 1, Unreal Lightmass and Lumen "
+                "cannot bake correct shadows. Asset will show uniform ambient shadowing "
+                "or baking artifacts."
             ),
-            "fix": "Create UV Channel 1 using Smart UV Project or Lightmap Pack in Blender's UV Editor.",
+            "fix": "Add UV Channel 1 via Smart UV Project or Lightmap Pack. Keep non-overlapping.",
             "auto_fixable": False,
         },
-        "normal_map_direction": {
-            "label": "Normal map direction — Blender (OpenGL) vs UE5 (DirectX)",
-            "severity": "warning",
+        "collision_mesh": {
+            "label": "No custom collision mesh (UCX_/UBX_ object not found)",
             "why": (
-                "Blender and UE5 use opposite Y-axis convention for normal maps. "
-                "A normal map baked in Blender will look inverted (lighting from wrong "
-                "direction) when applied in UE5 without conversion."
+                "Without a custom collision mesh, UE5 uses an auto-convex hull which is "
+                "too imprecise for gameplay — characters clip through corners, projectiles "
+                "miss concave surfaces, physics performance is worse."
             ),
-            "fix": (
-                "In UE5 Texture Editor: enable 'Flip Green Channel' on normal map textures. "
-                "Or bake with Y-flipped normals in Blender by enabling 'Flip Y' in the "
-                "bake settings."
+            "fix": "Create collision mesh named UCX_ObjectName (convex) or UBX_ObjectName (box). "
+                   "Export alongside main mesh in same FBX.",
+            "auto_fixable": False,
+        },
+        "lod_naming": {
+            "label": "No LOD hierarchy found (ObjectName_LOD0 not present in scene)",
+            "why": (
+                "Without LODs, UE5 renders full-detail mesh at all distances. "
+                "For game assets, LODs are essential for draw-call and triangle "
+                "budget management."
             ),
+            "fix": "Create LODs named ObjectName_LOD0, _LOD1, _LOD2 etc. Export all in same FBX.",
+            "auto_fixable": False,
+        },
+        "modifiers_applied": {
+            "label": "Unapplied blocking modifier(s) present (BOOLEAN/ARRAY/MIRROR/BEVEL/SOLIDIFY)",
+            "why": (
+                "These modifier types are not baked into mesh geometry. "
+                "FBX export sends the base mesh without modifier effects — "
+                "UE5 receives the wrong mesh, not what is visible in viewport."
+            ),
+            "fix": "Apply all blocking modifiers (Ctrl+A in Properties > Modifiers) before FBX export.",
+            "auto_fixable": True,
+        },
+        "normal_map_direction": {
+            "label": "Normal map direction advisory (Blender=OpenGL, UE5=DirectX)",
+            "why": (
+                "Blender uses OpenGL normal maps (G channel = up). "
+                "UE5 uses DirectX normal maps (G channel = down). "
+                "A Blender-baked normal map will look incorrectly lit in UE5."
+            ),
+            "fix": "In UE5 Texture Editor: enable 'Flip Green Channel'. "
+                   "Or in Blender bake settings enable 'Flip Y' before baking.",
             "auto_fixable": False,
         },
     }
@@ -648,20 +793,27 @@ def _reason_unreal_readiness(raw: dict) -> dict:
     for key, meta in check_meta.items():
         check = checks.get(key, {})
         passed = check.get("pass", True)
+        sev = check.get("severity", "warning")
         if not passed:
-            sev = check.get("severity", meta["severity"])
             findings.append({
                 "issue": meta["label"],
-                "severity": sev,
+                "severity": "critical" if sev == "error" else sev,
                 "why_it_matters": meta["why"],
                 "professional_fix": meta["fix"],
                 "auto_fixable": meta.get("auto_fixable", False),
+                "addon_detail": check.get("detail", ""),
             })
 
-    blocking = [f for f in findings if f["severity"] == "critical"]
-    advisory = [f for f in findings if f["severity"] == "warning"]
+    blocking   = [f for f in findings if f["severity"] == "critical"]
+    advisory   = [f for f in findings if f["severity"] == "warning"]
+    info_items = [f for f in findings if f["severity"] == "info"]
 
-    overall = "critical" if blocking else ("warning" if advisory else ("info" if findings else "pass"))
+    overall = (
+        "critical" if blocking
+        else "warning" if advisory
+        else "info" if info_items
+        else "pass"
+    )
 
     return {
         **raw,
@@ -670,10 +822,12 @@ def _reason_unreal_readiness(raw: dict) -> dict:
             "summary": (
                 "PASS — asset meets UE5 import requirements." if overall == "pass"
                 else f"{overall.upper()} — {len(blocking)} blocking error(s), "
-                     f"{len(advisory)} advisory warning(s) before UE5 export."
+                     f"{len(advisory)} advisory warning(s), "
+                     f"{len(info_items)} info item(s) before UE5 export."
             ),
             "blocking_errors": blocking,
             "advisory_warnings": advisory,
+            "info_items": info_items,
             "export_safe": overall in ("pass", "info"),
             "findings": findings,
         }
@@ -681,39 +835,39 @@ def _reason_unreal_readiness(raw: dict) -> dict:
 
 
 def _reason_animation(raw: dict) -> dict:
-    """Interpret analyze_animation_quality output with professional animation context."""
+    """
+    Interpret analyze_animation_quality output with professional animation context.
+
+    Real addon.py schema (analyze_animation_quality):
+      {
+        "score": int,
+        "rating": str,
+        "error_count": int,
+        "warning_count": int,
+        "findings": [
+          {"severity": "error"|"warning"|"info", "msg": str}
+        ],
+        "recommendation": str
+      }
+    findings is a FLAT LIST with severity + msg.
+    severity uses "error" (not "critical") for most severe items.
+    """
     findings = []
 
-    score   = raw.get("score", 100)
-    warns   = raw.get("warnings", [])
-    errors  = raw.get("errors", [])
-    info    = raw.get("info", [])
+    score        = raw.get("score", 100)
+    raw_findings = raw.get("findings", [])  # flat list with severity+msg
 
-    for e in errors:
+    for item in raw_findings:
+        sev = item.get("severity", "info")
+        msg = item.get("msg", "")
+        # Map addon "error" -> "critical" for consistency with other tools
+        mapped_sev = "critical" if sev == "error" else sev
         findings.append({
-            "issue": e,
-            "severity": "critical",
-            "category": _classify_animation_issue(e),
-            "why_it_matters": _animation_why(e),
-            "professional_fix": _animation_fix(e),
-        })
-
-    for w in warns:
-        findings.append({
-            "issue": w,
-            "severity": "warning",
-            "category": _classify_animation_issue(w),
-            "why_it_matters": _animation_why(w),
-            "professional_fix": _animation_fix(w),
-        })
-
-    for i in info:
-        findings.append({
-            "issue": i,
-            "severity": "info",
-            "category": _classify_animation_issue(i),
-            "why_it_matters": "",
-            "professional_fix": "",
+            "issue": msg,
+            "severity": mapped_sev,
+            "category": _classify_animation_issue(msg),
+            "why_it_matters": _animation_why(msg),
+            "professional_fix": _animation_fix(msg),
         })
 
     if score >= 90:
@@ -727,7 +881,11 @@ def _reason_animation(raw: dict) -> dict:
     else:
         grade = "F — Not suitable for production"
 
-    overall = "critical" if errors else ("warning" if warns else ("info" if info else "pass"))
+    overall = "pass" if not findings else (
+        "critical" if any(f["severity"] == "critical" for f in findings)
+        else "warning" if any(f["severity"] == "warning" for f in findings)
+        else "info"
+    )
 
     return {
         **raw,
@@ -737,7 +895,7 @@ def _reason_animation(raw: dict) -> dict:
             "score": score,
             "summary": (
                 f"Animation grade: {grade}. Score: {score}/100. "
-                f"{len(errors)} error(s), {len(warns)} warning(s)."
+                f"{raw.get('error_count', 0)} error(s), {raw.get('warning_count', 0)} warning(s)."
             ),
             "findings": findings,
             "production_ready": score >= 75,
@@ -745,82 +903,22 @@ def _reason_animation(raw: dict) -> dict:
     }
 
 
-def _classify_animation_issue(text: str) -> str:
-    t = text.lower()
-    if "foot" in t or "sliding" in t:
-        return "foot_contact"
-    if "jitter" in t or "noise" in t:
-        return "keyframe_noise"
-    if "linear" in t:
-        return "interpolation"
-    if "velocity" in t or "spike" in t:
-        return "velocity"
-    if "spine" in t or "pelvis" in t or "hip" in t:
-        return "body_mechanics"
-    if "arm" in t or "shoulder" in t:
-        return "upper_body"
-    return "general"
-
-
-def _animation_why(text: str) -> str:
-    t = text.lower()
-    if "foot" in t or "sliding" in t:
-        return (
-            "Foot sliding is the most immediately visible animation error. It breaks "
-            "the physical contract between the character and the ground, destroying "
-            "believability in any third-person or VR context."
-        )
-    if "jitter" in t or "noise" in t:
-        return (
-            "High-frequency keyframe jitter is usually caused by motion capture noise "
-            "or over-corrected curves. It reads as vibration at runtime, not as motion, "
-            "and is particularly visible on held poses and slow movements."
-        )
-    if "linear" in t:
-        return (
-            "LINEAR interpolation between keyframes produces mechanical, robotic motion. "
-            "Organic motion requires ease-in/ease-out curves (BEZIER or AUTO interpolation) "
-            "to read as weight and physical momentum."
-        )
-    if "velocity" in t or "spike" in t:
-        return (
-            "Velocity spikes mean a bone is moving impossibly fast between two frames. "
-            "This causes popping artefacts in compressed animations and breaks secondary "
-            "motion systems like IK solvers and cloth simulation."
-        )
-    return "Review in the Dope Sheet and Graph Editor for context."
-
-
-def _animation_fix(text: str) -> str:
-    t = text.lower()
-    if "foot" in t or "sliding" in t:
-        return (
-            "In the Graph Editor, identify the foot bone's location curves during the "
-            "contact phase. Manually lock XY translation during ground contact frames. "
-            "Use IK constraints with a foot controller locked to world space."
-        )
-    if "jitter" in t or "noise" in t:
-        return (
-            "Select affected bones in Pose Mode, open Graph Editor, select all curves, "
-            "apply Smooth Keys (Key > Smooth Keys) 2–3 times. Alternatively use the "
-            "Decimate modifier on the F-curve with a ratio of 0.3–0.5."
-        )
-    if "linear" in t:
-        return (
-            "Select all keyframes in the Dope Sheet. Key > Interpolation Mode > Bezier. "
-            "Then use Key > Handle Type > Auto Clamped to prevent overshoot."
-        )
-    if "velocity" in t or "spike" in t:
-        return (
-            "Locate the spike in the Graph Editor (look for a V-shape in the curve). "
-            "Delete or move the offending keyframe. Check for duplicate keyframes on "
-            "the same frame — they create zero-duration transitions."
-        )
-    return "Review in the Dope Sheet and Graph Editor."
-
-
 def _reason_asset_qa(raw: dict) -> dict:
-    """Interpret run_asset_qa output with production QA context."""
+    """
+    Interpret run_asset_qa output with production QA context.
+
+    Real addon.py schema (run_asset_qa):
+      {
+        "verdict": "PASS"|"FAIL",
+        "passed": [str],
+        "issues": [str],
+        "warnings": [str],
+        "issue_count": int,
+        "warning_count": int,
+        "summary": str
+      }
+    issues and warnings are both plain string lists.
+    """
     findings = []
 
     issues   = raw.get("issues", [])
@@ -830,7 +928,7 @@ def _reason_asset_qa(raw: dict) -> dict:
         findings.append({
             "issue": issue,
             "severity": "critical",
-            "why_it_matters": "Blocking issue — asset will fail pipeline validation.",
+            "why_it_matters": "Blocking issue — asset will fail pipeline validation or import.",
             "professional_fix": "Resolve before export.",
         })
 
@@ -838,7 +936,7 @@ def _reason_asset_qa(raw: dict) -> dict:
         findings.append({
             "issue": warning,
             "severity": "warning",
-            "why_it_matters": "Advisory — may cause downstream problems.",
+            "why_it_matters": "Advisory — may cause downstream problems in production.",
             "professional_fix": "Review before shipping to production.",
         })
 
@@ -859,9 +957,6 @@ def _reason_asset_qa(raw: dict) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-REPAIR ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Safe repair scripts — each is a standalone bpy code block
 _REPAIR_SCRIPTS = {
@@ -910,8 +1005,10 @@ print("scale_not_applied:done")
 """,
 }
 
+# _REPAIR_ORDER uses script keys. addon.py calls loose verts "isolated_verts"
+# so we check both names in the repair loop below.
 _REPAIR_ORDER = [
-    "loose_vertices",
+    "loose_vertices",    # addon key: "isolated_verts"
     "duplicate_faces",
     "zero_area_faces",
     "inverted_normals",
@@ -1612,7 +1709,9 @@ bpy.context.view_layer.objects.active = obj
 obj.select_set(True)
 print("active:set")
 """
-        activate_result = blender.send_command("execute_code", {"code": set_active_script})
+        activate_result = blender.send_command(
+            "execute_code_safe", {"code": set_active_script, "required_mode": "OBJECT", "push_undo": True}
+        )
         if "error" in activate_result:
             return json.dumps({"error": f"Could not set active object: {activate_result['error']}"})
 
@@ -1655,7 +1754,12 @@ print("active:set")
         repair_errors = []
 
         for repair_key in _REPAIR_ORDER:
-            if repair_key not in auto_repairable:
+            # addon.py calls loose verts "isolated_verts"; our script key is "loose_vertices"
+            matched = (
+                repair_key in auto_repairable or
+                (repair_key == "loose_vertices" and "isolated_verts" in auto_repairable)
+            )
+            if not matched:
                 continue
             script = _REPAIR_SCRIPTS.get(repair_key, "")
             if not script:
@@ -1671,7 +1775,9 @@ if obj:
 {script}
 """
             try:
-                result = blender.send_command("execute_code", {"code": full_script})
+                result = blender.send_command(
+                    "execute_code_safe", {"code": full_script, "required_mode": "OBJECT", "push_undo": True}
+                )
                 if result.get("result", "").find("done") >= 0 or "error" not in result:
                     repairs_executed.append(repair_key)
                 else:
