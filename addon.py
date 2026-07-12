@@ -348,6 +348,52 @@ class BlenderMCPServer:
         return (bpy.app.version[0], bpy.app.version[1])
 
     @staticmethod
+    def _get_fcurves(action, obj=None):
+        """
+        Return a flat list of FCurves from an action, handling both the legacy
+        API (Blender < 4.4) and the new layered action API (Blender 4.4+).
+
+        Blender 4.4 removed the direct action.fcurves shortcut. FCurves now
+        live at: action.layers[n].strips[m] (type KEYFRAME) -> channelbag
+        scoped to an action slot -> channelbag.fcurves.
+
+        Strategy:
+          1. If Blender >= 4.4 and action has layers, iterate layers/strips/
+             channelbags. Try slot-scoped channelbag first (correct for
+             multi-object actions); fall back to all channelbags on the strip
+             if the slot isn't available.
+          2. Otherwise use the legacy action.fcurves list directly.
+          3. If neither exists, return [].
+        """
+        # ── Blender 4.4+ layered action API ───────────────────────────────────
+        if bpy.app.version >= (4, 4, 0) and hasattr(action, 'layers'):
+            fcurves = []
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if strip.type != 'KEYFRAME':
+                        continue
+                    # Prefer slot-scoped channelbag — correct for multi-object actions
+                    slot = None
+                    if (obj
+                            and hasattr(obj, 'animation_data')
+                            and obj.animation_data
+                            and hasattr(obj.animation_data, 'action_slot')):
+                        slot = obj.animation_data.action_slot
+                    if slot is not None:
+                        cb = strip.channelbags.get(slot)
+                        if cb:
+                            fcurves.extend(cb.fcurves)
+                            continue
+                    # Fallback: collect from every channelbag on this strip
+                    for cb in strip.channelbags:
+                        fcurves.extend(cb.fcurves)
+            return fcurves
+        # ── Legacy API (pre-4.4): fcurves directly on action ──────────────────
+        if hasattr(action, 'fcurves'):
+            return list(action.fcurves)
+        return []
+
+    @staticmethod
     def _build_bmesh_from_object(obj):
         """
         Safely build a new BMesh from obj in OBJECT mode.
@@ -692,8 +738,9 @@ class BlenderMCPServer:
 
             if obj.animation_data.action:
                 action = obj.animation_data.action
+                fcurves = self._get_fcurves(action, obj)
                 fcurves_summary = []
-                for fc in action.fcurves:
+                for fc in fcurves:
                     kps = fc.keyframe_points
                     entry = {
                         "path": fc.data_path,
@@ -716,7 +763,7 @@ class BlenderMCPServer:
                 result["action"] = {
                     "name": action.name,
                     "frame_range": [round(v, 1) for v in action.frame_range],
-                    "fcurve_count": len(action.fcurves),
+                    "fcurve_count": len(fcurves),
                     "channels": fcurves_summary[:30],
                 }
             else:
@@ -1014,6 +1061,10 @@ class BlenderMCPServer:
                         "findings": [{"sev": "info", "msg": "No animation action found"}], "score": 0}
 
             action = obj.animation_data.action
+            # Fetch fcurves once via version-safe helper — works on Blender 4.4+
+            # (layered action API) and all earlier versions (action.fcurves).
+            fcurves = self._get_fcurves(action, obj)
+
             errors   = []  # will cause problems
             warnings = []  # should be reviewed
             info     = []  # useful context
@@ -1027,7 +1078,7 @@ class BlenderMCPServer:
 
             # --- Stiff channels (rotation with <3 keys over full range) ---
             stiff_bones = []
-            for fc in action.fcurves:
+            for fc in fcurves:
                 if "rotation" in fc.data_path and len(fc.keyframe_points) < 3:
                     stiff_bones.append(fc.data_path)
             if len(stiff_bones) > 3:
@@ -1036,7 +1087,7 @@ class BlenderMCPServer:
             # --- FIX: Foot sliding — detect XY movement while Z is LOCKED (planted foot)
             # A foot sliding = Z constant (foot on ground) BUT XY is moving (sliding)
             loc_curves = {}
-            for fc in action.fcurves:
+            for fc in fcurves:
                 if 'location' in fc.data_path:
                     key = fc.data_path
                     if key not in loc_curves:
@@ -1065,7 +1116,7 @@ class BlenderMCPServer:
                                 )
 
             # --- Velocity spikes (sudden large value jumps between adjacent keyframes) ---
-            for fc in action.fcurves:
+            for fc in fcurves:
                 kps = fc.keyframe_points
                 if len(kps) < 2:
                     continue
@@ -1081,11 +1132,11 @@ class BlenderMCPServer:
 
             # --- Missing secondary motion ---
             if obj.type == 'ARMATURE' and obj.pose:
-                has_scale_anim = any('scale' in fc.data_path for fc in action.fcurves)
+                has_scale_anim = any('scale' in fc.data_path for fc in fcurves)
                 if not has_scale_anim:
                     info.append("No scale animation — add subtle squash/stretch for secondary motion")
                 # Check for constant-rotation bones (potential missing follow-through)
-                for fc in action.fcurves:
+                for fc in fcurves:
                     if 'rotation' in fc.data_path:
                         kps = fc.keyframe_points
                         if len(kps) >= 2:
