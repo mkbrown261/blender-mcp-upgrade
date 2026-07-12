@@ -995,7 +995,10 @@ def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
     # problems dict: non_manifold_edges / isolated_verts / zero_area_faces / duplicate_faces / boundary_edges
     # uv.has_uvs / uv.layer_count
     # modifiers: [{name, type, show_viewport}]
-    # rigging.deform_modifiers: list of modifier type strings
+    # rigging.deform_modifiers: list of modifier NAMES (e.g. ["Armature", "Armature.001"])
+    #   — addon.py line 529: [m.name for m in obj.modifiers if m.type in ('ARMATURE',...)]
+    #   — NOT type strings — "ARMATURE" will never appear in this list
+    # modifiers: [{name, type, show_viewport}]  ← use this for type checks
     # health: "clean" | "issues_found"
     counts     = mesh_stats.get("counts", {})
     face_types = mesh_stats.get("face_types", {})
@@ -1014,12 +1017,10 @@ def _classify_stage_from_signals(obj_info: dict, mesh_stats: dict) -> dict:
     quad_pct       = (quad_count / total_faces * 100) if total_faces > 0 else 0
     nm_edges       = problems.get("non_manifold_edges", 0)
 
-    # Armature: inferred from deform_modifiers list in rigging block
-    deform_mods    = rigging.get("deform_modifiers", [])
-    has_armature   = "ARMATURE" in deform_mods
-
-    # Modifier types from the modifiers list in mesh_stats
+    # Modifier types from the modifiers list — correct source for type checks.
+    # deform_modifiers holds names not types, so armature detection uses mod_list.
     modifier_types = [m.get("type", "") for m in mod_list if isinstance(m, dict)]
+    has_armature   = "ARMATURE" in modifier_types
     has_multires   = "MULTIRES" in modifier_types
     has_subsurf    = "SUBSURF"  in modifier_types
     no_modifiers   = len(modifier_types) == 0
@@ -1479,25 +1480,34 @@ Then deliver ONE orientation sentence:
 STOP. Wait for user. Do not auto-run further tools.
 
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
-TIER 1 (prefer): analyze_mesh_for_unreal, full_asset_pipeline_check,
-                 analyze_animation_quality, suggest_repair_plan
-TIER 2:          get_mesh_quality_report, analyze_topology, run_unreal_readiness_check,
-                 run_asset_qa
-TIER 3 (raw):    detect_mesh_problems, get_object_info, get_scene_info
-TIER 4 (repair): suggest_repair_plan (safe) → [user approval] → auto_repair_mesh
-                 → validate_repair (always after repair)
+TIER 1 (prefer — most coverage per call):
+  analyze_mesh_for_unreal      full mesh + topology + UE5 readiness in one call
+  analyze_animation_quality    full animation health check
+  critique_animation           animation critique with stage context
+TIER 2 (targeted):
+  get_mesh_quality_report      mesh stats + problem types
+  analyze_topology             topology score + pole analysis
+  run_unreal_readiness_check   UE5 gate check
+  run_asset_qa                 QA pass/fail verdict
+TIER 3 (raw — only when Tier 1-2 don't cover it):
+  detect_mesh_problems         raw problem list
+  get_object_info              raw object data
+  get_scene_info               raw scene data
+TIER 4 (repair — always gate-controlled):
+  auto_repair_mesh             DESTRUCTIVE — requires explicit user approval
+  run_asset_qa                 call after auto_repair_mesh to verify repair
 
 SCENE-LEVEL ORDER (never skip):
-  screenshot → get_scene_summary() → classify_pipeline_stage(name)
-  → audit_all_objects()
+  screenshot → get_scene_summary() → classify_pipeline_stage(name) → audit_all_objects()
 audit_all_objects auto-mode: 1 mesh = HERO, 2–20 = COLLECTION, 20+ = ENVIRONMENT.
 
 TRIGGER MAP:
-  "look/show/what do you see"     → screenshot immediately
+  "look/show/what do you see"     → get_viewport_screenshot() immediately
   "ready for Unreal/export/UE5"   → analyze_mesh_for_unreal()
   "topology/loops/quads"          → screenshot + analyze_topology()
-  "what's wrong/audit/check"      → full_asset_pipeline_check()
-  "fix/clean/repair"              → suggest_repair_plan() → wait → auto_repair_mesh()
+  "what's wrong/audit/check"      → analyze_mesh_for_unreal() (covers all systems)
+  "fix/clean/repair"              → describe plan explicitly → WAIT for "yes/do it"
+                                    → auto_repair_mesh() → screenshot + run_asset_qa()
   "poly/vert count"               → get_object_info() + stage context
   "what stage"                    → screenshot + get_object_info() + stage reasoning
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
@@ -1508,13 +1518,14 @@ Screenshot required: session start, after any repair, before/after auto_repair_m
 when reporting any PASS/FAIL verdict.
 
 ── SAFETY GATES — hard stops, never bypass ────────────────────────────────────
-GATE 1 DESTRUCTIVE GEOMETRY  → suggest_repair_plan() + explicit "yes/do it/go ahead"
+GATE 1 DESTRUCTIVE GEOMETRY  → describe plan in full + explicit "yes/do it/go ahead"
+                               → NEVER call auto_repair_mesh() without that confirmation
 GATE 2 STAGE TRANSITION      → full QA for current stage + "Ready to move to X?"
 GATE 3 EXPORT                → run_unreal_readiness_check() zero errors + run_asset_qa() PASS
 GATE 4 IRREVERSIBLE OPS      → state exactly what happens + wait for explicit confirm
 
 NEVER:
-  ✗ auto_repair_mesh() without approved suggest_repair_plan()
+  ✗ auto_repair_mesh() without explicit user approval
   ✗ PASS without running the actual tool
   ✗ "clean" verdict from visual inspection alone
   ✗ Export with known critical issues
@@ -2466,7 +2477,9 @@ def classify_pipeline_stage(object_name: str) -> str:
             "vertex_count":   mesh_block.get("vertices", 0),
             "face_count":     mesh_block.get("polygons",  0),
             "material_count": len(obj_info.get("materials", [])),
-            "has_armature":   "ARMATURE" in mesh_stats.get("rigging", {}).get("deform_modifiers", []),
+            "has_armature":   any(m.get("type") == "ARMATURE"
+                                 for m in mesh_stats.get("modifiers", [])
+                                 if isinstance(m, dict)),
             "has_uvs":        mesh_stats.get("uv", {}).get("has_uvs", False),
             "uv_layers":      mesh_stats.get("uv", {}).get("layer_count", 0),
             "mesh_health":    mesh_stats.get("health", "unknown"),
@@ -2853,7 +2866,10 @@ def get_scene_summary() -> str:
                     faces  = stats.get("counts", {}).get("faces",     0) or 0
                     health_flag = stats.get("health", "unknown")
                     probs  = stats.get("problems", {})
-                    problem_count = sum(v for v in probs.values() if isinstance(v, int))
+                    # Count distinct problem TYPES that have at least one instance.
+                    # Do NOT sum the raw counts — those are edge/vertex quantities,
+                    # not a count of problem categories.
+                    problem_count = sum(1 for v in probs.values() if isinstance(v, int) and v > 0)
                     # Find worst problem by count
                     if probs:
                         worst_key = max(probs, key=lambda k: probs[k] if isinstance(probs[k], int) else 0)
