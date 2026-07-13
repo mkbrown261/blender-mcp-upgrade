@@ -7006,7 +7006,8 @@ else:
         (["tree","bush","plant","flower","grass"],         "vegetation"),
         (["rock","stone","boulder","cliff"],               "rock / terrain"),
         (["car","truck","vehicle","wheel","tire"],         "vehicle"),
-        (["character","human","person","npc","enemy"],     "character"),
+        (["character","human","person","npc","enemy",
+          "zombie","monster","creature","undead","boss","villain"], "character"),
         (["pillar","column","post","pole"],                "structural column"),
         (["roof","ceiling","canopy"],                      "ceiling / roof"),
     ]
@@ -7092,7 +7093,9 @@ else:
         parts.append("floating (nothing directly below)")
     if nearest:
         nn = nearest[0]
-        parts.append(f"{nn['distance']}m {nn['direction']} of {nn['name']}")
+        # "above"/"below" read naturally on their own; other directions need "of"
+        joiner = "" if nn['direction'] in ("above", "below") else " of"
+        parts.append(f"{nn['distance']}m {nn['direction']}{joiner} {nn['name']}")
     if len(nearest) > 1:
         others_str = ", ".join(f"{n['name']} ({n['distance']}m)" for n in nearest[1:3])
         parts.append(f"near {others_str}")
