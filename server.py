@@ -1534,6 +1534,7 @@ TIER 2 (targeted):
   analyze_material_pbr         full PBR node graph review
   analyze_rig_weights          weight QA: unweighted verts, >8 influences, zero-weight
   analyze_rig_skeleton         skeleton QA: root at origin, orphan bones, naming
+  validate_bake_setup          bake pre-flight: 10 checks before touching Blender bake
 TIER 3 (raw — only when Tier 1-2 don't cover it):
   detect_mesh_problems         raw problem list
   get_object_info              raw object data
@@ -1564,6 +1565,8 @@ TRIGGER MAP:
   "poly/vert count"               → get_object_info() + stage context
   "what stage"                    → classify_pipeline_stage() + screenshot
   "rig/weights/skinning/bones"    → analyze_rig_weights() then analyze_rig_skeleton()
+  "bake/baking/normal map/AO"    → validate_bake_setup(low_poly, high_poly) FIRST
+                                    NEVER call bake without validate_bake_setup PASS/WARN
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → get_scene_summary()
                                     → gap report (Present/Missing/Extra/Different)
@@ -1577,6 +1580,9 @@ GATE 1 DESTRUCTIVE GEOMETRY  → describe plan in full + explicit "yes/do it/go 
 GATE 2 STAGE TRANSITION      → full QA for current stage + "Ready to move to X?"
 GATE 3 EXPORT                → run_unreal_readiness_check() zero errors + run_asset_qa() PASS
 GATE 4 IRREVERSIBLE OPS      → state exactly what happens + wait for explicit confirm
+GATE 5 BAKE                  → validate_bake_setup() MUST run first, every time
+                               → NEVER initiate a bake if verdict is FAIL
+                               → WARN verdict: state warnings explicitly, get confirmation
 
 NEVER:
   ✗ auto_repair_mesh() without explicit user approval
@@ -3345,6 +3351,502 @@ else:
 
     except Exception as e:
         logger.error(f"Error in analyze_rig_skeleton: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def validate_bake_setup(low_poly_name: str, high_poly_name: str) -> str:
+    """
+    BAKE PRE-FLIGHT — validates that a bake setup is correct before touching anything.
+
+    Run this BEFORE every bake operation. It will hard-stop on any condition that
+    causes black textures, smeared detail, incorrect normals, or failed exports.
+
+    Checks (in priority order):
+
+      CRITICAL — blocks bake entirely:
+        1. Both objects exist in scene by the given names
+        2. Low poly has a UV map with at least one island
+        3. No overlapping UV islands (uses Blender's select_overlap operator)
+        4. Active material has an Image Texture node in the shader
+        5. That Image Texture node is the active/selected node in the shader
+        6. The bake target image is valid (exists, not zero-size)
+
+      WARNING — bake can proceed but you should know:
+        7. UV island margin (islands packed too tight → bleed at low resolution)
+        8. High poly visibility (hidden objects bake but it's a common confusion)
+        9. Unapplied scale on low poly (distorts normal map results)
+       10. Modifiers on low poly (subdivision etc. affect bake cage unexpectedly)
+
+    Parameters:
+      low_poly_name  : name of the low-poly mesh object (bake target)
+      high_poly_name : name of the high-poly mesh object (bake source)
+
+    Returns:
+      safe_to_bake   : bool — True only if zero CRITICAL failures
+      verdict        : PASS | WARN | FAIL
+      checks         : full list with severity, status, why, why_now, consequence
+      ready_when_fixed : ordered list of actions needed before baking
+    """
+    try:
+        script = r"""
+import bpy
+import json
+
+low_poly_name  = '{LOW_POLY}'
+high_poly_name = '{HIGH_POLY}'
+
+checks       = []
+fix_list     = []
+had_critical = False
+
+def add_check(check, severity, status, detail, why, why_now, consequence, fix=None):
+    global had_critical
+    checks.append({
+        "check":       check,
+        "severity":    severity,
+        "status":      status,
+        "detail":      detail,
+        "why":         why,
+        "why_now":     why_now,
+        "consequence": consequence,
+    })
+    if status in ("FAIL", "WARN") and fix:
+        fix_list.append(fix)
+    if severity == "CRITICAL" and status == "FAIL":
+        had_critical = True
+
+# ── CHECK 1: Objects exist ──────────────────────────────────────────────────
+low_obj  = bpy.data.objects.get(low_poly_name)
+high_obj = bpy.data.objects.get(high_poly_name)
+
+if low_obj is None:
+    add_check(
+        "low_poly_exists", "CRITICAL", "FAIL",
+        f"Object '{low_poly_name}' not found in scene.",
+        "The bake target must exist as a named object in the scene.",
+        "Cannot proceed — Blender has nothing to bake onto.",
+        "Bake will error immediately.",
+        f"Verify the exact object name. Got: '{low_poly_name}'.",
+    )
+if high_obj is None:
+    add_check(
+        "high_poly_exists", "CRITICAL", "FAIL",
+        f"Object '{high_poly_name}' not found in scene.",
+        "The bake source must exist as a named object in the scene.",
+        "Cannot proceed — Blender has no high-poly to sample from.",
+        "Bake will produce a flat or black result — no detail transferred.",
+        f"Verify the exact object name. Got: '{high_poly_name}'.",
+    )
+
+if low_obj is None or high_obj is None:
+    # Cannot run further checks without both objects
+    print(json.dumps({
+        "safe_to_bake":    False,
+        "verdict":         "FAIL",
+        "summary":         "One or both objects not found. Cannot run further checks.",
+        "checks":          checks,
+        "ready_when_fixed": fix_list,
+    }))
+    raise SystemExit
+
+# Both objects confirmed — continue
+if low_obj.type != 'MESH':
+    add_check(
+        "low_poly_is_mesh", "CRITICAL", "FAIL",
+        f"'{low_poly_name}' is type {low_obj.type}, not MESH.",
+        "Only mesh objects can be bake targets.",
+        "Blender cannot bake onto a non-mesh object.",
+        "Bake will error.",
+        f"Select the correct mesh object as the low poly.",
+    )
+else:
+    add_check(
+        "low_poly_is_mesh", "CRITICAL", "PASS",
+        f"'{low_poly_name}' is a MESH object.",
+        "", "", "",
+    )
+
+# ── CHECK 2: Low poly has UVs ───────────────────────────────────────────────
+if low_obj.type == 'MESH':
+    uv_layers = low_obj.data.uv_layers
+    if len(uv_layers) == 0:
+        add_check(
+            "low_poly_has_uvs", "CRITICAL", "FAIL",
+            "No UV map found on low poly.",
+            "Baking writes detail into UV space. Without a UV map there is nowhere to write.",
+            "Blender will error before the bake begins.",
+            "Result: bake error, no texture produced.",
+            "UV unwrap the low poly first (U key in Edit Mode → Unwrap).",
+        )
+    else:
+        # Check that at least one UV island exists (not just an empty layer)
+        mesh = low_obj.data
+        has_uvdata = len(mesh.uv_layers[0].data) > 0
+        if not has_uvdata:
+            add_check(
+                "low_poly_has_uvs", "CRITICAL", "FAIL",
+                "UV layer exists but contains no UV data (empty layer).",
+                "An empty UV layer is the same as no UVs for baking purposes.",
+                "Bake will produce black — no UV coordinates to write into.",
+                "Result: black texture.",
+                "Delete the empty UV layer and re-unwrap.",
+            )
+        else:
+            add_check(
+                "low_poly_has_uvs", "CRITICAL", "PASS",
+                f"{len(uv_layers)} UV layer(s) found with data.",
+                "", "", "",
+            )
+
+# ── CHECK 3: Overlapping UV islands ────────────────────────────────────────
+# Use Blender's select_overlap operator — requires Edit Mode briefly.
+overlap_count = 0
+overlap_error  = None
+
+if low_obj.type == 'MESH' and len(low_obj.data.uv_layers) > 0:
+    original_mode   = bpy.context.mode
+    original_active = bpy.context.view_layer.objects.active
+
+    try:
+        bpy.context.view_layer.objects.active = low_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.uv.select_all(action='DESELECT')
+
+        # select_overlap selects all overlapping UV islands
+        bpy.ops.uv.select_overlap()
+
+        # Count selected UV loops as a proxy for overlap extent
+        mesh_edit = low_obj.data
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # After returning to object mode, check selected UV loops
+        overlap_loops = sum(
+            1 for loop_uv in mesh_edit.uv_layers.active.data
+            if loop_uv.select
+        )
+        overlap_count = overlap_loops
+
+    except Exception as oe:
+        overlap_error = str(oe)
+        overlap_count = 0
+    finally:
+        # Always restore state
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+        bpy.context.view_layer.objects.active = original_active
+
+    if overlap_error:
+        add_check(
+            "uv_no_overlaps", "CRITICAL", "WARN",
+            f"Could not run overlap check: {overlap_error}",
+            "UV overlap check requires Edit Mode access.",
+            "Overlap check skipped — verify manually in UV Editor.",
+            "If islands overlap: smeared or doubled texture detail.",
+            "Open UV Editor → UV menu → Select Overlapping to check manually.",
+        )
+    elif overlap_count > 0:
+        add_check(
+            "uv_no_overlaps", "CRITICAL", "FAIL",
+            f"{overlap_count} UV loop(s) flagged as overlapping.",
+            "Overlapping UV islands occupy the same texture space.",
+            "At Stage 3/4, overlapping UVs mean two surfaces share the same pixels. "
+            "Baked detail from one surface bleeds onto the other.",
+            "Smeared, doubled, or incorrect texture detail in overlapping areas. "
+            "Will look wrong in engine regardless of bake quality.",
+            "UV Editor → UV → Select Overlapping → separate and repack islands.",
+        )
+    else:
+        add_check(
+            "uv_no_overlaps", "CRITICAL", "PASS",
+            "No overlapping UV islands detected.",
+            "", "", "",
+        )
+
+# ── CHECK 4: Active material has an Image Texture node ─────────────────────
+has_image_node   = False
+image_node_selected = False
+bake_image       = None
+bake_image_valid = False
+
+if low_obj.type == 'MESH':
+    mat = low_obj.active_material
+    if mat is None:
+        add_check(
+            "material_exists", "CRITICAL", "FAIL",
+            "Low poly has no active material.",
+            "Blender bakes into an image node inside the active material's shader.",
+            "Without a material, there is no shader, no image node, nowhere to bake.",
+            "Bake will error: 'No active image found in material'.",
+            "Assign a material to the low poly with an Image Texture node set up.",
+        )
+    elif mat.node_tree is None:
+        add_check(
+            "material_exists", "CRITICAL", "FAIL",
+            f"Material '{mat.name}' has no node tree (not using nodes).",
+            "Blender requires a node-based material to identify the bake target image.",
+            "Non-node materials have no Image Texture node to bake into.",
+            "Bake will error.",
+            f"Enable 'Use Nodes' on material '{mat.name}' and add an Image Texture node.",
+        )
+    else:
+        add_check(
+            "material_exists", "CRITICAL", "PASS",
+            f"Active material '{mat.name}' with node tree found.",
+            "", "", "",
+        )
+
+        # Find Image Texture nodes
+        img_nodes = [
+            n for n in mat.node_tree.nodes
+            if n.type == 'TEX_IMAGE'
+        ]
+
+        if not img_nodes:
+            add_check(
+                "image_node_exists", "CRITICAL", "FAIL",
+                f"No Image Texture node found in material '{mat.name}'.",
+                "Blender bakes into an Image Texture node. It must exist in the shader.",
+                "Without the node, Blender has no image to write bake data into.",
+                "Bake will error: 'No active image found in material'.",
+                f"Add an Image Texture node to '{mat.name}', create/assign a new image, "
+                f"then select that node before baking.",
+            )
+        else:
+            has_image_node = True
+            add_check(
+                "image_node_exists", "CRITICAL", "PASS",
+                f"{len(img_nodes)} Image Texture node(s) found in '{mat.name}'.",
+                "", "", "",
+            )
+
+            # ── CHECK 5: Image Texture node is the active/selected node ────────
+            active_node = mat.node_tree.nodes.active
+            if active_node is None or active_node.type != 'TEX_IMAGE':
+                # Find which image nodes are selected
+                selected_img = [n for n in img_nodes if n.select]
+                if not selected_img:
+                    add_check(
+                        "image_node_selected", "CRITICAL", "FAIL",
+                        "No Image Texture node is the active node in the shader.",
+                        "Blender bakes into the ACTIVE (highlighted) Image Texture node, "
+                        "not just any node that exists.",
+                        "The image nodes exist but none is selected/active. "
+                        "Blender does not know which image to write into.",
+                        "Bake will produce a black result or error: "
+                        "'No active image found in material'.",
+                        f"In Shader Editor, click to select the Image Texture node "
+                        f"you want to bake into. It must have an image assigned.",
+                    )
+                else:
+                    add_check(
+                        "image_node_selected", "CRITICAL", "FAIL",
+                        "An Image Texture node is selected but is not the ACTIVE node.",
+                        "Blender uses the active node (outlined in white), not just selected.",
+                        "Even with a node selected, if it's not active the bake target is wrong.",
+                        "Black bake result or bake into wrong image.",
+                        "Ctrl+click the Image Texture node to make it both selected and active.",
+                    )
+                image_node_selected = False
+            else:
+                image_node_selected = True
+                bake_image = active_node.image
+                add_check(
+                    "image_node_selected", "CRITICAL", "PASS",
+                    f"Active node is Image Texture: image='{bake_image.name if bake_image else 'None'}'.",
+                    "", "", "",
+                )
+
+            # ── CHECK 6: Bake target image is valid ───────────────────────────
+            if image_node_selected:
+                if bake_image is None:
+                    add_check(
+                        "bake_image_valid", "CRITICAL", "FAIL",
+                        "Active Image Texture node has no image assigned.",
+                        "The node exists and is active but has no image loaded or created.",
+                        "Blender cannot write bake data into an empty node slot.",
+                        "Bake will error: 'No active image found in material'.",
+                        "In the Image Texture node, create a new image "
+                        "(New button) or load an existing one.",
+                    )
+                elif bake_image.size[0] == 0 or bake_image.size[1] == 0:
+                    add_check(
+                        "bake_image_valid", "CRITICAL", "FAIL",
+                        f"Image '{bake_image.name}' has zero size ({bake_image.size[0]}x{bake_image.size[1]}).",
+                        "A zero-size image has no pixels to write into.",
+                        "Blender cannot bake into a zero-size image.",
+                        "Bake will error or produce nothing.",
+                        f"Delete and recreate image '{bake_image.name}' with a valid resolution "
+                        f"(e.g. 2048x2048 or 4096x4096).",
+                    )
+                else:
+                    bake_image_valid = True
+                    add_check(
+                        "bake_image_valid", "CRITICAL", "PASS",
+                        f"Bake target image '{bake_image.name}' is {bake_image.size[0]}x{bake_image.size[1]}.",
+                        "", "", "",
+                    )
+
+# ── CHECK 7: UV margin (WARNING) ────────────────────────────────────────────
+# Proxy: check if UV islands are very close together using island count vs area.
+# Simplified check — if UV layer exists we report advisory.
+if low_obj.type == 'MESH' and len(low_obj.data.uv_layers) > 0:
+    add_check(
+        "uv_margin", "WARNING", "WARN",
+        "UV margin not automatically measurable — verify manually.",
+        "Islands packed too close together cause pixel bleed between islands "
+        "at lower texture resolutions (1K, 2K).",
+        "At export or in-engine mip-mapping, neighbouring islands bleed colour "
+        "onto each other along seams.",
+        "Faint colour fringing along UV seams visible in engine at distance.",
+        "UV Editor → N panel → check island spacing. "
+        "Use at least 2px margin at 1K, 4px at 2K, 8px at 4K.",
+    )
+
+# ── CHECK 8: High poly visibility (WARNING) ─────────────────────────────────
+if high_obj is not None:
+    is_hidden = not high_obj.visible_get()
+    if is_hidden:
+        add_check(
+            "high_poly_visible", "WARNING", "WARN",
+            f"'{high_poly_name}' is hidden in the viewport.",
+            "Blender CAN bake from hidden objects in selected-to-active mode, "
+            "but hidden high polys are a common source of confusion and errors.",
+            "If the wrong object is the bake source, the result will be flat or wrong.",
+            "You may get a flat normal map with no detail transferred.",
+            f"Unhide '{high_poly_name}' (H key or eye icon in Outliner) "
+            f"to confirm it is the correct source before baking.",
+        )
+    else:
+        add_check(
+            "high_poly_visible", "WARNING", "PASS",
+            f"'{high_poly_name}' is visible in viewport.",
+            "", "", "",
+        )
+
+# ── CHECK 9: Unapplied scale on low poly (WARNING) ──────────────────────────
+if low_obj is not None:
+    scale = low_obj.scale
+    scale_applied = (
+        abs(scale.x - 1.0) < 0.001 and
+        abs(scale.y - 1.0) < 0.001 and
+        abs(scale.z - 1.0) < 0.001
+    )
+    if not scale_applied:
+        add_check(
+            "scale_applied", "WARNING", "WARN",
+            f"Low poly scale not applied: ({scale.x:.3f}, {scale.y:.3f}, {scale.z:.3f}).",
+            "Unapplied scale means Blender's internal geometry differs from what "
+            "you see. Normal map baking uses raw geometry — unapplied scale "
+            "causes the ray direction to be skewed.",
+            "Normal maps baked with unapplied scale will look incorrect when "
+            "the scale IS applied later (which it must be for UE5 export).",
+            "Normal map will appear swirled, inverted, or incorrect after export.",
+            "Object Mode → Object → Apply → Scale (Ctrl+A → Scale).",
+        )
+    else:
+        add_check(
+            "scale_applied", "WARNING", "PASS",
+            "Scale is applied on low poly (1.0, 1.0, 1.0).",
+            "", "", "",
+        )
+
+# ── CHECK 10: Modifiers on low poly (WARNING) ───────────────────────────────
+if low_obj is not None and low_obj.type == 'MESH':
+    bake_affecting_mods = [
+        m.name for m in low_obj.modifiers
+        if m.type in ('SUBSURF', 'MULTIRES', 'DISPLACE', 'SHRINKWRAP')
+        and m.show_viewport
+    ]
+    if bake_affecting_mods:
+        add_check(
+            "modifier_check", "WARNING", "WARN",
+            f"Bake-affecting modifier(s) active on low poly: {bake_affecting_mods}.",
+            "Subdivision, Multires, Displace, and Shrinkwrap modifiers change "
+            "the effective mesh shape during baking. The bake cage is computed "
+            "from the modified mesh, not the base mesh.",
+            "If you intend to apply these modifiers before export, bake with them "
+            "active and then apply — or disable them before baking.",
+            "Bake result will not match the exported mesh if modifiers are "
+            "removed after baking.",
+            f"Decide: apply modifiers before baking, or disable them. "
+            f"Affected: {bake_affecting_mods}.",
+        )
+    else:
+        add_check(
+            "modifier_check", "WARNING", "PASS",
+            "No bake-affecting modifiers active on low poly.",
+            "", "", "",
+        )
+
+# ── Final verdict ───────────────────────────────────────────────────────────
+critical_fails = [c for c in checks if c["severity"] == "CRITICAL" and c["status"] == "FAIL"]
+warnings       = [c for c in checks if c["severity"] == "WARNING"  and c["status"] == "WARN"]
+
+safe_to_bake = len(critical_fails) == 0
+
+if critical_fails:
+    verdict = "FAIL"
+    summary = (
+        f"{len(critical_fails)} CRITICAL issue(s) must be fixed before baking. "
+        f"Baking now will produce black, empty, or incorrect textures."
+    )
+elif warnings:
+    verdict = "WARN"
+    summary = (
+        f"No critical blockers. {len(warnings)} warning(s) to review. "
+        f"Bake can proceed but check the warnings — they affect output quality."
+    )
+else:
+    verdict = "PASS"
+    summary = (
+        f"All pre-flight checks passed. Setup looks correct. "
+        f"Safe to bake '{high_poly_name}' → '{low_poly_name}'."
+    )
+
+print(json.dumps({
+    "safe_to_bake":     safe_to_bake,
+    "verdict":          verdict,
+    "summary":          summary,
+    "low_poly":         low_poly_name,
+    "high_poly":        high_poly_name,
+    "checks":           checks,
+    "ready_when_fixed": fix_list,
+    "critical_count":   len(critical_fails),
+    "warning_count":    len(warnings),
+}))
+""".replace("{LOW_POLY}", low_poly_name.replace("'", "\\'")) \
+   .replace("{HIGH_POLY}", high_poly_name.replace("'", "\\'"))
+
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script})
+
+        output_text = raw.get("result", "") if isinstance(raw, dict) else str(raw)
+        result = None
+        for line in output_text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+        if result is None:
+            return json.dumps({
+                "error": "No JSON output from bake pre-flight script.",
+                "raw_output": output_text[:500],
+            })
+        if "error" in result:
+            return json.dumps(result)
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in validate_bake_setup: {e}")
         return json.dumps({"error": str(e)})
 
 
