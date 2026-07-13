@@ -145,6 +145,59 @@ class BlenderConnection:
 _blender_connection: Optional[BlenderConnection] = None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION CONTEXT — persists for the lifetime of this MCP server process.
+# Stores what Claude knows about the current work session so every tool call
+# can reference confirmed facts instead of re-inferring from scratch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SESSION: dict = {
+    # What kind of asset is being worked on (user-confirmed or inferred)
+    "asset_type": None,           # e.g. "hero_character" | "weapon" | "environment_prop"
+    # Which named playbook is active
+    "active_playbook": None,      # e.g. "hero_char" | "weapon" | "env_prop" | "creature" | "vehicle"
+    # Pipeline stage — confirmed by user or strong inference
+    "confirmed_stage": None,      # 1–6 or None if unknown
+    # Which tool calls have been verified this session
+    "verified_checks": [],        # e.g. ["analyze_mesh_for_unreal", "analyze_rig_weights"]
+    # Issues the user acknowledged or that remain open
+    "open_issues": [],            # e.g. ["shoulder_deformation", "uv_margin_tight"]
+    # Object name being worked on
+    "active_object": None,        # e.g. "SK_Mannequin"
+    # User corrections / overrides this session
+    "user_corrections": [],       # e.g. ["user said this is a weapon, not prop"]
+    # Playbook conflicts Claude noticed and surfaced to user
+    "surfaced_conflicts": [],     # e.g. ["vert_budget: 3x weapon limit but user said weapon"]
+    # Apprentice mode — when True, every action gets a _why teaching note
+    "apprentice_mode": False,
+    # TD mode — when True, plan_production_path prepends a 5-step plan to every run
+    "td_mode": False,
+}
+
+
+def _session_get(key: str, default=None):
+    """Read a value from the session context."""
+    return _SESSION.get(key, default)
+
+
+def _session_set(**kwargs):
+    """Write one or more values into the session context."""
+    global _SESSION
+    for k, v in kwargs.items():
+        if k in _SESSION:
+            _SESSION[k] = v
+        else:
+            logger.warning(f"_session_set: unknown key '{k}' ignored")
+
+
+def _session_append(key: str, value):
+    """Append a value to a session list field."""
+    global _SESSION
+    lst = _SESSION.get(key)
+    if isinstance(lst, list) and value not in lst:
+        lst.append(value)
+
+
 def get_blender_connection() -> BlenderConnection:
     global _blender_connection
     if _blender_connection is not None and _blender_connection.sock is not None:
@@ -1700,6 +1753,120 @@ Don't re-run tools unless scene changed or user requests. Cite earlier findings.
 Stage shift mid-session → state it: "Shifting to Stage 5 standards from here."
 """,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION TOOLS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def session_update(
+    asset_type: str = "",
+    active_playbook: str = "",
+    confirmed_stage: int = 0,
+    active_object: str = "",
+    add_verified_check: str = "",
+    add_open_issue: str = "",
+    add_user_correction: str = "",
+    apprentice_mode: bool = None,
+    td_mode: bool = None,
+) -> str:
+    """
+    SESSION CONTEXT — Update what Claude knows about the current work session.
+
+    Call this whenever the user confirms or corrects something important:
+    the asset type, active playbook, pipeline stage, or when a tool run is
+    verified and complete.
+
+    This persists for the lifetime of the MCP session so subsequent tool calls
+    can reference confirmed facts without re-inferring from scratch.
+
+    Parameters (all optional — only pass what changed):
+      asset_type         : confirmed asset type — "hero_character" | "weapon" |
+                           "environment_prop" | "creature" | "vehicle" | "npc" |
+                           "background_character" | "crowd_character" | etc.
+      active_playbook    : set the active playbook — "hero_char" | "weapon" |
+                           "env_prop" | "creature" | "vehicle"
+      confirmed_stage    : 1–6 — pipeline stage confirmed by user or strong evidence
+      active_object      : Blender object name currently being worked on
+      add_verified_check : tool name to mark as completed this session
+                           e.g. "analyze_rig_weights"
+      add_open_issue     : issue to track e.g. "shoulder_deformation"
+      add_user_correction: record a user override e.g. "user said weapon not prop"
+      apprentice_mode    : True/False — enable/disable teaching annotations
+      td_mode            : True/False — enable/disable TD planning mode
+    """
+    if asset_type:
+        _session_set(asset_type=asset_type)
+    if active_playbook:
+        _session_set(active_playbook=active_playbook)
+    if confirmed_stage and 1 <= confirmed_stage <= 6:
+        _session_set(confirmed_stage=confirmed_stage)
+    if active_object:
+        _session_set(active_object=active_object)
+    if add_verified_check:
+        _session_append("verified_checks", add_verified_check)
+    if add_open_issue:
+        _session_append("open_issues", add_open_issue)
+    if add_user_correction:
+        _session_append("user_corrections", add_user_correction)
+    if apprentice_mode is not None:
+        _session_set(apprentice_mode=apprentice_mode)
+    if td_mode is not None:
+        _session_set(td_mode=td_mode)
+
+    return json.dumps({"session_updated": True, "current_session": _SESSION}, indent=2)
+
+
+@mcp.tool()
+def session_status() -> str:
+    """
+    SESSION STATUS — Read the current session context.
+
+    Returns everything Claude knows about this session: confirmed asset type,
+    active playbook, pipeline stage, which checks have been run, open issues,
+    and any user corrections or overrides recorded this session.
+
+    Call this at the start of a new conversation turn to orient yourself
+    before reaching for Blender tools. If session is empty, fall back to
+    the normal session-start sequence (screenshot → scene_info → object_info).
+    """
+    has_context = any([
+        _SESSION.get("asset_type"),
+        _SESSION.get("active_playbook"),
+        _SESSION.get("confirmed_stage"),
+        _SESSION.get("active_object"),
+        _SESSION.get("verified_checks"),
+    ])
+
+    orientation = ""
+    if has_context:
+        parts = []
+        if _SESSION.get("active_object"):
+            parts.append(f"Working on: {_SESSION['active_object']}")
+        if _SESSION.get("asset_type"):
+            parts.append(f"Asset type: {_SESSION['asset_type']}")
+        if _SESSION.get("active_playbook"):
+            parts.append(f"Playbook: {_SESSION['active_playbook']}")
+        if _SESSION.get("confirmed_stage"):
+            stage_names = {1:"Sculpt", 2:"Retopo", 3:"Bake-Ready", 4:"Texture", 5:"Rig", 6:"Export"}
+            sn = stage_names.get(_SESSION["confirmed_stage"], "Unknown")
+            parts.append(f"Stage: {_SESSION['confirmed_stage']} ({sn})")
+        if _SESSION.get("verified_checks"):
+            parts.append(f"Checks run: {', '.join(_SESSION['verified_checks'])}")
+        if _SESSION.get("open_issues"):
+            parts.append(f"Open issues: {', '.join(_SESSION['open_issues'])}")
+        if _SESSION.get("user_corrections"):
+            parts.append(f"User overrides: {', '.join(_SESSION['user_corrections'])}")
+        orientation = " | ".join(parts)
+    else:
+        orientation = "No session context yet. Run screenshot → get_scene_info → get_object_info to orient."
+
+    return json.dumps({
+        "has_context": has_context,
+        "orientation_summary": orientation,
+        "session": _SESSION,
+    }, indent=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
