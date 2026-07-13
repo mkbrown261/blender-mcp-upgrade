@@ -1782,7 +1782,7 @@ _REPAIR_ORDER = [
 mcp = FastMCP(
     "BlenderMCP",
     instructions="""
-BLENDER MCP — SENIOR TECHNICAL DIRECTOR v2.5
+BLENDER MCP — SENIOR TECHNICAL DIRECTOR v3.0
 You are a pipeline-aware AAA Technical Director embedded in Blender via live MCP
 tools. Priorities: pipeline correctness → visual quality → performance → handoff
 readiness. You never PASS without running the tool. You never skip the screenshot.
@@ -1797,6 +1797,9 @@ readiness. You never PASS without running the tool. You never skip the screensho
 Ambiguous stage → assume the MORE DEMANDING one.
 
 ── SESSION START — ALWAYS execute this sequence first, no exceptions ───────────
+0. session_status()            ← check if session context exists from a prior turn
+   If session has_context=True: orient from session, skip to screenshot only.
+   If session empty: run full sequence below.
 1. get_viewport_screenshot()   ← look before anything else
 2. get_scene_info()            ← object count, types
 3. get_object_info(active)     ← verts/faces at mesh.vertices/polygons, materials list
@@ -1806,8 +1809,22 @@ Then deliver ONE orientation sentence:
 STOP. Wait for user. Do not auto-run further tools.
 
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
+TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
+  session_status               read session context before starting any work
+  set_playbook                 activate named workflow: hero_char|weapon|env_prop|creature|vehicle
+  list_playbooks               show all available playbooks with their standards
+  production_review            ONE command — full scored report (0-100), strengths, conflicts,
+                               time estimate. The "show me everything" command.
+  plan_production_path         AI TD — 5-step production plan with tools, gates, success criteria.
+                               ALWAYS present plan and wait for approval before executing.
+  critique_mesh                senior TA topology review — WHY it matters, compounding issues,
+                               deformation risk, what I would do
+  animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
+                               animation principles. Apprentice lessons if apprentice_mode=True.
+  session_update               record confirmed facts: asset_type, stage, verified checks, issues
+
 TIER 1 (prefer — most coverage per call):
-  what_next                    ONE priority action: what to do right now and why
+  what_next                    ONE priority action + playbook context if active
   analyze_mesh_for_unreal      full mesh + topology + UE5 readiness in one call
   analyze_animation_quality    full animation health check
   critique_animation           animation critique with stage context
@@ -1821,13 +1838,7 @@ TIER 2 (targeted):
   analyze_rig_weights          weight QA: unweighted verts, >8 influences, zero-weight
   analyze_rig_skeleton         skeleton QA: root at origin, orphan bones, naming
   validate_bake_setup          bake pre-flight: 10 checks before touching Blender bake
-
-VERBOSE MODE: Most tools default to verbose=False (failing/warning findings only).
-  Pass verbose=True when you need the full picture including passing checks.
-  Tools with verbose param: analyze_mesh_for_unreal, validate_bake_setup,
-  detect_mesh_problems, run_asset_qa, run_unreal_readiness_check,
-  analyze_rig_weights, analyze_rig_skeleton.
-TIER 3 (raw — only when Tier 1-2 don't cover it):
+TIER 3 (raw — only when Tier 0-2 don't cover it):
   detect_mesh_problems         raw problem list
   get_object_info              raw object data
   get_scene_info               raw scene data
@@ -1835,33 +1846,62 @@ TIER 4 (repair — always gate-controlled):
   auto_repair_mesh             DESTRUCTIVE — requires explicit user approval
   run_asset_qa                 call after auto_repair_mesh to verify repair
 
+VERBOSE MODE: Most tools default to verbose=False (failing/warning findings only).
+  Pass verbose=True when you need the full picture including passing checks.
+  Tools with verbose param: analyze_mesh_for_unreal, validate_bake_setup,
+  detect_mesh_problems, run_asset_qa, run_unreal_readiness_check,
+  analyze_rig_weights, analyze_rig_skeleton, critique_mesh.
+
 SCENE-LEVEL ORDER (never skip):
   screenshot → get_scene_summary() → classify_pipeline_stage(name) → audit_all_objects()
 audit_all_objects auto-mode: 1 mesh = HERO, 2–20 = COLLECTION, 20+ = ENVIRONMENT.
 
-BUDGET ASSUMPTION RULE:
-  analyze_mesh_for_unreal and what_next both state their assumed asset context.
-  Always read the assumed_context and correct_me fields in their output.
-  If the assumption is wrong, tell the user immediately and re-run with context=
-  parameter set to the correct asset description before giving any verdict.
+── CONFLICT SURFACING — CRITICAL BEHAVIOR ──────────────────────────────────────
+When data conflicts with what the user stated (asset type, budget, stage):
+  DO: State the conflict clearly + ask for confirmation.
+  NEVER: Silently resolve the conflict or ignore it.
+  FORMAT: "UV is clean. Topology is clean. But the vert count is 3× the weapon
+           budget you stated. Is this intentional (cinematic tier) or should I
+           re-evaluate against a different playbook?"
+production_review and what_next both surface conflicts automatically when a
+playbook is active. Read the conflicts[] field and surface them verbatim.
 
-TRIGGER MAP:
-  "what do I do next" / "where do I start" / "what should I do"
-                                  → what_next(object_name) immediately
+── PLAYBOOK WORKFLOW ──────────────────────────────────────────────────────────
+When user says "this is a [weapon/hero/prop/creature/vehicle]":
+  1. set_playbook(playbook='weapon') immediately
+  2. session_update(asset_type='weapon')
+  3. Re-run what_next or production_review — playbook now applies correct standards
+When playbook is active, what_next includes:
+  - playbook.vert_budget and conflict if exceeded
+  - playbook.stage_standard for the current stage
+  - playbook.gotchas — the failure modes that burn people
+
+── APPRENTICE MODE ────────────────────────────────────────────────────────────
+When user says "explain as you go" / "teach me" / "I'm learning":
+  → session_update(apprentice_mode=True) immediately
+  → animation_coach includes animation principles lessons
+  → plan_production_path includes step notes explaining each decision
+  → critique_mesh includes why_it_matters for every finding
+  → State principles, not just fixes: "This is an Arcs violation — natural
+    motion curves, straight trajectories read as mechanical."
+When user says "stop explaining" / "expert mode" / "just do it":
+  → session_update(apprentice_mode=False)
+
+── TRIGGER MAP ────────────────────────────────────────────────────────────────
+  "what do I do next" / "where do I start" → what_next(object_name) immediately
   "look/show/what do you see"     → get_viewport_screenshot() immediately
   "ready for Unreal/export/UE5"   → analyze_mesh_for_unreal()
-  "topology/loops/quads"          → screenshot + analyze_topology()
-  "what's wrong/audit/check"      → analyze_mesh_for_unreal() (covers all systems)
-  "fix/clean/repair"              → describe plan explicitly → WAIT for "yes/do it"
-                                    → auto_repair_mesh() → screenshot + run_asset_qa()
-  "poly/vert count"               → get_object_info() + stage context
-  "what stage"                    → classify_pipeline_stage() + screenshot
+  "review/audit/full report"      → production_review(object_name, asset_type=...)
+  "make a plan/plan it out"       → plan_production_path(object_name) — WAIT FOR APPROVAL
+  "topology/loops/quads/critique" → critique_mesh(object_name)
+  "what's wrong/check"            → analyze_mesh_for_unreal() (covers all systems)
+  "fix/clean/repair"              → describe plan → WAIT "yes/do it" → auto_repair_mesh()
   "rig/weights/skinning/bones"    → analyze_rig_weights() then analyze_rig_skeleton()
   "bake/baking/normal map/AO"    → validate_bake_setup(low_poly, high_poly) FIRST
-                                    NEVER call bake without validate_bake_setup PASS/WARN
+  "animation/coach/teach me anim" → animation_coach(name, focus=...)
+  "this is a weapon/hero/prop"    → set_playbook() + session_update(asset_type=...) first
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
-  reference image + "match/build" → describe image → screenshot → get_scene_summary()
-                                    → gap report (Present/Missing/Extra/Different)
+  reference image + "match/build" → describe image → screenshot → gap report
 
 Screenshot required: session start, after any repair, before/after auto_repair_mesh,
 when reporting any PASS/FAIL verdict.
@@ -1873,8 +1913,8 @@ GATE 2 STAGE TRANSITION      → full QA for current stage + "Ready to move to X
 GATE 3 EXPORT                → run_unreal_readiness_check() zero errors + run_asset_qa() PASS
 GATE 4 IRREVERSIBLE OPS      → state exactly what happens + wait for explicit confirm
 GATE 5 BAKE                  → validate_bake_setup() MUST run first, every time
-                               → NEVER initiate a bake if verdict is FAIL
-                               → WARN verdict: state warnings explicitly, get confirmation
+GATE 6 TD PLAN               → plan_production_path() → PRESENT PLAN → WAIT for approval
+                               → NEVER execute plan steps without explicit "yes/go ahead"
 
 NEVER:
   ✗ auto_repair_mesh() without explicit user approval
@@ -1883,6 +1923,8 @@ NEVER:
   ✗ Export with known critical issues
   ✗ Repair the wrong object
   ✗ Delete user data
+  ✗ Resolve a playbook conflict silently — surface it, ask for confirmation
+  ✗ Execute a TD plan without presenting it first
 
 ── REPORT FORMAT ──────────────────────────────────────────────────────────────
 ── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
@@ -1902,9 +1944,10 @@ AI/SCAN ASSETS: Very high poly + irregular topology → state:
   "AI/scanned asset detected. Pipeline: validate→cleanup→retopo→bake→texture→rig→export.
    Do not export in current state."
 
-SESSION MEMORY: Track stage, open issues, tools run, repairs completed.
-Don't re-run tools unless scene changed or user requests. Cite earlier findings.
-Stage shift mid-session → state it: "Shifting to Stage 5 standards from here."
+SESSION MEMORY: Always call session_status() at start of each turn if context may exist.
+  After confirming asset type or stage → session_update() immediately.
+  Don't re-run tools unless scene changed or user requests. Cite earlier findings.
+  Stage shift mid-session → state it: "Shifting to Stage 5 standards from here."
 """,
 )
 
@@ -3090,6 +3133,221 @@ def critique_animation(name: str, frame_start: Optional[int] = None, frame_end: 
 
     except Exception as e:
         logger.error(f"Error in critique_animation: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def animation_coach(
+    name: str,
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    focus: str = "all",
+) -> str:
+    """
+    AI ANIMATION COACH — Frame-specific motion quality feedback.
+
+    Builds on critique_animation by adding production-principles coaching:
+    contact timing, weight transfer arcs, anticipation, follow-through,
+    and pose-to-pose readability. Each finding includes the production
+    principle being violated, the typical frame range where it shows, and
+    a correction method.
+
+    Different from critique_animation: that tool tells you what's wrong with
+    the data. This tool tells you *why it looks wrong* to an animator's eye,
+    and what principle to apply to fix it.
+
+    In Apprentice Mode (session_update(apprentice_mode=True)), every finding
+    also includes an animation principles lesson so newer artists understand
+    the 'why' behind each correction.
+
+    Parameters:
+      name        : armature or mesh object with animation
+      frame_start : first frame to evaluate (defaults to action start)
+      frame_end   : last frame to evaluate (defaults to action end)
+      focus       : "all" (default) | "timing" | "arcs" | "weight" |
+                    "contact" | "follow_through"
+
+    Returns:
+      coaching_verdict   : overall assessment with animation-principles framing
+      frame_findings     : findings with frame references and principle citations
+      timing_notes       : contact timing and rhythmic issues
+      arc_notes          : arc quality and trajectory smoothness
+      weight_notes       : weight transfer, anticipation, follow-through
+      apprentice_lessons : present if apprentice_mode is True
+    """
+    try:
+        # ── Get base animation data ───────────────────────────────────────────
+        raw = _send_raw("analyze_animation_quality", name=name,
+                        frame_start=frame_start, frame_end=frame_end)
+        if "error" in raw:
+            return json.dumps(raw, indent=2)
+
+        enriched  = _reason_animation(raw)
+        reasoning = enriched.get("_reasoning", {})
+        findings  = reasoning.get("findings", [])
+
+        anim_start  = frame_start or raw.get("frame_start", 0)
+        anim_end    = frame_end   or raw.get("frame_end",   0)
+        frame_range = (anim_end - anim_start) + 1 if anim_end > anim_start else 0
+        fps         = raw.get("fps", 24)
+
+        # ── Animation principles catalog ──────────────────────────────────────
+        # Keyed by issue category → coaching note
+        PRINCIPLES = {
+            "timing": {
+                "principle":    "Timing & Spacing",
+                "definition":   "The number of frames between key poses determines the feeling of speed and weight. More frames = slower, heavier. Fewer frames = faster, lighter.",
+                "common_error": "Even spacing between keys produces mechanical, robotic motion. Vary spacing to show acceleration and deceleration.",
+                "correction":   "Use the Graph Editor to add ease-in and ease-out. Slow into holds, fast through impacts.",
+            },
+            "arcs": {
+                "principle":    "Arcs",
+                "definition":   "All natural motion follows curved paths. Linear trajectories look mechanical because nothing in nature moves in straight lines.",
+                "common_error": "Straight-line translation of a limb end-point even when the intermediate pose travels in an arc.",
+                "correction":   "In the viewport, enable Onion Skins (Animation > Onion Skin). Check that trajectory curves, especially for hands and head.",
+            },
+            "weight": {
+                "principle":    "Weight & Follow-Through",
+                "definition":   "Heavy objects take longer to start and stop. Secondary elements (hair, clothing, tail) lag behind primary motion.",
+                "common_error": "Body and appendages stop at the same frame. No follow-through after primary motion stops.",
+                "correction":   "After the primary pose holds, secondary elements should continue for 3–8 more frames, then settle.",
+            },
+            "contact": {
+                "principle":    "Contact & Overlap",
+                "definition":   "At contact moments (foot strike, hand grab), the contacted surface must visibly react. The body absorbs shock through squash.",
+                "common_error": "Foot plants but hips continue downward with no weight shift. The body doesn't 'feel' the contact.",
+                "correction":   "At foot contact frame: hip should start a slight down-and-forward lean. Knee should not lock immediately — allow 2–3 frames of compress before settling.",
+            },
+            "anticipation": {
+                "principle":    "Anticipation",
+                "definition":   "Before any large action, the character moves briefly in the opposite direction. This prepares the audience and adds energy to the main action.",
+                "common_error": "Jump or large movement starts from neutral without any wind-up. Feels robotic and weightless.",
+                "correction":   "Add a pre-movement in the opposite direction: 3–6 frames for small actions, 8–12 for large ones. The bigger the action, the bigger the anticipation.",
+            },
+            "follow_through": {
+                "principle":    "Follow-Through & Overlapping Action",
+                "definition":   "No part of a character stops moving all at once. After the main action, secondary elements continue, overlap, and settle.",
+                "common_error": "Everything stops at the same frame. Feels frozen rather than settled.",
+                "correction":   "Stagger stops: spine settles first, then limbs, then extremities, then cloth/hair. Each should overlap the previous by 2–4 frames.",
+            },
+        }
+
+        # ── Frame-specific findings ───────────────────────────────────────────
+        frame_findings = []
+        timing_notes   = []
+        arc_notes      = []
+        weight_notes   = []
+
+        for f in findings:
+            cat         = f.get("category", "general")
+            issue       = f.get("issue", "")
+            sev         = f.get("severity", "info")
+            frame_ref   = f.get("frame") or f.get("frames") or "N/A"
+            fix         = f.get("professional_fix", "") or f.get("correction", "") or f.get("fix", "")
+
+            # Map category to principle
+            principle_key = None
+            if "timing" in cat.lower() or "speed" in issue.lower():
+                principle_key = "timing"
+                timing_notes.append(issue)
+            elif "arc" in cat.lower() or "trajectory" in issue.lower():
+                principle_key = "arcs"
+                arc_notes.append(issue)
+            elif "weight" in cat.lower() or "follow" in issue.lower():
+                principle_key = "weight"
+                weight_notes.append(issue)
+            elif "contact" in cat.lower() or "foot" in issue.lower() or "plant" in issue.lower():
+                principle_key = "contact"
+                weight_notes.append(issue)
+            elif "anticipat" in cat.lower():
+                principle_key = "anticipation"
+                weight_notes.append(issue)
+
+            entry = {
+                "severity":  sev,
+                "issue":     issue,
+                "frame_ref": frame_ref,
+                "principle": PRINCIPLES[principle_key]["principle"] if principle_key else "General quality",
+                "correction": fix or (PRINCIPLES[principle_key]["correction"] if principle_key else "Review manually."),
+            }
+
+            # Focus filter
+            if focus != "all":
+                if focus == "timing"        and principle_key != "timing":       continue
+                if focus == "arcs"          and principle_key != "arcs":         continue
+                if focus == "weight"        and principle_key not in ("weight", "contact", "follow_through"): continue
+                if focus == "contact"       and principle_key != "contact":      continue
+                if focus == "follow_through" and principle_key != "follow_through": continue
+
+            frame_findings.append(entry)
+
+        # ── Overall coaching verdict ──────────────────────────────────────────
+        score   = reasoning.get("score", 0)
+        grade   = reasoning.get("grade", "?")
+        criticals = [f for f in findings if f.get("severity") == "critical"]
+        warnings  = [f for f in findings if f.get("severity") == "warning"]
+
+        if not criticals and not warnings:
+            coaching_verdict = (
+                f"Grade {grade} ({score}/100). This animation is production-ready. "
+                f"The fundamentals are solid — timing reads correctly, no mechanical artifacts detected. "
+                f"Polish pass: look for any secondary motion that could add life."
+            )
+        elif criticals:
+            coaching_verdict = (
+                f"Grade {grade} ({score}/100). {len(criticals)} critical issue(s) will read as wrong to any viewer. "
+                f"These aren't subtle polish items — they're animation principles violations that break believability. "
+                f"Address criticals first before any polish work."
+            )
+        else:
+            coaching_verdict = (
+                f"Grade {grade} ({score}/100). Structurally sound with {len(warnings)} warning(s). "
+                f"The character reads correctly but experienced animators will notice the issues listed. "
+                f"These are worth fixing before delivery."
+            )
+
+        # ── Apprentice lessons (session-gated) ────────────────────────────────
+        apprentice_mode   = _session_get("apprentice_mode") or False
+        apprentice_lessons = []
+        if apprentice_mode:
+            principles_used = set()
+            for f in frame_findings:
+                principle_name = f.get("principle", "")
+                for k, v in PRINCIPLES.items():
+                    if v["principle"] == principle_name and k not in principles_used:
+                        apprentice_lessons.append({
+                            "principle":    v["principle"],
+                            "definition":   v["definition"],
+                            "common_error": v["common_error"],
+                            "correction":   v["correction"],
+                        })
+                        principles_used.add(k)
+
+        # ── Build report ──────────────────────────────────────────────────────
+        report = {
+            "object":           name,
+            "frame_range":      {"start": anim_start, "end": anim_end, "total_frames": frame_range},
+            "fps":              fps,
+            "coaching_verdict": coaching_verdict,
+            "grade":            grade,
+            "score":            score,
+            "frame_findings":   frame_findings,
+        }
+        if timing_notes:
+            report["timing_notes"] = timing_notes
+        if arc_notes:
+            report["arc_notes"] = arc_notes
+        if weight_notes:
+            report["weight_notes"] = weight_notes
+        if apprentice_lessons:
+            report["apprentice_lessons"] = apprentice_lessons
+            report["apprentice_mode"] = True
+
+        _session_append("verified_checks", "animation_coach")
+        return json.dumps(report, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in animation_coach: {e}")
         return json.dumps({"error": str(e)})
 
 
