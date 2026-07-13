@@ -1614,6 +1614,12 @@ TIER 2 (targeted):
   analyze_rig_weights          weight QA: unweighted verts, >8 influences, zero-weight
   analyze_rig_skeleton         skeleton QA: root at origin, orphan bones, naming
   validate_bake_setup          bake pre-flight: 10 checks before touching Blender bake
+
+VERBOSE MODE: Most tools default to verbose=False (failing/warning findings only).
+  Pass verbose=True when you need the full picture including passing checks.
+  Tools with verbose param: analyze_mesh_for_unreal, validate_bake_setup,
+  detect_mesh_problems, run_asset_qa, run_unreal_readiness_check,
+  analyze_rig_weights, analyze_rig_skeleton.
 TIER 3 (raw — only when Tier 1-2 don't cover it):
   detect_mesh_problems         raw problem list
   get_object_info              raw object data
@@ -2079,18 +2085,33 @@ def analyze_topology(name: str, context: str = "generic") -> str:
 
 
 @mcp.tool()
-def detect_mesh_problems(name: str) -> str:
+def detect_mesh_problems(name: str, verbose: bool = False) -> str:
     """
     Detect common mesh problems (non-manifold geometry, loose vertices,
     zero-area faces, duplicate faces, inverted normals) on a named object.
 
     v2.2: Each problem explained with production impact, professional fix,
     and whether it can be auto-repaired by auto_repair_mesh.
+    verbose: False (default) — returns only problems found (count > 0).
+             True — returns full reasoning block including clean checks.
     """
     raw = _send_raw("detect_mesh_problems", name=name)
     if "error" in raw:
         return json.dumps(raw, indent=2)
     enriched = _reason_mesh_problems(raw)
+    if not verbose:
+        reasoning = enriched.get("_reasoning", {})
+        # Keep only findings that have actual problems
+        slim = {
+            "object":          name,
+            "overall_severity": reasoning.get("overall_severity", "pass"),
+            "problem_count":   reasoning.get("problem_count", 0),
+            "findings":        [f for f in reasoning.get("findings", []) if f.get("count", 1) > 0],
+            "auto_repairable": reasoning.get("auto_repairable", []),
+            "needs_artist_review": reasoning.get("needs_artist_review", []),
+            "_tip": "Pass verbose=True for full reasoning block.",
+        }
+        return json.dumps(slim, indent=2, default=str)
     return json.dumps(enriched, indent=2, default=str)
 
 
@@ -2159,34 +2180,60 @@ def create_pbr_material(
 
 
 @mcp.tool()
-def run_asset_qa(name: str, check_uvs: bool = True, check_materials: bool = True, check_modifiers: bool = True) -> str:
+def run_asset_qa(name: str, check_uvs: bool = True, check_materials: bool = True, check_modifiers: bool = True, verbose: bool = False) -> str:
     """
     Run a production QA pass on a named object: UVs, materials, modifiers,
     weight paint, duplicate faces, and other readiness checks.
 
     v2.2: Response enriched with blocking vs advisory categorisation
     and professional fix guidance from the reasoning engine.
+    verbose: False (default) — verdict + blocking issues only.
+             True — full reasoning block.
     """
     raw = _send_raw("run_asset_qa", name=name, check_uvs=check_uvs, check_materials=check_materials, check_modifiers=check_modifiers)
     if "error" in raw:
         return json.dumps(raw, indent=2)
     enriched = _reason_asset_qa(raw)
+    if not verbose:
+        reasoning = enriched.get("_reasoning", {})
+        slim = {
+            "object":   name,
+            "verdict":  enriched.get("verdict", reasoning.get("verdict", "unknown")),
+            "blocking": reasoning.get("blocking", []),
+            "advisory": reasoning.get("advisory", []),
+            "_tip":     "Pass verbose=True for full reasoning block.",
+        }
+        return json.dumps(slim, indent=2, default=str)
     return json.dumps(enriched, indent=2, default=str)
 
 
 @mcp.tool()
-def run_unreal_readiness_check(name: str, expected_unit_scale: float = 0.01) -> str:
+def run_unreal_readiness_check(name: str, expected_unit_scale: float = 0.01, verbose: bool = False) -> str:
     """
     Check whether a named object is ready for Unreal Engine 5 import.
     Validates scale, pivot, naming, UVs, lightmap UV, collision, and normal map direction.
 
     v2.2: Each failed check explained with UE5 pipeline context, severity,
     and specific fix instructions from the reasoning engine.
+    verbose: False (default) — blocking errors + warnings only.
+             True — full reasoning block including all passing checks.
     """
     raw = _send_raw("run_unreal_readiness_check", name=name, expected_unit_scale=expected_unit_scale)
     if "error" in raw:
         return json.dumps(raw, indent=2)
     enriched = _reason_unreal_readiness(raw)
+    if not verbose:
+        reasoning = enriched.get("_reasoning", {})
+        slim = {
+            "object":         name,
+            "overall":        reasoning.get("overall", "unknown"),
+            "blocking_errors": enriched.get("blocking_errors", 0),
+            "warnings":       enriched.get("warnings", 0),
+            "findings":       [f for f in reasoning.get("findings", [])
+                               if f.get("severity") in ("critical", "warning")],
+            "_tip":           "Pass verbose=True for full reasoning block.",
+        }
+        return json.dumps(slim, indent=2, default=str)
     return json.dumps(enriched, indent=2, default=str)
 
 
@@ -2270,7 +2317,7 @@ def get_session_log() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def analyze_mesh_for_unreal(name: str, topology_context: str = "generic") -> str:
+def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbose: bool = False) -> str:
     """
     COMPOUND TOOL — Full pre-export analysis in one call.
 
@@ -2281,6 +2328,9 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic") -> str
     Use this as the first step before any UE5 export workflow.
 
     topology_context: 'generic' | 'character_body' | 'face' | 'hand' | 'hard_surface'
+    verbose: False (default) — returns verdict + failing/warning findings only.
+             True — returns full analysis including all passing checks and raw
+             reasoning blocks. Use when you need the complete picture.
     """
     try:
         # Run all four analyses
@@ -2356,34 +2406,44 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic") -> str
             assumed_tier = "game asset (unknown tier)"
             budget_note  = f"{vert_count:,} verts. I don't have enough context to assign a budget tier. Tell me what this asset is and who it's for — hero character, NPC, prop, environment piece — and I'll give you a verdict calibrated to that standard."
 
+        # ── Build report — slim by default, full when verbose=True ───────────
         report = {
-            "object": name,
+            "object":          name,
             "assumed_context": assumed_tier,
-            "assumed_context_note": budget_note,
             "correct_me": (
                 f"I'm evaluating this as: {assumed_tier}. "
                 "If the asset type or target is different, say so and I'll re-evaluate."
             ),
-            "verdict": verdict,
+            "verdict":         verdict,
             "overall_severity": overall,
             "summary": (
                 f"{verdict} — {len(critical)} blocking error(s), "
                 f"{len(warnings)} warning(s), {len(info)} info item(s). "
                 f"{len(auto_fixable_all)} issue(s) can be auto-repaired via auto_repair_mesh."
             ),
-            "action_required": len(critical) > 0 or len(warnings) > 0,
-            "auto_repair_available": len(auto_fixable_all) > 0,
+            "action_required":        len(critical) > 0 or len(warnings) > 0,
+            "auto_repair_available":  len(auto_fixable_all) > 0,
             "auto_repairable_issues": auto_fixable_all,
             "critical_errors": critical,
-            "warnings": warnings,
-            "info": info,
-            "full_analysis": {
+            "warnings":        warnings,
+        }
+
+        if verbose:
+            # Full output — all findings + raw reasoning blocks
+            report["assumed_context_note"] = budget_note
+            report["info"]                 = info
+            report["full_analysis"] = {
                 "mesh_problems":    r_problems.get("_reasoning", {}),
                 "mesh_quality":     r_quality.get("_reasoning", {}),
                 "topology":         r_topology.get("_reasoning", {}),
                 "unreal_readiness": r_ue5.get("_reasoning", {}),
-            },
-        }
+            }
+        else:
+            # Slim output — omit info findings, raw reasoning blocks, budget prose
+            # Re-add budget note only when something is wrong (user needs context)
+            if critical or warnings:
+                report["assumed_context_note"] = budget_note
+            report["_tip"] = "Pass verbose=True for full analysis including info findings and raw reasoning."
 
         return json.dumps(report, indent=2, default=str)
 
@@ -2964,7 +3024,7 @@ def what_next(object_name: str, context: str = "") -> str:
 
 
 @mcp.tool()
-def analyze_rig_weights(object_name: str) -> str:
+def analyze_rig_weights(object_name: str, verbose: bool = False) -> str:
     """
     RIG WEIGHT QA — checks vertex group weights for catastrophic skinning failures.
 
@@ -3160,6 +3220,16 @@ else:
         if "error" in result:
             return json.dumps(result)
 
+        # Slim mode: strip PASS checks — only keep CRITICAL/WARNING findings
+        if not verbose:
+            all_checks = result.get("checks", [])
+            result["checks"] = [
+                c for c in all_checks
+                if c.get("severity") != "PASS"
+            ]
+            result["passed_count"] = len(all_checks) - len(result["checks"])
+            result["_tip"] = "Pass verbose=True to see passing checks too."
+
         return json.dumps(result, indent=2, default=str)
 
     except Exception as e:
@@ -3168,7 +3238,7 @@ else:
 
 
 @mcp.tool()
-def analyze_rig_skeleton(object_name: str) -> str:
+def analyze_rig_skeleton(object_name: str, verbose: bool = False) -> str:
     """
     RIG SKELETON QA — inspects the armature linked to a mesh object.
 
@@ -3426,6 +3496,16 @@ else:
         if "error" in result:
             return json.dumps(result)
 
+        # Slim mode: strip PASS checks — only keep CRITICAL/WARNING/INFO findings
+        if not verbose:
+            all_checks = result.get("checks", [])
+            result["checks"] = [
+                c for c in all_checks
+                if c.get("severity") not in ("PASS",)
+            ]
+            result["passed_count"] = len(all_checks) - len(result["checks"])
+            result["_tip"] = "Pass verbose=True to see passing checks too."
+
         return json.dumps(result, indent=2, default=str)
 
     except Exception as e:
@@ -3434,7 +3514,7 @@ else:
 
 
 @mcp.tool()
-def validate_bake_setup(low_poly_name: str, high_poly_name: str) -> str:
+def validate_bake_setup(low_poly_name: str, high_poly_name: str, verbose: bool = False) -> str:
     """
     BAKE PRE-FLIGHT — validates that a bake setup is correct before touching anything.
 
@@ -3460,11 +3540,13 @@ def validate_bake_setup(low_poly_name: str, high_poly_name: str) -> str:
     Parameters:
       low_poly_name  : name of the low-poly mesh object (bake target)
       high_poly_name : name of the high-poly mesh object (bake source)
+      verbose        : False (default) — returns failing/warning checks only.
+                       True — returns all 10 checks including PASSes.
 
     Returns:
       safe_to_bake   : bool — True only if zero CRITICAL failures
       verdict        : PASS | WARN | FAIL
-      checks         : full list with severity, status, why, why_now, consequence
+      checks         : failing/warning checks (verbose=False) or all checks (verbose=True)
       ready_when_fixed : ordered list of actions needed before baking
     """
     try:
@@ -3474,6 +3556,7 @@ import json
 
 low_poly_name  = '{LOW_POLY}'
 high_poly_name = '{HIGH_POLY}'
+verbose        = {VERBOSE}
 
 checks   = []
 fix_list = []
@@ -3507,17 +3590,28 @@ def emit(extra=None):
         verdict  = "PASS"
         summary  = (f"All pre-flight checks passed. Setup looks correct. "
                     f"Safe to bake '{high_poly_name}' -> '{low_poly_name}'.")
+
+    # Slim mode: only emit checks that need attention (FAIL or WARN)
+    # Verbose mode: emit all checks including PASSes
+    if verbose:
+        emitted_checks = checks
+    else:
+        emitted_checks = [c for c in checks if c["status"] in ("FAIL", "WARN")]
+
     out = {
         "safe_to_bake":     safe,
         "verdict":          verdict,
         "summary":          summary,
         "low_poly":         low_poly_name,
         "high_poly":        high_poly_name,
-        "checks":           checks,
+        "checks":           emitted_checks,
         "ready_when_fixed": fix_list,
         "critical_count":   len(critical_fails),
         "warning_count":    len(warnings),
+        "passed_count":     len(checks) - len(critical_fails) - len(warnings),
     }
+    if not verbose:
+        out["_tip"] = "Pass verbose=True to see all 10 checks including passing ones."
     if extra:
         out.update(extra)
     print(json.dumps(out))
@@ -3848,7 +3942,8 @@ else:
     # ── Emit final result ───────────────────────────────────────────────────
     emit()
 """.replace("{LOW_POLY}", low_poly_name.replace("'", "\\'")) \
-   .replace("{HIGH_POLY}", high_poly_name.replace("'", "\\'"))
+   .replace("{HIGH_POLY}", high_poly_name.replace("'", "\\'")) \
+   .replace("{VERBOSE}", "True" if verbose else "False")
 
         blender = get_blender_connection()
         raw = blender.send_command("execute_code_safe", {"code": script})
