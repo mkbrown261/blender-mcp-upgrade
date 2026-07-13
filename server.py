@@ -2105,8 +2105,12 @@ def detect_mesh_problems(name: str, verbose: bool = False) -> str:
         slim = {
             "object":          name,
             "overall_severity": reasoning.get("overall_severity", "pass"),
-            "problem_count":   reasoning.get("problem_count", 0),
-            "findings":        [f for f in reasoning.get("findings", []) if f.get("count", 1) > 0],
+            # FIX: "problem_count" lives on the raw-spread top level of `enriched`
+            # (from addon.py's detect_mesh_problems response), not inside the
+            # nested "_reasoning" dict — reasoning.get("problem_count") always
+            # silently returned 0 regardless of the real count.
+            "problem_count":   enriched.get("problem_count", 0),
+            "findings":        reasoning.get("findings", []),
             "auto_repairable": reasoning.get("auto_repairable", []),
             "needs_artist_review": reasoning.get("needs_artist_review", []),
             "_tip": "Pass verbose=True for full reasoning block.",
@@ -2196,11 +2200,15 @@ def run_asset_qa(name: str, check_uvs: bool = True, check_materials: bool = True
     enriched = _reason_asset_qa(raw)
     if not verbose:
         reasoning = enriched.get("_reasoning", {})
+        # FIX: _reason_asset_qa's "_reasoning" has no "blocking"/"advisory" keys
+        # at all — only "findings" (a flat list with per-item "severity"). The
+        # old code silently returned [] for both regardless of real findings.
+        findings = reasoning.get("findings", [])
         slim = {
             "object":   name,
-            "verdict":  enriched.get("verdict", reasoning.get("verdict", "unknown")),
-            "blocking": reasoning.get("blocking", []),
-            "advisory": reasoning.get("advisory", []),
+            "verdict":  enriched.get("verdict", reasoning.get("overall_severity", "unknown")),
+            "blocking": [f for f in findings if f.get("severity") == "critical"],
+            "advisory": [f for f in findings if f.get("severity") == "warning"],
             "_tip":     "Pass verbose=True for full reasoning block.",
         }
         return json.dumps(slim, indent=2, default=str)
@@ -2226,7 +2234,9 @@ def run_unreal_readiness_check(name: str, expected_unit_scale: float = 0.01, ver
         reasoning = enriched.get("_reasoning", {})
         slim = {
             "object":         name,
-            "overall":        reasoning.get("overall", "unknown"),
+            # FIX: real key is "overall_severity", not "overall" — always fell
+            # through to the "unknown" default before.
+            "overall":        reasoning.get("overall_severity", "unknown"),
             "blocking_errors": enriched.get("blocking_errors", 0),
             "warnings":       enriched.get("warnings", 0),
             "findings":       [f for f in reasoning.get("findings", [])
