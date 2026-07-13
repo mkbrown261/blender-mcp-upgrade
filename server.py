@@ -4930,6 +4930,351 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION REVIEW MODE — v3.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def production_review(
+    object_name: str,
+    asset_type: str = "",
+    include_rig: bool = False,
+    include_animation: bool = False,
+) -> str:
+    """
+    PRODUCTION REVIEW — One command. Full picture. Senior TA verdict.
+
+    Conducts every relevant QA tool in sequence, aggregates findings, scores
+    the asset 0–100, extracts strengths, lists critical blockers in priority
+    order, and estimates how long to production-ready. Surfaces any conflicts
+    between the stated asset_type and what the data shows — states the
+    conflict and asks for confirmation rather than silently resolving it.
+
+    This is the "show me everything" command. Use it at the start of a review
+    session or any time you need a comprehensive status report.
+
+    Parameters:
+      object_name     : Blender object to review
+      asset_type      : What kind of asset this is — "hero_character" | "weapon" |
+                        "environment_prop" | "creature" | "vehicle" | "npc" |
+                        "background_character" | "crowd_character"
+                        Leave blank and the tool will state its inference.
+      include_rig     : True → also run analyze_rig_weights + analyze_rig_skeleton
+                        (requires Armature modifier on the object)
+      include_animation : True → also run critique_animation
+
+    Returns:
+      production_score  : 0–100. 100 = fully production-ready.
+      score_grade       : A / B / C / D / F
+      assumed_asset_type: what the tool inferred (or used from asset_type param)
+      conflicts         : list of conflicts between stated type and data findings —
+                          each includes the conflict, what the data shows, and a
+                          confirmation question for the user
+      strengths         : list of things this asset does well
+      critical_blockers : ordered list of things that must be fixed before export
+      warnings          : non-blocking issues that should be addressed
+      recommendations   : prioritised action list
+      time_estimate     : plain-English estimate of work remaining
+      session_updated   : True — session context updated with this review's findings
+    """
+    try:
+        # ── Step 1: Gather baseline data ──────────────────────────────────────
+        obj_info   = _send_raw("get_object_info",         name=object_name)
+        mesh_stats = _send_raw("get_mesh_quality_report", name=object_name)
+        if "error" in obj_info:
+            return json.dumps({"error": f"Object not found: {object_name}"})
+
+        # ── Step 2: Infer asset type (session > param > inference) ───────────
+        session_type = _session_get("asset_type")
+        if asset_type:
+            effective_type = asset_type
+        elif session_type:
+            effective_type = session_type
+        else:
+            # Infer from signals
+            mesh_block   = obj_info.get("mesh", {})
+            vert_count   = mesh_block.get("vertices", 0) or 0
+            has_arm_mod  = any(
+                m.get("type") == "ARMATURE"
+                for m in mesh_stats.get("modifiers", [])
+                if isinstance(m, dict)
+            )
+            if has_arm_mod and vert_count > 40_000:
+                effective_type = "hero_character"
+            elif has_arm_mod:
+                effective_type = "character"
+            elif vert_count < 5_000:
+                effective_type = "environment_prop"
+            elif vert_count < 25_000:
+                effective_type = "weapon_or_prop"
+            else:
+                effective_type = "unknown"
+
+        # ── Step 3: Run core analysis tools ──────────────────────────────────
+        raw_problems = _send_raw("detect_mesh_problems",    name=object_name)
+        raw_quality  = _send_raw("get_mesh_quality_report", name=object_name)
+        raw_topology = _send_raw("analyze_topology",        name=object_name)
+        raw_ue5      = _send_raw("run_unreal_readiness_check", name=object_name)
+
+        r_problems = _reason_mesh_problems(raw_problems) if "error" not in raw_problems else raw_problems
+        r_quality  = _reason_mesh_quality(raw_quality)   if "error" not in raw_quality  else raw_quality
+        r_topology = _reason_topology(raw_topology)      if "error" not in raw_topology else raw_topology
+        r_ue5      = _reason_unreal_readiness(raw_ue5)   if "error" not in raw_ue5      else raw_ue5
+
+        # Collect all findings
+        all_findings = []
+        for source, enriched in [
+            ("mesh_problems",    r_problems),
+            ("mesh_quality",     r_quality),
+            ("topology",         r_topology),
+            ("unreal_readiness", r_ue5),
+        ]:
+            for f in enriched.get("_reasoning", {}).get("findings", []):
+                all_findings.append({**f, "source": source})
+
+        # ── Step 4: Optional rig QA ───────────────────────────────────────────
+        rig_findings = []
+        rig_verdict  = None
+        if include_rig:
+            try:
+                rig_w_json = analyze_rig_weights(object_name, verbose=False)
+                rig_s_json = analyze_rig_skeleton(object_name, verbose=False)
+                rig_w = json.loads(rig_w_json)
+                rig_s = json.loads(rig_s_json)
+                rig_verdict = rig_w.get("verdict", "UNKNOWN")
+                # Promote rig criticals into all_findings
+                for chk in rig_w.get("checks", []):
+                    if chk.get("severity") in ("CRITICAL", "WARNING"):
+                        all_findings.append({
+                            "issue":    chk.get("detail", chk.get("check", "")),
+                            "severity": chk.get("severity", "warning").lower(),
+                            "source":   "rig_weights",
+                        })
+                for chk in rig_s.get("checks", []):
+                    if chk.get("severity") in ("CRITICAL", "WARNING"):
+                        all_findings.append({
+                            "issue":    chk.get("detail", chk.get("check", "")),
+                            "severity": chk.get("severity", "warning").lower(),
+                            "source":   "rig_skeleton",
+                        })
+                _session_append("verified_checks", "analyze_rig_weights")
+                _session_append("verified_checks", "analyze_rig_skeleton")
+            except Exception as e:
+                rig_findings.append({"note": f"Rig QA failed: {e}"})
+
+        # ── Step 5: Optional animation critique ───────────────────────────────
+        anim_summary = None
+        if include_animation:
+            try:
+                anim_json = critique_animation(object_name)
+                anim_data = json.loads(anim_json)
+                anim_summary = {
+                    "verdict":  anim_data.get("overall_verdict", "Unknown"),
+                    "blockers": [f for f in anim_data.get("findings", [])
+                                 if f.get("severity") in ("critical", "blocking")],
+                }
+                _session_append("verified_checks", "critique_animation")
+            except Exception as e:
+                anim_summary = {"note": f"Animation critique failed: {e}"}
+
+        # ── Step 6: Conflict detection ────────────────────────────────────────
+        # Compare stated asset_type against what the data shows.
+        # State the conflict clearly — ask for confirmation, don't silently resolve.
+        conflicts = []
+        vert_count = raw_quality.get("counts", {}).get("verts", 0) or 0
+        face_types = raw_quality.get("face_types", {})
+        ngon_count = face_types.get("ngons", 0) or 0
+        has_uvs    = raw_quality.get("uv", {}).get("has_uvs", False)
+        has_arm    = any(
+            m.get("type") == "ARMATURE"
+            for m in raw_quality.get("modifiers", [])
+            if isinstance(m, dict)
+        )
+
+        # Vertex budget conflict
+        BUDGET_LIMITS = {
+            "hero_character":       80_000,
+            "character":            80_000,
+            "npc":                  30_000,
+            "background_character": 15_000,
+            "crowd_character":       8_000,
+            "weapon":               15_000,
+            "weapon_or_prop":       15_000,
+            "environment_prop":     20_000,
+            "vehicle":              60_000,
+            "creature":             60_000,
+        }
+        limit = BUDGET_LIMITS.get(effective_type)
+        if limit and vert_count > limit:
+            ratio = vert_count / limit
+            conflicts.append({
+                "conflict":       "Vertex budget exceeded",
+                "data_shows":     f"{vert_count:,} vertices — {ratio:.1f}× the typical {effective_type} limit ({limit:,})",
+                "stated_type":    effective_type,
+                "confirm_question": (
+                    f"I see {vert_count:,} vertices. That's {ratio:.1f}× the typical {effective_type} budget. "
+                    f"Is this intentional (e.g. cinematic asset, hero tier) or should I evaluate against a different asset type?"
+                ),
+            })
+            _session_append("surfaced_conflicts",
+                f"vert_budget: {vert_count:,} is {ratio:.1f}x {effective_type} limit")
+
+        # Rig/no-rig conflict
+        if "character" in effective_type and not has_arm:
+            conflicts.append({
+                "conflict":       "Character type stated but no Armature modifier found",
+                "data_shows":     "No ARMATURE modifier on this object",
+                "stated_type":    effective_type,
+                "confirm_question": (
+                    f"You described this as a {effective_type}, but I see no Armature modifier. "
+                    "Is this pre-rig (Stage 1–4), or is the armature on a separate object?"
+                ),
+            })
+
+        # No UV on textured-type asset
+        if effective_type in ("hero_character", "character", "weapon", "weapon_or_prop", "vehicle") and not has_uvs:
+            conflicts.append({
+                "conflict":       "Asset type expects UVs but none found",
+                "data_shows":     "No UV map present",
+                "stated_type":    effective_type,
+                "confirm_question": (
+                    f"This is described as a {effective_type}, but it has no UV map. "
+                    "Is this still in retopo/pre-UV stage? That changes the evaluation standards significantly."
+                ),
+            })
+
+        # ── Step 7: Score 0–100 ───────────────────────────────────────────────
+        # Start at 100, deduct per finding severity.
+        # Scale deductions by asset type — characters are held to tighter standards.
+        criticals = [f for f in all_findings if f.get("severity") == "critical"]
+        warnings  = [f for f in all_findings if f.get("severity") == "warning"]
+        infos     = [f for f in all_findings if f.get("severity") == "info"]
+
+        score = 100
+        score -= len(criticals) * 20
+        score -= len(warnings)  * 5
+        score -= len(infos)     * 1
+        score -= len(conflicts) * 10   # conflicts cost score too
+        score = max(0, min(100, score))
+
+        if   score >= 90: grade = "A"
+        elif score >= 75: grade = "B"
+        elif score >= 55: grade = "C"
+        elif score >= 35: grade = "D"
+        else:             grade = "F"
+
+        # ── Step 8: Extract strengths ─────────────────────────────────────────
+        strengths = []
+        if not any(f.get("source") == "mesh_problems" and f.get("severity") == "critical" for f in all_findings):
+            strengths.append("Mesh geometry is clean — no non-manifold edges or degenerate faces")
+        if has_uvs:
+            strengths.append("UV map present — baking and texturing pipeline unblocked")
+        topo_score = raw_topology.get("topology_score", 0) if "error" not in raw_topology else 0
+        if topo_score >= 80:
+            strengths.append(f"Strong topology score ({topo_score}/100) — quad-dominant, animation-friendly")
+        elif topo_score >= 60:
+            strengths.append(f"Acceptable topology score ({topo_score}/100)")
+        ue5_reasoning = r_ue5.get("_reasoning", {})
+        ue5_findings  = ue5_reasoning.get("findings", [])
+        if not any(f.get("severity") == "critical" for f in ue5_findings):
+            strengths.append("UE5 readiness check: no blocking export errors")
+        if vert_count > 0 and limit and vert_count <= limit:
+            strengths.append(f"Vertex count ({vert_count:,}) within {effective_type} budget ({limit:,})")
+        if include_rig and rig_verdict == "PASS":
+            strengths.append("Rig QA passed — weights and skeleton are export-ready")
+        if not strengths:
+            strengths.append("Asset is functional and repairable — blocking issues are known and fixable")
+
+        # ── Step 9: Time estimate ─────────────────────────────────────────────
+        total_issues = len(criticals) + len(warnings)
+        auto_repairable = len(r_problems.get("_reasoning", {}).get("auto_repairable", []))
+        manual_issues   = total_issues - auto_repairable
+        conflict_time   = 5 * len(conflicts)  # minutes for clarification + re-eval
+
+        if total_issues == 0 and not conflicts:
+            time_est = "Production-ready now — no blocking issues found."
+        elif len(criticals) == 0 and manual_issues <= 2:
+            time_est = f"15–30 minutes — {len(warnings)} warning(s), mostly auto-repairable."
+        elif len(criticals) <= 2 and manual_issues <= 4:
+            time_est = f"30–90 minutes — {len(criticals)} critical issue(s) need artist review."
+        elif len(criticals) <= 5:
+            time_est = f"2–4 hours — {len(criticals)} critical issue(s) across multiple systems."
+        else:
+            time_est = f"Half-day or more — {len(criticals)} critical issues, significant rework required."
+        if conflicts:
+            time_est += f" Plus ~{conflict_time} min to clarify {len(conflicts)} type conflict(s) before re-evaluating."
+
+        # ── Step 10: Build recommendations (ordered by severity) ──────────────
+        recs = []
+        if conflicts:
+            for c in conflicts:
+                recs.append(f"⚠️ CONFIRM: {c['confirm_question']}")
+        for f in criticals:
+            fix = f.get("professional_fix") or f.get("fix") or "Review and fix manually."
+            recs.append(f"🚫 CRITICAL — {f['issue']}: {fix}")
+        for f in warnings:
+            fix = f.get("professional_fix") or f.get("fix") or "Review."
+            recs.append(f"⚠️ WARN — {f['issue']}: {fix}")
+        if not recs:
+            recs.append("✅ No blocking issues — ready for export gate.")
+
+        # ── Step 11: Update session context ──────────────────────────────────
+        _session_set(active_object=object_name)
+        if asset_type:
+            _session_set(asset_type=asset_type)
+        _session_append("verified_checks", "production_review")
+        _session_append("verified_checks", "analyze_mesh_for_unreal")
+        _session_append("verified_checks", "run_unreal_readiness_check")
+        for f in criticals:
+            issue_tag = f.get("issue", "")[:40]
+            _session_append("open_issues", issue_tag)
+
+        # ── Build final report ────────────────────────────────────────────────
+        report = {
+            "object":              object_name,
+            "assumed_asset_type":  effective_type,
+            "production_score":    score,
+            "score_grade":         grade,
+            "score_breakdown": {
+                "started_at":   100,
+                "critical_deductions": f"-{len(criticals) * 20} ({len(criticals)} critical × 20)",
+                "warning_deductions":  f"-{len(warnings) * 5} ({len(warnings)} warnings × 5)",
+                "conflict_deductions": f"-{len(conflicts) * 10} ({len(conflicts)} conflicts × 10)",
+                "final_score":    score,
+            },
+            "conflicts":          conflicts,
+            "strengths":          strengths,
+            "critical_blockers":  criticals,
+            "warnings":           warnings,
+            "recommendations":    recs,
+            "time_estimate":      time_est,
+            "stats": {
+                "vertex_count":  vert_count,
+                "has_uvs":       has_uvs,
+                "has_armature":  has_arm,
+                "topology_score": topo_score,
+                "total_findings": len(all_findings),
+            },
+        }
+
+        if include_rig and rig_verdict is not None:
+            report["rig_verdict"] = rig_verdict
+        if include_animation and anim_summary:
+            report["animation_summary"] = anim_summary
+        if conflicts:
+            report["_action_required"] = (
+                "One or more conflicts detected between your stated asset type and the data. "
+                "Please answer the confirm_question(s) in 'conflicts' before treating this score as final."
+            )
+
+        report["session_updated"] = True
+        return json.dumps(report, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in production_review: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     try:
