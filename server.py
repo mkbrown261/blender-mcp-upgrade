@@ -5215,6 +5215,483 @@ def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AI TECHNICAL DIRECTOR — v3.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def plan_production_path(
+    object_name: str,
+    goal: str = "export_ready",
+) -> str:
+    """
+    AI TECHNICAL DIRECTOR — Build a 5-step production plan for this asset.
+
+    Reads the current scene state + session context + active playbook, then
+    proposes a concrete, ordered 5-step plan to reach the stated goal.
+    Each step includes: what to do, which tool executes it, what success looks
+    like, and which gate/check confirms it's done.
+
+    After you present the plan to the user, wait for explicit approval before
+    executing any step. After each step, re-read state before proceeding.
+
+    Parameters:
+      object_name : Blender object to plan for
+      goal        : "export_ready" (default) | "bake_ready" | "rig_ready" |
+                    "texture_ready" | "review_only"
+
+    Returns:
+      plan         : ordered list of 5 steps, each with tool, success_criteria, gate
+      assumptions  : what the TD is assuming about this asset
+      active_playbook_name : playbook in use (or "none")
+      session_context_used : True if session data informed the plan
+      approval_required    : always True — present plan, wait for "yes/go ahead"
+    """
+    try:
+        # ── Gather state ──────────────────────────────────────────────────────
+        obj_info   = _send_raw("get_object_info",         name=object_name)
+        mesh_stats = _send_raw("get_mesh_quality_report", name=object_name)
+        if "error" in obj_info:
+            return json.dumps({"error": f"Object not found: {object_name}"})
+
+        mesh_block   = obj_info.get("mesh", {})
+        vertex_count = mesh_block.get("vertices", 0) or 0
+        face_count   = mesh_block.get("polygons",  0) or 0
+        mat_list     = obj_info.get("materials", [])
+        has_uvs      = mesh_stats.get("uv", {}).get("has_uvs", False)
+        uv_layers    = mesh_stats.get("uv", {}).get("layer_count", 0)
+        has_arm      = any(
+            m.get("type") == "ARMATURE"
+            for m in mesh_stats.get("modifiers", [])
+            if isinstance(m, dict)
+        )
+        health       = mesh_stats.get("health", "unknown")
+        face_types   = mesh_stats.get("face_types", {})
+        ngon_count   = face_types.get("ngons", 0) or 0
+
+        # Problems
+        prob_raw  = _send_raw("detect_mesh_problems", name=object_name)
+        prob_list = prob_raw.get("problems", []) if "error" not in prob_raw else []
+        prob_map  = {p.get("type", ""): p.get("count", 0) for p in prob_list}
+        nm_edges  = prob_map.get("non_manifold_edges", 0)
+
+        # Stage inference
+        stage_result = _classify_stage_from_signals(obj_info, mesh_stats)
+        stage_num    = stage_result.get("stage_number", 0)
+        stage_name   = stage_result.get("stage_name",   "Unknown")
+
+        # Session
+        pb           = _get_active_playbook()
+        session_type = _session_get("asset_type") or ""
+        verified     = _session_get("verified_checks") or []
+        open_iss     = _session_get("open_issues") or []
+        conf_stage   = _session_get("confirmed_stage")
+
+        pb_name = pb["name"] if pb else "none"
+        effective_stage = conf_stage or stage_num
+
+        # ── Build 5-step plan ─────────────────────────────────────────────────
+        # Adapt to goal and current state. Skip already-verified checks.
+        steps = []
+        step_n = 1
+
+        def step(title, tool_call, success_criteria, gate, note=""):
+            nonlocal step_n
+            s = {
+                "step":             step_n,
+                "title":            title,
+                "tool_call":        tool_call,
+                "success_criteria": success_criteria,
+                "gate":             gate,
+            }
+            if note:
+                s["note"] = note
+            steps.append(s)
+            step_n += 1
+
+        # Step 1: Always start with visual + scene orientation (unless already done)
+        if "get_viewport_screenshot" not in verified:
+            step(
+                "Visual inspection — look before you touch",
+                "get_viewport_screenshot() then get_scene_info()",
+                "Screenshot captured, scene object count confirmed, active object identified",
+                "None — observation only. Describe what you see.",
+                note="Never skip this. The screenshot tells you things the data doesn't.",
+            )
+        else:
+            step(
+                "Re-orient: confirm current state matches last session",
+                "session_status() then get_viewport_screenshot()",
+                "Session context refreshed, any scene changes since last session identified",
+                "None — observation only.",
+                note="Session has prior context. Verify scene hasn't changed before acting.",
+            )
+
+        # Step 2: Geometry health
+        if "detect_mesh_problems" not in verified and "analyze_mesh_for_unreal" not in verified:
+            step(
+                "Geometry health check — find any blocking errors",
+                f"analyze_mesh_for_unreal(name='{object_name}')",
+                "Zero non-manifold edges. Zero degenerate faces. Zero duplicate faces.",
+                "GATE 1 — If critical errors found: auto_repair_mesh() with user approval first.",
+                note=f"Current signal: {nm_edges} non-manifold edges. {'Repair needed.' if nm_edges > 0 else 'Looks clean — confirm with tool.'}",
+            )
+        else:
+            already = [c for c in ["analyze_mesh_for_unreal", "detect_mesh_problems"] if c in verified]
+            step(
+                "Geometry verified this session — check topology",
+                f"analyze_topology(name='{object_name}')",
+                "Topology score ≥ playbook minimum. Quad dominance in deformation zones.",
+                "No hard gate — inform next step.",
+                note=f"Geometry checks already run: {', '.join(already)}. Open issues: {open_iss or 'none'}.",
+            )
+
+        # Step 3: Stage-specific gate
+        if goal == "bake_ready" or effective_stage <= 3:
+            step(
+                "Bake pre-flight — validate UV and bake setup",
+                f"validate_bake_setup(low_poly_name='{object_name}', high_poly_name='<HIGH_POLY_NAME>')",
+                "All 10 bake checks pass or warnings acknowledged. Image Texture node active. No UV overlap.",
+                "GATE 5 — Do not initiate bake if verdict is FAIL. WARN: state warnings, get confirmation.",
+                note="Replace <HIGH_POLY_NAME> with the actual high-poly object name in the scene.",
+            )
+        elif goal == "rig_ready" or (effective_stage == 5 and has_arm):
+            step(
+                "Rig QA — weights and skeleton before export gate",
+                f"analyze_rig_weights(object_name='{object_name}') then analyze_rig_skeleton(object_name='{object_name}')",
+                "Zero unweighted vertices. All vertices ≤8 influences. Root bone at origin. No orphan bones.",
+                "GATE 3 (Export) — Rig QA must pass before export gate is valid.",
+                note="Run both tools. A PASS on weights with a FAIL on skeleton is still a combined failure.",
+            )
+        elif has_uvs and len(mat_list) > 0:
+            step(
+                "Material validation — PBR integrity check",
+                f"analyze_material_pbr(name='{object_name}')",
+                "Principled BSDF confirmed. No broken texture paths. Normal map Y-flip correct for UE5.",
+                "GATE 2 (Stage Transition) — Material must pass before export gate.",
+                note=f"{len(mat_list)} material(s) found on object.",
+            )
+        else:
+            step(
+                "UV unwrap — required before any downstream work",
+                "No MCP tool — manual Blender operation",
+                "UV map present with no overlapping islands. UV stretch < 20%.",
+                "No MCP gate — verify with get_mesh_quality_report() after.",
+                note="Use Smart UV Project as a starting point on hard surface. Mark seams manually for characters.",
+            )
+
+        # Step 4: Full export gate (unless goal is pre-export)
+        if goal not in ("bake_ready", "review_only"):
+            step(
+                "Full Unreal readiness check — export gate",
+                f"run_unreal_readiness_check(name='{object_name}')",
+                "Zero blocking errors. Scale applied. Pivot at origin. Lightmap UV present.",
+                "GATE 3 (Export) — Must be zero errors before export_for_unreal() is called.",
+                note=pb.get("stage_standards", {}).get(6, "") if pb else "",
+            )
+
+        # Step 5: Export or playbook-specific closer
+        if goal == "export_ready":
+            step(
+                "Export to Unreal Engine",
+                f"export_for_unreal(name='{object_name}')",
+                "FBX exported to project path. No modifier errors. Armature included if rigged.",
+                "GATE 4 (Irreversible Op) — State what will happen. Wait for explicit 'yes/export/go ahead'.",
+                note="After export: verify in UE5 — check for missing materials, incorrect scale, animation playback.",
+            )
+        elif goal == "review_only":
+            step(
+                "Production review — full scored report",
+                f"production_review(object_name='{object_name}', asset_type='{session_type or effective_stage}')",
+                "production_score ≥ 75 (grade B or better). Zero conflicts. Zero critical blockers.",
+                "No gate — report delivered to user.",
+                note="Use include_rig=True if this is a rigged character. Surface all conflicts.",
+            )
+        else:
+            step(
+                "Verify and document — update session context",
+                "session_update(add_verified_check='...', add_open_issue='...')",
+                "Session context reflects all completed work. Open issues documented.",
+                "None — session hygiene step.",
+                note="Keep session accurate so future turns don't re-run already-completed checks.",
+            )
+
+        # ── Assumptions block ─────────────────────────────────────────────────
+        assumptions = [
+            f"Asset: {object_name} — {vertex_count:,} vertices, Stage {effective_stage} ({stage_name})",
+            f"Playbook: {pb_name}",
+            f"Goal: {goal}",
+        ]
+        if open_iss:
+            assumptions.append(f"Open issues from this session: {', '.join(open_iss)}")
+        if nm_edges > 0:
+            assumptions.append(f"⚠️ {nm_edges} non-manifold edges detected — Step 2 will address this first.")
+
+        # Update session
+        _session_set(active_object=object_name)
+        _session_append("verified_checks", "plan_production_path")
+
+        return json.dumps({
+            "plan":                   steps,
+            "step_count":             len(steps),
+            "assumptions":            assumptions,
+            "active_playbook_name":   pb_name,
+            "session_context_used":   bool(verified or open_iss or conf_stage or session_type),
+            "approval_required":      True,
+            "_instruction": (
+                "Present this plan to the user. Wait for explicit approval ('yes', 'go ahead', "
+                "'do it') before executing Step 1. After each step: re-read state, then proceed "
+                "to next step only if success_criteria are met."
+            ),
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in plan_production_path: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def critique_mesh(
+    object_name: str,
+    focus: str = "all",
+    verbose: bool = False,
+) -> str:
+    """
+    AI MESH CRITIC — Senior technical artist review of topology and mesh decisions.
+
+    Goes beyond pass/fail counts to give you the *why* behind each finding:
+    why this topology decision creates problems, which production scenarios
+    will expose the failure, and what a senior artist would actually do to fix it.
+
+    Different from analyze_mesh_for_unreal: that tool tells you what's wrong.
+    This tool tells you why it matters, in the context of the active playbook
+    and production stage, with the depth of a senior TA code review.
+
+    Parameters:
+      object_name : Blender object to critique
+      focus       : "all" (default) | "topology" | "uvs" | "geometry" | "deformation"
+      verbose     : True → include passing observations (what's done well)
+
+    Returns:
+      critique_verdict   : overall assessment with senior framing
+      priority_findings  : ordered by production impact, not just severity
+      compounding_issues : pairs of issues that are worse together than separately
+      deformation_risk   : specific risks in deforming areas (if rig detected)
+      what_i_would_do    : concrete senior-TA recommendation for each major finding
+      playbook_context   : how findings relate to active playbook standards
+    """
+    try:
+        # ── Gather data ───────────────────────────────────────────────────────
+        raw_problems = _send_raw("detect_mesh_problems",    name=object_name)
+        raw_quality  = _send_raw("get_mesh_quality_report", name=object_name)
+        raw_topology = _send_raw("analyze_topology",        name=object_name)
+
+        r_problems = _reason_mesh_problems(raw_problems) if "error" not in raw_problems else raw_problems
+        r_quality  = _reason_mesh_quality(raw_quality)   if "error" not in raw_quality  else raw_quality
+        r_topology = _reason_topology(raw_topology)      if "error" not in raw_topology else raw_topology
+
+        counts     = raw_quality.get("counts", {})
+        face_types = raw_quality.get("face_types", {})
+        vert_count = counts.get("verts", 0) or 0
+        face_count = counts.get("faces", 0) or 0
+        ngon_count = face_types.get("ngons", 0) or 0
+        quad_count = face_types.get("quads", 0) or 0
+        tri_count  = face_types.get("tris",  0) or 0
+        has_uvs    = raw_quality.get("uv", {}).get("has_uvs", False)
+        uv_oob     = raw_quality.get("uv", {}).get("out_of_bounds_loops", 0) or 0
+        poles      = raw_quality.get("poles", {})
+        high_val   = poles.get("high_valence", 0) or 0
+        topo_score = raw_topology.get("topology_score", 100) if "error" not in raw_topology else 100
+        topo_rating = raw_topology.get("rating", "unknown") if "error" not in raw_topology else "unknown"
+
+        # Armature check
+        has_arm = any(
+            m.get("type") == "ARMATURE"
+            for m in raw_quality.get("modifiers", [])
+            if isinstance(m, dict)
+        )
+
+        # All raw findings
+        all_findings = []
+        for enriched in [r_problems, r_quality, r_topology]:
+            for f in enriched.get("_reasoning", {}).get("findings", []):
+                all_findings.append(f)
+
+        # ── Senior-framed priority findings ───────────────────────────────────
+        # Re-rank by production impact, not just severity.
+        # Production impact = severity × (downstream_blocker_count + deformation_risk)
+        priority_findings = []
+        for f in all_findings:
+            issue   = f.get("issue", "")
+            sev     = f.get("severity", "info")
+            fix     = f.get("professional_fix") or f.get("fix") or ""
+            why     = f.get("why_it_matters", "")
+
+            # Senior framing: add "what I would do" and downstream risk
+            if "non_manifold" in issue.lower():
+                downstream = "Blocks baking, subdivision, UE5 import, and physics. Fix this before anything else."
+                senior_do  = "Run auto_repair_mesh() — merge by distance + interior face delete. Re-scan. If any survive, manually select Non Manifold in Edit Mode and investigate each one."
+            elif "n-gon" in issue.lower() or "ngon" in issue.lower():
+                downstream = f"UE5 auto-tris n-gons. At {ngon_count} n-gons you'll see star patterns and banding under normals. Worse under subdivision or dynamic lighting."
+                senior_do  = f"Select All by Trait > Face Sides > Greater Than 4. Knife-cut from pole to pole. Don't dissolve existing edges — reroute. Priority: any n-gon in a deformation zone."
+            elif "zero-area" in issue.lower() or "degenerate" in issue.lower():
+                downstream = "Undefined normals cause black patches in baking and undefined behavior in physics. Silent failure — bakes look fine in preview, wrong in engine."
+                senior_do  = "Degenerate Dissolve at 0.0001 threshold. Then bake a test patch — if you see any black faces, there are survivors."
+            elif "uv" in issue.lower() or "out-of-bounds" in issue.lower():
+                downstream = f"UV issues compound with bake issues. If you have {uv_oob} out-of-bounds loops on lightmap channel, you'll get shadow bleeding across unrelated surfaces."
+                senior_do  = "Check which UV channel. Channel 0 OOB = maybe intentional tiling. Channel 1 OOB = lightmap error, fix now."
+            elif "pole" in issue.lower() or "valence" in issue.lower():
+                downstream = "High-valence poles (6+) cause pinching under subdivision and make skinning harder. Predictable failure point at joint centers."
+                senior_do  = "Dissolve edges feeding into the pole. Target ≤5 edges at any non-boundary vertex. Priority: poles near joints."
+            elif "duplicate" in issue.lower():
+                downstream = "Z-fighting at all render distances. Doubles GPU cost for zero visual benefit. Silent in Blender, visible immediately in UE5."
+                senior_do  = "Merge by Distance 0.0001. Re-check face count before/after — duplicates disappear cleanly."
+            elif "isolated" in issue.lower() or "loose" in issue.lower():
+                downstream = "Inflates vert count and shifts bounding box. May offset pivot point from expected location."
+                senior_do  = "Delete Loose (Edit Mode > Mesh > Clean Up). Zero visual impact."
+            else:
+                downstream = "Review in context of the current stage."
+                senior_do  = fix or "Manual review required."
+
+            entry = {
+                "issue":           issue,
+                "severity":        sev,
+                "downstream_risk": downstream,
+                "what_i_would_do": senior_do,
+            }
+            if verbose and why:
+                entry["why_it_matters"] = why
+            priority_findings.append(entry)
+
+        # Sort by severity (critical > warning > info)
+        sev_order = {"critical": 0, "warning": 1, "info": 2}
+        priority_findings.sort(key=lambda f: sev_order.get(f["severity"], 3))
+
+        # ── Compounding issues ────────────────────────────────────────────────
+        # Pairs of issues that are significantly worse together.
+        compounding = []
+        sev_set = {f.get("severity") for f in all_findings}
+        has_nm  = any("non_manifold" in f.get("issue","").lower() for f in all_findings)
+        has_ng  = ngon_count > 0
+        has_uv_issue = uv_oob > 0
+
+        if has_nm and has_ng:
+            compounding.append({
+                "pair": ["Non-manifold edges", "N-gons"],
+                "compounding_effect": (
+                    "N-gon tessellation is unpredictable on its own. Combined with non-manifold edges, "
+                    "the UE5 auto-triangulator hits undefined geometry — can produce NaN normals and "
+                    "invisible faces that still cast shadows. Fix non-manifold first."
+                ),
+            })
+        if has_uv_issue and has_nm:
+            compounding.append({
+                "pair": ["UV out-of-bounds", "Non-manifold edges"],
+                "compounding_effect": (
+                    "Baking with UV errors + non-manifold geometry = corrupted bake output that's "
+                    "hard to diagnose. The projection errors and geometry errors produce overlapping "
+                    "artifacts. Fix geometry before baking — don't try to bake around geo problems."
+                ),
+            })
+        if high_val > 5 and has_arm:
+            compounding.append({
+                "pair": [f"{high_val} high-valence poles", "Armature modifier (rigged mesh)"],
+                "compounding_effect": (
+                    "High-valence poles near joint areas create unpredictable deformation. "
+                    "The skin weight solver distributes influence across all edges — "
+                    "a 6-pole at the shoulder creates 6 competing influence vectors. "
+                    "Visible as pinching on full-range poses."
+                ),
+            })
+
+        # ── Deformation risk (rigged assets only) ─────────────────────────────
+        deformation_risk = None
+        if has_arm:
+            risks = []
+            if ngon_count > 0:
+                risks.append(f"{ngon_count} n-gon(s) in mesh — if any are in joint areas, expect deformation artefacts.")
+            if high_val > 5:
+                risks.append(f"{high_val} high-valence poles — verify none are within joint deformation zones.")
+            if not has_uvs:
+                risks.append("No UV map — weight painting without UV reference makes verification harder.")
+            deformation_risk = risks if risks else ["No specific deformation risks detected from geometry signals."]
+
+        # ── Overall critique verdict ──────────────────────────────────────────
+        criticals = [f for f in all_findings if f.get("severity") == "critical"]
+        warnings  = [f for f in all_findings if f.get("severity") == "warning"]
+
+        if not criticals and not warnings:
+            if topo_score >= 80:
+                verdict = (
+                    f"Clean mesh with strong topology ({topo_score}/100, {topo_rating}). "
+                    f"This is a well-constructed asset. The geometry is solid — proceed to "
+                    f"the next stage with confidence."
+                )
+            else:
+                verdict = (
+                    f"Mesh is geometrically clean but topology score is {topo_score}/100 ({topo_rating}). "
+                    f"No blockers, but topology optimisation would improve deformation and LOD generation."
+                )
+        elif criticals:
+            verdict = (
+                f"This mesh has {len(criticals)} critical issue(s) that will cause failures in production. "
+                f"Priority: address the highest-severity finding first — each critical issue compounds others. "
+                f"Do not proceed to baking, rigging, or export until criticals are resolved."
+            )
+        else:
+            verdict = (
+                f"Mesh is export-eligible but has {len(warnings)} warning(s) a senior TA would address. "
+                f"These won't block the pipeline today but will surface as harder-to-fix problems later "
+                f"(especially in deformation and LOD reduction)."
+            )
+
+        # ── Playbook context ──────────────────────────────────────────────────
+        pb = _get_active_playbook()
+        playbook_context = None
+        if pb:
+            topo_min = pb.get("topology_score_min", 60)
+            playbook_context = {
+                "playbook":           pb["name"],
+                "topology_score_min": topo_min,
+                "topology_pass":      topo_score >= topo_min,
+                "topology_verdict":   f"{topo_score}/100 — {'PASS' if topo_score >= topo_min else 'FAIL'} for {pb['name']} standard (min {topo_min})",
+                "vert_budget":        pb["vert_budget"],
+                "vert_count":         vert_count,
+                "vert_budget_pass":   vert_count <= pb["vert_budget"],
+            }
+
+        # ── Build report ──────────────────────────────────────────────────────
+        report = {
+            "object":            object_name,
+            "critique_verdict":  verdict,
+            "topology_score":    topo_score,
+            "topology_rating":   topo_rating,
+            "priority_findings": priority_findings,
+            "stats": {
+                "vertices": vert_count,
+                "faces":    face_count,
+                "quads":    quad_count,
+                "tris":     tri_count,
+                "ngons":    ngon_count,
+                "has_uvs":  has_uvs,
+                "rigged":   has_arm,
+            },
+        }
+        if compounding:
+            report["compounding_issues"] = compounding
+        if deformation_risk:
+            report["deformation_risk"] = deformation_risk
+        if playbook_context:
+            report["playbook_context"] = playbook_context
+
+        _session_append("verified_checks", "critique_mesh")
+        return json.dumps(report, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in critique_mesh: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION REVIEW MODE — v3.0
 # ─────────────────────────────────────────────────────────────────────────────
 
