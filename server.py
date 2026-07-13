@@ -28,6 +28,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -3186,10 +3187,16 @@ def animation_coach(
         reasoning = enriched.get("_reasoning", {})
         findings  = reasoning.get("findings", [])
 
-        anim_start  = frame_start or raw.get("frame_start", 0)
-        anim_end    = frame_end   or raw.get("frame_end",   0)
+        # FIX: addon.py's analyze_animation_quality returns "frame_range": [start, end],
+        # not separate "frame_start"/"frame_end" keys — those always defaulted to 0
+        # whenever the caller didn't explicitly pass frame_start/frame_end (the common
+        # case, since the docstring says both "default to action start/end").
+        # There's also no "fps" anywhere in the real schema, or in any addon.py
+        # command — omit it rather than presenting a fabricated constant as real data.
+        raw_frame_range = raw.get("frame_range", [0, 0])
+        anim_start  = frame_start or (raw_frame_range[0] if len(raw_frame_range) > 0 else 0)
+        anim_end    = frame_end   or (raw_frame_range[1] if len(raw_frame_range) > 1 else 0)
         frame_range = (anim_end - anim_start) + 1 if anim_end > anim_start else 0
-        fps         = raw.get("fps", 24)
 
         # ── Animation principles catalog ──────────────────────────────────────
         # Keyed by issue category → coaching note
@@ -3242,7 +3249,17 @@ def animation_coach(
             cat         = f.get("category", "general")
             issue       = f.get("issue", "")
             sev         = f.get("severity", "info")
-            frame_ref   = f.get("frame") or f.get("frames") or "N/A"
+            # FIX: individual findings have no "frame"/"frames" key in the real
+            # schema (only issue/severity/category/why_it_matters/professional_fix),
+            # so this always fell through to "N/A". addon.py does embed frame
+            # numbers in the issue text itself for some findings (e.g. "between
+            # frames 14-18") — extract them with a regex instead of a dead lookup.
+            frame_match = re.search(r"frames?\s+(\d+)(?:\s*[-–]\s*(\d+))?", issue, re.IGNORECASE)
+            if frame_match:
+                frame_ref = (f"{frame_match.group(1)}-{frame_match.group(2)}"
+                             if frame_match.group(2) else frame_match.group(1))
+            else:
+                frame_ref = "N/A"
             fix         = f.get("professional_fix", "") or f.get("correction", "") or f.get("fix", "")
 
             # Map category to principle
@@ -3327,7 +3344,6 @@ def animation_coach(
         report = {
             "object":           name,
             "frame_range":      {"start": anim_start, "end": anim_end, "total_frames": frame_range},
-            "fps":              fps,
             "coaching_verdict": coaching_verdict,
             "grade":            grade,
             "score":            score,
@@ -6087,10 +6103,14 @@ def production_review(
             try:
                 anim_json = critique_animation(object_name)
                 anim_data = json.loads(anim_json)
+                # FIX: critique_animation's real top-level keys are "verdict"
+                # (not "overall_verdict" — that's analyze_material_pbr's key,
+                # borrowed here by mistake) and "critical_issues" (there's no
+                # flat top-level "findings" list; it's pre-split into
+                # critical_issues/warnings/info).
                 anim_summary = {
-                    "verdict":  anim_data.get("overall_verdict", "Unknown"),
-                    "blockers": [f for f in anim_data.get("findings", [])
-                                 if f.get("severity") in ("critical", "blocking")],
+                    "verdict":  anim_data.get("verdict", "Unknown"),
+                    "blockers": anim_data.get("critical_issues", []),
                 }
                 _session_append("verified_checks", "critique_animation")
             except Exception as e:
