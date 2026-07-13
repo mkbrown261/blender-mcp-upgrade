@@ -909,6 +909,85 @@ def _reason_animation(raw: dict) -> dict:
     }
 
 
+# FIX: these three helpers were deleted in 41d2e84 ("v2.3 schema fix") while their
+# call sites in _reason_animation above were kept, causing a NameError that stayed
+# latent because the reasoning loop only executes when there's an actual finding —
+# every test animation until now happened to score a clean 100/100. Restored from
+# b730146 (the commit that introduced them, before the accidental deletion).
+def _classify_animation_issue(text: str) -> str:
+    t = text.lower()
+    if "foot" in t or "sliding" in t:
+        return "foot_contact"
+    if "jitter" in t or "noise" in t:
+        return "keyframe_noise"
+    if "linear" in t:
+        return "interpolation"
+    if "velocity" in t or "spike" in t:
+        return "velocity"
+    if "spine" in t or "pelvis" in t or "hip" in t:
+        return "body_mechanics"
+    if "arm" in t or "shoulder" in t:
+        return "upper_body"
+    return "general"
+
+
+def _animation_why(text: str) -> str:
+    t = text.lower()
+    if "foot" in t or "sliding" in t:
+        return (
+            "Foot sliding is the most immediately visible animation error. It breaks "
+            "the physical contract between the character and the ground, destroying "
+            "believability in any third-person or VR context."
+        )
+    if "jitter" in t or "noise" in t:
+        return (
+            "High-frequency keyframe jitter is usually caused by motion capture noise "
+            "or over-corrected curves. It reads as vibration at runtime, not as motion, "
+            "and is particularly visible on held poses and slow movements."
+        )
+    if "linear" in t:
+        return (
+            "LINEAR interpolation between keyframes produces mechanical, robotic motion. "
+            "Organic motion requires ease-in/ease-out curves (BEZIER or AUTO interpolation) "
+            "to read as weight and physical momentum."
+        )
+    if "velocity" in t or "spike" in t:
+        return (
+            "Velocity spikes mean a bone is moving impossibly fast between two frames. "
+            "This causes popping artefacts in compressed animations and breaks secondary "
+            "motion systems like IK solvers and cloth simulation."
+        )
+    return "Review in the Dope Sheet and Graph Editor for context."
+
+
+def _animation_fix(text: str) -> str:
+    t = text.lower()
+    if "foot" in t or "sliding" in t:
+        return (
+            "In the Graph Editor, identify the foot bone's location curves during the "
+            "contact phase. Manually lock XY translation during ground contact frames. "
+            "Use IK constraints with a foot controller locked to world space."
+        )
+    if "jitter" in t or "noise" in t:
+        return (
+            "Select affected bones in Pose Mode, open Graph Editor, select all curves, "
+            "apply Smooth Keys (Key > Smooth Keys) 2-3 times. Alternatively use the "
+            "Decimate modifier on the F-curve with a ratio of 0.3-0.5."
+        )
+    if "linear" in t:
+        return (
+            "Select all keyframes in the Dope Sheet. Key > Interpolation Mode > Bezier. "
+            "Then use Key > Handle Type > Auto Clamped to prevent overshoot."
+        )
+    if "velocity" in t or "spike" in t:
+        return (
+            "Locate the spike in the Graph Editor (look for a V-shape in the curve). "
+            "Delete or move the offending keyframe. Check for duplicate keyframes on "
+            "the same frame — they create zero-duration transitions."
+        )
+    return "Review in the Dope Sheet and Graph Editor."
+
+
 def _reason_asset_qa(raw: dict) -> dict:
     """
     Interpret run_asset_qa output with production QA context.
