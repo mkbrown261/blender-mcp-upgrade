@@ -1632,13 +1632,23 @@ class BlenderMCPServer:
             if qa.get("problems"):
                 pre_export_warnings = [f"{p['type']}: {p['count']}" for p in qa["problems"]]
 
-            # Select object + children
+            # Select object + related rig.
+            # FIX: previously only walked armature -> children (armature passed in).
+            # The far more common call is mesh -> parent armature (mesh passed in),
+            # which silently dropped the rig even with export_animations=True.
+            # Resolve via the ARMATURE modifier's target, not just obj.parent —
+            # a mesh can be deform-linked to an armature without being parented to it.
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             bpy.context.view_layer.objects.active = obj
             if obj.type == 'ARMATURE':
                 for child in obj.children:
                     child.select_set(True)
+            elif obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object is not None:
+                        mod.object.select_set(True)
+                        break
 
             # FIX: always include ARMATURE in object_types (needed for skin weights)
             obj_types = {'MESH', 'ARMATURE'}
