@@ -2280,6 +2280,8 @@ def snapshot_mesh_state(object_name: str) -> str:
     problems   = raw_quality.get("problems", {})
     uv         = raw_quality.get("uv", {})
     topo_stats = raw_topo.get("stats", {})
+    face_total = counts.get("faces", 0) or 0
+    ngon_pct   = round(face_types.get("ngons", 0) / face_total * 100, 1) if face_total else 0.0
 
     snapshot = {
         "_timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
@@ -2300,7 +2302,10 @@ def snapshot_mesh_state(object_name: str) -> str:
         "topology_score":   raw_topo.get("topology_score", 0),
         "topology_rating":  raw_topo.get("rating", "unknown"),
         "quad_ratio_pct":   topo_stats.get("quad_ratio_pct", 0.0),
-        "ngon_pct":         topo_stats.get("tris_pct", 0.0),  # tris_pct from stats
+        # FIX: was assigning tris_pct here under the "ngon_pct" key — real ngon
+        # percentage isn't precomputed anywhere in the schema, so derive it
+        # from the actual ngon count and face count instead.
+        "ngon_pct":         ngon_pct,
     }
 
     _SNAPSHOTS[object_name] = snapshot
