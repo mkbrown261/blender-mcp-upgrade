@@ -3898,6 +3898,72 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             layout.operator("blendermcp.stop_server", text="Disconnect from MCP server")
             layout.label(text=f"Running on port {scene.blendermcp_port}")
 
+
+class BLENDERMCP_OT_PlayAnimation(bpy.types.Operator):
+    """Assign this action to the active object and start playback"""
+    bl_idname = "blendermcp.play_animation"
+    bl_label = "Play Animation"
+    action_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        action = bpy.data.actions.get(self.action_name)
+        if not obj:
+            self.report({'ERROR'}, "No active object")
+            return {'CANCELLED'}
+        if not action:
+            self.report({'ERROR'}, f"Action '{self.action_name}' not found")
+            return {'CANCELLED'}
+        if not obj.animation_data:
+            obj.animation_data_create()
+        obj.animation_data.action = action
+        context.scene.frame_set(int(action.frame_range[0]))
+        if context.screen and not context.screen.is_animation_playing:
+            bpy.ops.screen.animation_play()
+        return {'FINISHED'}
+
+
+class BLENDERMCP_PT_AnimPanel(bpy.types.Panel):
+    """Auto-populated list of animations for the active object, with quick playback"""
+    bl_label = "Animations"
+    bl_idname = "BLENDERMCP_PT_AnimPanel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'BlenderMCP'
+    bl_order = 10  # draw below the main BlenderMCP panel
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        if not obj:
+            layout.label(text="No active object", icon='INFO')
+            return
+
+        layout.label(text=f"For: {obj.name}")
+
+        # Match actions by name (Blender's default auto-naming embeds the object
+        # name, e.g. "ZombieRigAction.002") plus whatever is currently assigned.
+        matches = [a for a in bpy.data.actions if obj.name.lower() in a.name.lower()]
+        current = obj.animation_data.action if obj.animation_data else None
+        if current and current not in matches:
+            matches.append(current)
+
+        if not matches:
+            layout.label(text="No animations found", icon='INFO')
+            return
+
+        for action in sorted(matches, key=lambda a: a.name):
+            row = layout.row()
+            is_active = current == action
+            op = row.operator(
+                "blendermcp.play_animation",
+                text=action.name,
+                icon='CHECKMARK' if is_active else 'PLAY',
+                depress=is_active,
+            )
+            op.action_name = action.name
+
+
 # Operator to set Hyper3D API Key
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_idname = "blendermcp.set_hyper3d_free_trial_api_key"
@@ -4100,6 +4166,8 @@ def register():
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
     bpy.utils.register_class(BLENDERMCP_PT_Panel)
+    bpy.utils.register_class(BLENDERMCP_OT_PlayAnimation)
+    bpy.utils.register_class(BLENDERMCP_PT_AnimPanel)
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
@@ -4115,6 +4183,8 @@ def unregister():
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
 
+    bpy.utils.unregister_class(BLENDERMCP_PT_AnimPanel)
+    bpy.utils.unregister_class(BLENDERMCP_OT_PlayAnimation)
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
