@@ -6683,7 +6683,7 @@ from mathutils import Vector
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     center = obj.matrix_world.to_translation()
     others = [o for o in bpy.context.scene.objects if o.type == 'MESH' and o is not obj and not o.hide_viewport]
@@ -6691,9 +6691,9 @@ else:
     for o in others:
         oc = o.matrix_world.to_translation()
         d  = (center - oc).length
-        dists.append({{"name": o.name, "distance": round(d,3), "position": [round(oc.x,3),round(oc.y,3),round(oc.z,3)]}})
+        dists.append({"name": o.name, "distance": round(d,3), "position": [round(oc.x,3),round(oc.y,3),round(oc.z,3)]})
     dists.sort(key=lambda x: x["distance"])
-    print(json.dumps({{"query": "nearest", "reference": "{OBJ}", "results": dists[:{COUNT}]}}))
+    print(json.dumps({"query": "nearest", "reference": "{OBJ}", "results": dists[:{COUNT}]}))
 """,
 
 "in_radius": r"""
@@ -6702,7 +6702,7 @@ from mathutils import Vector
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     center = obj.matrix_world.to_translation()
     radius = {RADIUS}
@@ -6713,9 +6713,9 @@ else:
         oc = o.matrix_world.to_translation()
         d  = (center - oc).length
         if d <= radius:
-            found.append({{"name": o.name, "distance": round(d,3)}})
+            found.append({"name": o.name, "distance": round(d,3)})
     found.sort(key=lambda x: x["distance"])
-    print(json.dumps({{"query": "in_radius", "reference": "{OBJ}", "radius": radius, "count": len(found), "results": found}}))
+    print(json.dumps({"query": "in_radius", "reference": "{OBJ}", "radius": radius, "count": len(found), "results": found}))
 """,
 
 "intersecting": r"""
@@ -6725,7 +6725,7 @@ from mathutils.bvhtree import BVHTree
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     depsgraph = bpy.context.evaluated_depsgraph_get()
     eval_a = obj.evaluated_get(depsgraph)
@@ -6753,11 +6753,11 @@ else:
             eval_b.to_mesh_clear()
             overlaps = bvh_a.overlap(bvh_b)
             if overlaps:
-                found.append({{"name": other.name, "overlap_pairs": len(overlaps), "distance": round(dist,3)}})
+                found.append({"name": other.name, "overlap_pairs": len(overlaps), "distance": round(dist,3)})
         except Exception:
             pass
-    print(json.dumps({{"query": "intersecting", "reference": "{OBJ}", "count": len(found), "results": found,
-        "verdict": "WARN: intersecting objects detected — likely placement errors" if found else "PASS: no intersections"}}))
+    print(json.dumps({"query": "intersecting", "reference": "{OBJ}", "count": len(found), "results": found,
+        "verdict": "WARN: intersecting objects detected — likely placement errors" if found else "PASS: no intersections"}))
 """,
 
 "supporting": r"""
@@ -6766,7 +6766,7 @@ from mathutils import Vector
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     depsgraph = bpy.context.evaluated_depsgraph_get()
     # Find lowest point of bounding box
@@ -6778,15 +6778,15 @@ else:
     hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
     if hit and hit_obj:
         dist = (origin - loc).length
-        print(json.dumps({{"query": "supporting", "reference": "{OBJ}",
+        print(json.dumps({"query": "supporting", "reference": "{OBJ}",
             "supported_by": hit_obj.name,
             "gap": round(dist, 4),
             "contact": dist < 0.05,
-            "hit_location": [round(loc.x,3), round(loc.y,3), round(loc.z,3)]}}))
+            "hit_location": [round(loc.x,3), round(loc.y,3), round(loc.z,3)]}))
     else:
-        print(json.dumps({{"query": "supporting", "reference": "{OBJ}",
+        print(json.dumps({"query": "supporting", "reference": "{OBJ}",
             "supported_by": None, "gap": None, "contact": False,
-            "note": "Nothing found below this object — it may be floating"}}))
+            "note": "Nothing found below this object — it may be floating"}))
 """,
 
 "above": r"""
@@ -6795,7 +6795,7 @@ from mathutils import Vector
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     center = obj.matrix_world.to_translation()
     radius = {RADIUS}
@@ -6807,9 +6807,9 @@ else:
         dz  = oc.z - center.z
         dxy = ((oc.x-center.x)**2 + (oc.y-center.y)**2) ** 0.5
         if dz > 0 and dxy <= radius:
-            found.append({{"name": o.name, "height_above": round(dz,3), "lateral_offset": round(dxy,3)}})
+            found.append({"name": o.name, "height_above": round(dz,3), "lateral_offset": round(dxy,3)})
     found.sort(key=lambda x: x["height_above"])
-    print(json.dumps({{"query": "above", "reference": "{OBJ}", "count": len(found), "results": found}}))
+    print(json.dumps({"query": "above", "reference": "{OBJ}", "count": len(found), "results": found}))
 """,
 
 "below": r"""
@@ -6818,7 +6818,7 @@ from mathutils import Vector
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
-    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
     center = obj.matrix_world.to_translation()
     radius = {RADIUS}
@@ -6830,9 +6830,9 @@ else:
         dz  = center.z - oc.z
         dxy = ((oc.x-center.x)**2 + (oc.y-center.y)**2) ** 0.5
         if dz > 0 and dxy <= radius:
-            found.append({{"name": o.name, "depth_below": round(dz,3), "lateral_offset": round(dxy,3)}})
+            found.append({"name": o.name, "depth_below": round(dz,3), "lateral_offset": round(dxy,3)})
     found.sort(key=lambda x: x["depth_below"])
-    print(json.dumps({{"query": "below", "reference": "{OBJ}", "count": len(found), "results": found}}))
+    print(json.dumps({"query": "below", "reference": "{OBJ}", "count": len(found), "results": found}))
 """,
 
 "raycast": r"""
@@ -6845,12 +6845,12 @@ direction = Vector(({DX}, {DY}, {DZ}))
 hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
 if hit and hit_obj:
     dist = (origin - loc).length
-    print(json.dumps({{"query": "raycast", "hit": True, "object": hit_obj.name,
+    print(json.dumps({"query": "raycast", "hit": True, "object": hit_obj.name,
         "distance": round(dist,3),
         "hit_location": [round(loc.x,3), round(loc.y,3), round(loc.z,3)],
-        "face_index": idx}}))
+        "face_index": idx}))
 else:
-    print(json.dumps({{"query": "raycast", "hit": False, "object": None, "distance": None}}))
+    print(json.dumps({"query": "raycast", "hit": False, "object": None, "distance": None}))
 """,
 
 "floating": r"""
@@ -6871,11 +6871,11 @@ for obj in bpy.context.scene.objects:
     direction = Vector((0, 0, -1))
     hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
     if not hit:
-        floating.append({{"name": obj.name, "lowest_z": round(z_min,3), "note": "nothing below"}})
+        floating.append({"name": obj.name, "lowest_z": round(z_min,3), "note": "nothing below"})
     elif (origin - loc).length > 0.5:
-        floating.append({{"name": obj.name, "lowest_z": round(z_min,3), "gap_to_nearest_below": round((origin-loc).length,3)}})
-verdict = f"WARN: {{len(floating)}} floating object(s) detected" if floating else "PASS: all objects have support or floor contact"
-print(json.dumps({{"query": "floating", "floating_count": len(floating), "results": floating, "verdict": verdict}}))
+        floating.append({"name": obj.name, "lowest_z": round(z_min,3), "gap_to_nearest_below": round((origin-loc).length,3)})
+verdict = f"WARN: {len(floating)} floating object(s) detected" if floating else "PASS: all objects have support or floor contact"
+print(json.dumps({"query": "floating", "floating_count": len(floating), "results": floating, "verdict": verdict}))
 """,
 
 "isolated": r"""
@@ -6896,10 +6896,10 @@ for obj in meshes:
             has_neighbor = True
             break
     if not has_neighbor:
-        isolated.append({{"name": obj.name, "position": [round(center.x,3), round(center.y,3), round(center.z,3)]}})
-print(json.dumps({{"query": "isolated", "radius": radius, "isolated_count": len(isolated),
+        isolated.append({"name": obj.name, "position": [round(center.x,3), round(center.y,3), round(center.z,3)]})
+print(json.dumps({"query": "isolated", "radius": radius, "isolated_count": len(isolated),
     "results": isolated,
-    "note": f"Objects with no neighbors within {{radius}}m — may be misplaced"}}))
+    "note": f"Objects with no neighbors within {radius}m — may be misplaced"}))
 """,
     }
 
@@ -6984,7 +6984,7 @@ from mathutils.bvhtree import BVHTree
 OBJ_NAME = '{OBJ_NAME}'
 obj = bpy.data.objects.get(OBJ_NAME)
 if obj is None:
-    print(json.dumps({{"error": f"Object not found: {{OBJ_NAME}}"}}))
+    print(json.dumps({"error": f"Object not found: {OBJ_NAME}"}))
 else:
     depsgraph = bpy.context.evaluated_depsgraph_get()
     center    = obj.matrix_world.to_translation()
@@ -7039,7 +7039,7 @@ else:
     for o in meshes:
         oc   = o.matrix_world.to_translation()
         dist = (center - oc).length
-        nearest.append({{"name": o.name, "distance": round(dist,3), "direction": dir_label(center,oc)}})
+        nearest.append({"name": o.name, "distance": round(dist,3), "direction": dir_label(center,oc)})
     nearest.sort(key=lambda x: x["distance"])
     nearest = nearest[:5]
 
@@ -7083,31 +7083,31 @@ else:
         pass
 
     # ── Spatial sentence ─────────────────────────────────────────────────
-    parts = [f"{{OBJ_NAME}} ({role})"]
+    parts = [f"{OBJ_NAME} ({role})"]
     if supported_by:
-        parts.append(f"resting on {{supported_by}}")
+        parts.append(f"resting on {supported_by}")
     elif floor_contact:
         parts.append("on/near the floor")
     elif not supported_by:
         parts.append("floating (nothing directly below)")
     if nearest:
         nn = nearest[0]
-        parts.append(f"{{nn['distance']}}m {{nn['direction']}} of {{nn['name']}}")
+        parts.append(f"{nn['distance']}m {nn['direction']} of {nn['name']}")
     if len(nearest) > 1:
-        others_str = ", ".join(f"{{n['name']}} ({{n['distance']}}m)" for n in nearest[1:3])
-        parts.append(f"near {{others_str}}")
+        others_str = ", ".join(f"{n['name']} ({n['distance']}m)" for n in nearest[1:3])
+        parts.append(f"near {others_str}")
     cols = [c.name for c in obj.users_collection]
     if cols:
-        parts.append(f"in collection '{{', '.join(cols)}}'")
+        parts.append(f"in collection '{', '.join(cols)}'")
     if intersecting:
-        parts.append(f"WARN: intersecting {{', '.join(intersecting)}}")
+        parts.append(f"WARN: intersecting {', '.join(intersecting)}")
     spatial_sentence = "; ".join(parts) + "."
 
-    print(json.dumps({{
+    print(json.dumps({
         "object_name":     OBJ_NAME,
         "semantic_role":   role,
         "position":        [round(center.x,3), round(center.y,3), round(center.z,3)],
-        "dimensions":      {{"w": round(dims.x,3), "d": round(dims.y,3), "h": round(dims.z,3)}},
+        "dimensions":      {"w": round(dims.x,3), "d": round(dims.y,3), "h": round(dims.z,3)},
         "collections":     [c.name for c in obj.users_collection],
         "parent":          obj.parent.name if obj.parent else None,
         "children":        [c.name for c in obj.children if c.type == 'MESH'],
@@ -7117,7 +7117,7 @@ else:
         "intersecting":    intersecting,
         "spatial_sentence": spatial_sentence,
         "vertex_count":    len(obj.data.vertices) if obj.data else 0,
-    }}))
+    }))
 """.replace("{OBJ_NAME}", object_name)
 
     try:
