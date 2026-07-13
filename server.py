@@ -1823,6 +1823,14 @@ TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
                                animation principles. Apprentice lessons if apprentice_mode=True.
   session_update               record confirmed facts: asset_type, stage, verified checks, issues
+  get_scene_graph              SPATIAL: full relationship graph — positions, distances, predicates
+                               (above/beside/contains/intersecting), collection tree, floor contacts.
+                               Use before any spatial reasoning or layout decision.
+  query_spatial                SPATIAL: targeted spatial queries — nearest, in_radius, intersecting,
+                               supporting, above, below, raycast, floating, isolated
+  describe_object_context      SPATIAL: rich per-object context — semantic role, nearest neighbors
+                               with directions, floor contact, supported_by, spatial_sentence.
+                               Read this before moving, parenting, or reasoning about one object.
 
 TIER 1 (prefer — most coverage per call):
   what_next                    ONE priority action + playbook context if active
@@ -1903,6 +1911,12 @@ When user says "stop explaining" / "expert mode" / "just do it":
   "this is a weapon/hero/prop"    → set_playbook() + session_update(asset_type=...) first
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → gap report
+  "where is / what's near / layout / spatial / scene graph"
+                                  → get_scene_graph() then describe_object_context(name)
+  "what's floating/intersecting/isolated/in radius/supporting"
+                                  → query_spatial(query_type=...) — pick the right query type
+  "make the room balanced/spread objects/layout reasoning"
+                                  → get_scene_graph() first — reason from relationships, not coords
 
 Screenshot required: session start, after any repair, before/after auto_repair_mesh,
 when reporting any PASS/FAIL verdict.
@@ -6311,6 +6325,814 @@ def production_review(
 
     except Exception as e:
         logger.error(f"Error in production_review: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPATIAL INTELLIGENCE LAYER — v3.1
+# Gives the LLM structured spatial relationships instead of raw coordinates.
+# LLMs reason over "Lamp is 0.4m above Table" far better than over numbers.
+# All data is extracted from Blender's existing spatial structures — no math
+# libraries required, no training, no external APIs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_scene_graph(
+    max_objects: int = 50,
+    relationship_radius: float = 10.0,
+    include_collections: bool = True,
+) -> str:
+    """
+    SPATIAL INTELLIGENCE — Build a relationship graph of every object in the scene.
+
+    Instead of describing objects individually, this tool returns HOW objects
+    relate to each other spatially: what's above what, what's beside what,
+    what's intersecting, what's touching the floor, what's inside what collection.
+
+    The LLM can reason "Lamp is 0.4m above Table, Chair is 0.7m left of Table"
+    far better than it can reason over raw position coordinates. This is the
+    foundation of spatial judgment.
+
+    Parameters:
+      max_objects         : cap for full per-object detail (default 50).
+                            Scenes above this cap get a collection-summary view.
+      relationship_radius : only compute relationships between objects closer
+                            than this distance in meters (default 10.0).
+                            Prevents O(n²) explosion on large scenes.
+      include_collections : include collection hierarchy in output (default True)
+
+    Returns:
+      mode              : "full" | "focused" | "summary"
+      object_count      : total mesh objects in scene
+      objects           : per-object spatial data (position, dimensions, nearest,
+                          floor_contact, collection, parent, children)
+      relationships     : list of {subject, predicate, object, distance} triples
+                          predicates: above | below | beside | inside | intersecting
+                                      | touching | contains | near
+      collection_tree   : nested collection hierarchy (if include_collections)
+      spatial_summary   : plain-English summary of what the scene looks like
+    """
+    script = r"""
+import bpy
+import json
+import math
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+
+MAX_OBJECTS = {MAX_OBJECTS}
+REL_RADIUS  = {REL_RADIUS}
+INCLUDE_COL = {INCLUDE_COL}
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+scene     = bpy.context.scene
+
+# ── Gather all mesh objects ────────────────────────────────────────────────
+all_objects = [o for o in scene.objects if o.type == 'MESH' and not o.hide_viewport]
+obj_count   = len(all_objects)
+
+def world_center(obj):
+    return obj.matrix_world.to_translation()
+
+def world_dims(obj):
+    # Dimensions already in world space (accounts for scale)
+    return list(obj.dimensions)
+
+def world_bbox(obj):
+    return [list(obj.matrix_world @ Vector(c)) for c in obj.bound_box]
+
+def bbox_min_max(obj):
+    bbox = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    xs = [v.x for v in bbox]; ys = [v.y for v in bbox]; zs = [v.z for v in bbox]
+    return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+def direction_label(from_obj, to_obj):
+    # Return primary spatial relationship direction from from_obj to to_obj
+    fc = world_center(from_obj)
+    tc = world_center(to_obj)
+    dx = tc.x - fc.x
+    dy = tc.y - fc.y
+    dz = tc.z - fc.z
+    adx, ady, adz = abs(dx), abs(dy), abs(dz)
+    # Vertical dominates if it's at least 1.5x the horizontal distance
+    if adz > max(adx, ady) * 1.5:
+        return "above" if dz > 0 else "below"
+    if adx >= ady:
+        return "right" if dx > 0 else "left"
+    return "forward" if dy > 0 else "behind"
+
+def rel_predicate(from_obj, to_obj, dist):
+    # Derive relationship predicate from geometry
+    fc = world_center(from_obj)
+    tc = world_center(to_obj)
+    dz = tc.z - fc.z
+    adz = abs(dz)
+    adxy = math.sqrt((tc.x-fc.x)**2 + (tc.y-fc.y)**2)
+
+    # Check bounding box containment (to_obj inside from_obj)
+    fmin, fmax = bbox_min_max(from_obj)
+    tcp = world_center(to_obj)
+    if (fmin[0] < tcp.x < fmax[0] and
+        fmin[1] < tcp.y < fmax[1] and
+        fmin[2] < tcp.z < fmax[2]):
+        return "contains"
+
+    # Vertical relationship: one is clearly above the other
+    if adz > adxy * 1.2:
+        return "above" if dz > 0 else "below"
+
+    # Touching: bounding boxes nearly adjacent (< 0.05m gap)
+    fmin2, fmax2 = bbox_min_max(from_obj)
+    tmin,  tmax  = bbox_min_max(to_obj)
+    gap_x = max(0, max(fmin2[0], tmin[0]) - min(fmax2[0], tmax[0]))
+    gap_y = max(0, max(fmin2[1], tmin[1]) - min(fmax2[1], tmax[1]))
+    gap_z = max(0, max(fmin2[2], tmin[2]) - min(fmax2[2], tmax[2]))
+    if max(gap_x, gap_y, gap_z) < 0.05:
+        return "touching"
+
+    return "beside"
+
+def check_floor_contact(obj, threshold=0.15):
+    # True if the objects lowest bounding box point is within threshold of z=0
+    _, (_, _, z_max) = bbox_min_max(obj)
+    min_pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    z_min = min(v.z for v in min_pts)
+    return z_min < threshold
+
+def check_intersecting_bvh(obj_a, obj_b):
+    # True if the two meshes overlap using BVH tree intersection
+    try:
+        eval_a = obj_a.evaluated_get(depsgraph)
+        eval_b = obj_b.evaluated_get(depsgraph)
+        mesh_a = eval_a.to_mesh()
+        mesh_b = eval_b.to_mesh()
+        bvh_a  = BVHTree.FromPolygons(
+            [obj_a.matrix_world @ Vector(v.co) for v in mesh_a.vertices],
+            [list(p.vertices) for p in mesh_a.polygons]
+        )
+        bvh_b  = BVHTree.FromPolygons(
+            [obj_b.matrix_world @ Vector(v.co) for v in mesh_b.vertices],
+            [list(p.vertices) for p in mesh_b.polygons]
+        )
+        overlaps = bvh_a.overlap(bvh_b)
+        eval_a.to_mesh_clear()
+        eval_b.to_mesh_clear()
+        return len(overlaps) > 0
+    except Exception:
+        return False
+
+# ── Build per-object data ──────────────────────────────────────────────────
+objects_data = {}
+for obj in all_objects:
+    center  = world_center(obj)
+    dims    = world_dims(obj)
+    cols    = [c.name for c in obj.users_collection]
+    parent  = obj.parent.name if obj.parent else None
+    children = [c.name for c in obj.children if c.type == 'MESH']
+
+    # Nearest objects within radius — sorted by distance
+    neighbors = []
+    for other in all_objects:
+        if other is obj:
+            continue
+        oc = world_center(other)
+        dist = (center - oc).length
+        if dist <= REL_RADIUS:
+            neighbors.append({
+                "name":      other.name,
+                "distance":  round(dist, 3),
+                "direction": direction_label(obj, other),
+            })
+    neighbors.sort(key=lambda n: n["distance"])
+
+    objects_data[obj.name] = {
+        "position":      [round(center.x, 3), round(center.y, 3), round(center.z, 3)],
+        "dimensions":    [round(d, 3) for d in dims],
+        "collections":   cols,
+        "parent":        parent,
+        "children":      children,
+        "floor_contact": check_floor_contact(obj),
+        "nearest":       neighbors[:8],  # cap at 8 nearest
+        "vertex_count":  len(obj.data.vertices) if obj.data else 0,
+        "face_count":    len(obj.data.polygons) if obj.data else 0,
+    }
+
+# ── Build relationship triples ─────────────────────────────────────────────
+# Only between objects within REL_RADIUS of each other.
+# Each pair generates one relationship (from the closer object's perspective).
+relationships = []
+processed = set()
+for i, obj_a in enumerate(all_objects):
+    ca = world_center(obj_a)
+    for obj_b in all_objects[i+1:]:
+        cb = world_center(obj_b)
+        dist = (ca - cb).length
+        if dist > REL_RADIUS:
+            continue
+        pair_key = tuple(sorted([obj_a.name, obj_b.name]))
+        if pair_key in processed:
+            continue
+        processed.add(pair_key)
+
+        # Check intersection first (most important relationship)
+        if dist < 2.0:  # only check close pairs for performance
+            intersects = check_intersecting_bvh(obj_a, obj_b)
+            if intersects:
+                relationships.append({
+                    "subject":   obj_a.name,
+                    "predicate": "intersecting",
+                    "object":    obj_b.name,
+                    "distance":  round(dist, 3),
+                    "note":      "WARN: these objects overlap — likely a placement error",
+                })
+                continue
+
+        pred = rel_predicate(obj_a, obj_b, dist)
+        # Flip subject/object so predicate reads naturally
+        # e.g. "Lamp above Table" not "Table below Lamp"
+        dz = cb.z - ca.z
+        if pred == "above":
+            subject, object_ = obj_b.name, obj_a.name   # b is above a
+            pred = "above"
+        elif pred == "below":
+            subject, object_ = obj_a.name, obj_b.name
+            pred = "above"
+        elif pred == "contains":
+            subject, object_ = obj_a.name, obj_b.name
+            pred = "contains"
+        else:
+            subject, object_ = obj_a.name, obj_b.name
+
+        relationships.append({
+            "subject":   subject,
+            "predicate": pred,
+            "object":    object_,
+            "distance":  round(dist, 3),
+        })
+
+# ── Collection hierarchy ───────────────────────────────────────────────────
+collection_tree = {}
+if INCLUDE_COL:
+    def col_to_dict(col):
+        return {
+            "objects":  [o.name for o in col.objects if o.type == 'MESH'],
+            "children": {c.name: col_to_dict(c) for c in col.children},
+        }
+    collection_tree = col_to_dict(bpy.context.scene.collection)
+
+# ── Plain-English spatial summary ─────────────────────────────────────────
+intersecting_pairs = [(r["subject"], r["object"]) for r in relationships if r["predicate"] == "intersecting"]
+above_rels   = [(r["subject"], r["object"]) for r in relationships if r["predicate"] == "above"]
+contain_rels = [(r["subject"], r["object"]) for r in relationships if r["predicate"] == "contains"]
+
+summary_parts = [f"{obj_count} mesh object(s) in scene."]
+if intersecting_pairs:
+    pairs_str = ", ".join(f"{a}+{b}" for a,b in intersecting_pairs[:3])
+    summary_parts.append(f"WARN: {len(intersecting_pairs)} intersecting pair(s): {pairs_str}.")
+if above_rels:
+    sample = ", ".join(f"{a} above {b}" for a,b in above_rels[:3])
+    summary_parts.append(f"Vertical relationships: {sample}{'...' if len(above_rels) > 3 else ''}.")
+if contain_rels:
+    sample = ", ".join(f"{a} contains {b}" for a,b in contain_rels[:3])
+    summary_parts.append(f"Containment: {sample}.")
+floor_contacts = [n for n, d in objects_data.items() if d["floor_contact"]]
+if floor_contacts:
+    summary_parts.append(f"{len(floor_contacts)} object(s) on/near floor: {', '.join(floor_contacts[:5])}{'...' if len(floor_contacts) > 5 else ''}.")
+
+spatial_summary = " ".join(summary_parts)
+
+result = {
+    "mode":             "full" if obj_count <= MAX_OBJECTS else "summary",
+    "object_count":     obj_count,
+    "objects":          objects_data if obj_count <= MAX_OBJECTS else {},
+    "relationships":    relationships,
+    "spatial_summary":  spatial_summary,
+}
+if INCLUDE_COL:
+    result["collection_tree"] = collection_tree
+if obj_count > MAX_OBJECTS:
+    result["_note"] = f"Scene has {obj_count} objects — showing relationships only. Use describe_object_context(name) for per-object detail."
+
+print(json.dumps(result))
+""".replace("{MAX_OBJECTS}", str(max_objects)) \
+   .replace("{REL_RADIUS}",  str(relationship_radius)) \
+   .replace("{INCLUDE_COL}", "True" if include_collections else "False")
+
+    try:
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script, "required_mode": "OBJECT", "push_undo": False})
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        # Find the JSON line in stdout
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                data = json.loads(line)
+                # Update session with active scene state
+                _session_set(active_object=_session_get("active_object"))
+                return json.dumps(data, indent=2, default=str)
+        return json.dumps({"error": "No JSON output from scene graph script", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in get_scene_graph: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def query_spatial(
+    query_type: str,
+    object_name: str = "",
+    radius: float = 5.0,
+    origin: list = None,
+    direction: list = None,
+    count: int = 5,
+) -> str:
+    """
+    SPATIAL QUERY ENGINE — Ask precise spatial questions about the scene.
+
+    Instead of reading the whole scene graph, use this to answer targeted
+    spatial questions: what's nearest to this object, what's in this radius,
+    what does a ray hit, what is this object sitting on.
+
+    query_type options:
+      "nearest"      → find the N closest objects to object_name
+                        params: object_name, count (default 5)
+      "in_radius"    → find all objects within radius of object_name's center
+                        params: object_name, radius (default 5.0m)
+      "intersecting" → find all objects whose geometry overlaps object_name
+                        params: object_name
+      "supporting"   → find what object_name is resting on (raycast downward)
+                        params: object_name
+      "above"        → find all objects directly above object_name
+                        params: object_name, radius (search cone radius)
+      "below"        → find all objects directly below object_name
+                        params: object_name, radius
+      "raycast"      → cast a ray from origin in direction, return first hit
+                        params: origin [x,y,z], direction [x,y,z]
+      "floating"     → find all objects with no floor contact and nothing below them
+                        (no params needed — scene-wide check)
+      "isolated"     → find all objects with no neighbors within radius
+                        params: radius (default 5.0m)
+
+    Returns targeted spatial answer with object names, distances, directions.
+    """
+    script_map = {
+
+"nearest": r"""
+import bpy, json, math
+from mathutils import Vector
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    center = obj.matrix_world.to_translation()
+    others = [o for o in bpy.context.scene.objects if o.type == 'MESH' and o is not obj and not o.hide_viewport]
+    dists = []
+    for o in others:
+        oc = o.matrix_world.to_translation()
+        d  = (center - oc).length
+        dists.append({{"name": o.name, "distance": round(d,3), "position": [round(oc.x,3),round(oc.y,3),round(oc.z,3)]}})
+    dists.sort(key=lambda x: x["distance"])
+    print(json.dumps({{"query": "nearest", "reference": "{OBJ}", "results": dists[:{COUNT}]}}))
+""",
+
+"in_radius": r"""
+import bpy, json
+from mathutils import Vector
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    center = obj.matrix_world.to_translation()
+    radius = {RADIUS}
+    found  = []
+    for o in bpy.context.scene.objects:
+        if o.type != 'MESH' or o is obj or o.hide_viewport:
+            continue
+        oc = o.matrix_world.to_translation()
+        d  = (center - oc).length
+        if d <= radius:
+            found.append({{"name": o.name, "distance": round(d,3)}})
+    found.sort(key=lambda x: x["distance"])
+    print(json.dumps({{"query": "in_radius", "reference": "{OBJ}", "radius": radius, "count": len(found), "results": found}}))
+""",
+
+"intersecting": r"""
+import bpy, json
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_a = obj.evaluated_get(depsgraph)
+    mesh_a = eval_a.to_mesh()
+    bvh_a  = BVHTree.FromPolygons(
+        [obj.matrix_world @ v.co for v in mesh_a.vertices],
+        [list(p.vertices) for p in mesh_a.polygons]
+    )
+    eval_a.to_mesh_clear()
+    found = []
+    for other in bpy.context.scene.objects:
+        if other.type != 'MESH' or other is obj or other.hide_viewport:
+            continue
+        oc   = other.matrix_world.to_translation()
+        dist = (obj.matrix_world.to_translation() - oc).length
+        if dist > 10.0:  # skip distant objects
+            continue
+        try:
+            eval_b = other.evaluated_get(depsgraph)
+            mesh_b = eval_b.to_mesh()
+            bvh_b  = BVHTree.FromPolygons(
+                [other.matrix_world @ v.co for v in mesh_b.vertices],
+                [list(p.vertices) for p in mesh_b.polygons]
+            )
+            eval_b.to_mesh_clear()
+            overlaps = bvh_a.overlap(bvh_b)
+            if overlaps:
+                found.append({{"name": other.name, "overlap_pairs": len(overlaps), "distance": round(dist,3)}})
+        except Exception:
+            pass
+    print(json.dumps({{"query": "intersecting", "reference": "{OBJ}", "count": len(found), "results": found,
+        "verdict": "WARN: intersecting objects detected — likely placement errors" if found else "PASS: no intersections"}}))
+""",
+
+"supporting": r"""
+import bpy, json
+from mathutils import Vector
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    # Find lowest point of bounding box
+    bbox_pts  = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    z_min     = min(v.z for v in bbox_pts)
+    center_xy = obj.matrix_world.to_translation()
+    origin    = Vector((center_xy.x, center_xy.y, z_min - 0.001))
+    direction = Vector((0, 0, -1))
+    hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
+    if hit and hit_obj:
+        dist = (origin - loc).length
+        print(json.dumps({{"query": "supporting", "reference": "{OBJ}",
+            "supported_by": hit_obj.name,
+            "gap": round(dist, 4),
+            "contact": dist < 0.05,
+            "hit_location": [round(loc.x,3), round(loc.y,3), round(loc.z,3)]}}))
+    else:
+        print(json.dumps({{"query": "supporting", "reference": "{OBJ}",
+            "supported_by": None, "gap": None, "contact": False,
+            "note": "Nothing found below this object — it may be floating"}}))
+""",
+
+"above": r"""
+import bpy, json
+from mathutils import Vector
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    center = obj.matrix_world.to_translation()
+    radius = {RADIUS}
+    found  = []
+    for o in bpy.context.scene.objects:
+        if o.type != 'MESH' or o is obj or o.hide_viewport:
+            continue
+        oc  = o.matrix_world.to_translation()
+        dz  = oc.z - center.z
+        dxy = ((oc.x-center.x)**2 + (oc.y-center.y)**2) ** 0.5
+        if dz > 0 and dxy <= radius:
+            found.append({{"name": o.name, "height_above": round(dz,3), "lateral_offset": round(dxy,3)}})
+    found.sort(key=lambda x: x["height_above"])
+    print(json.dumps({{"query": "above", "reference": "{OBJ}", "count": len(found), "results": found}}))
+""",
+
+"below": r"""
+import bpy, json
+from mathutils import Vector
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({{"error": "Object not found: {OBJ}"}}))
+else:
+    center = obj.matrix_world.to_translation()
+    radius = {RADIUS}
+    found  = []
+    for o in bpy.context.scene.objects:
+        if o.type != 'MESH' or o is obj or o.hide_viewport:
+            continue
+        oc  = o.matrix_world.to_translation()
+        dz  = center.z - oc.z
+        dxy = ((oc.x-center.x)**2 + (oc.y-center.y)**2) ** 0.5
+        if dz > 0 and dxy <= radius:
+            found.append({{"name": o.name, "depth_below": round(dz,3), "lateral_offset": round(dxy,3)}})
+    found.sort(key=lambda x: x["depth_below"])
+    print(json.dumps({{"query": "below", "reference": "{OBJ}", "count": len(found), "results": found}}))
+""",
+
+"raycast": r"""
+import bpy, json
+from mathutils import Vector
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+origin    = Vector(({OX}, {OY}, {OZ}))
+direction = Vector(({DX}, {DY}, {DZ}))
+hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
+if hit and hit_obj:
+    dist = (origin - loc).length
+    print(json.dumps({{"query": "raycast", "hit": True, "object": hit_obj.name,
+        "distance": round(dist,3),
+        "hit_location": [round(loc.x,3), round(loc.y,3), round(loc.z,3)],
+        "face_index": idx}}))
+else:
+    print(json.dumps({{"query": "raycast", "hit": False, "object": None, "distance": None}}))
+""",
+
+"floating": r"""
+import bpy, json
+from mathutils import Vector
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+floating  = []
+for obj in bpy.context.scene.objects:
+    if obj.type != 'MESH' or obj.hide_viewport:
+        continue
+    bbox_pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    z_min    = min(v.z for v in bbox_pts)
+    if z_min < 0.1:   # close enough to z=0 — not floating
+        continue
+    center_xy = obj.matrix_world.to_translation()
+    origin    = Vector((center_xy.x, center_xy.y, z_min - 0.001))
+    direction = Vector((0, 0, -1))
+    hit, loc, normal, idx, hit_obj, matrix = bpy.context.scene.ray_cast(depsgraph, origin, direction)
+    if not hit:
+        floating.append({{"name": obj.name, "lowest_z": round(z_min,3), "note": "nothing below"}})
+    elif (origin - loc).length > 0.5:
+        floating.append({{"name": obj.name, "lowest_z": round(z_min,3), "gap_to_nearest_below": round((origin-loc).length,3)}})
+verdict = f"WARN: {{len(floating)}} floating object(s) detected" if floating else "PASS: all objects have support or floor contact"
+print(json.dumps({{"query": "floating", "floating_count": len(floating), "results": floating, "verdict": verdict}}))
+""",
+
+"isolated": r"""
+import bpy, json
+from mathutils import Vector
+
+radius   = {RADIUS}
+isolated = []
+meshes   = [o for o in bpy.context.scene.objects if o.type == 'MESH' and not o.hide_viewport]
+for obj in meshes:
+    center = obj.matrix_world.to_translation()
+    has_neighbor = False
+    for other in meshes:
+        if other is obj:
+            continue
+        dist = (center - other.matrix_world.to_translation()).length
+        if dist <= radius:
+            has_neighbor = True
+            break
+    if not has_neighbor:
+        isolated.append({{"name": obj.name, "position": [round(center.x,3), round(center.y,3), round(center.z,3)]}})
+print(json.dumps({{"query": "isolated", "radius": radius, "isolated_count": len(isolated),
+    "results": isolated,
+    "note": f"Objects with no neighbors within {{radius}}m — may be misplaced"}}))
+""",
+    }
+
+    try:
+        if query_type not in script_map:
+            available = list(script_map.keys())
+            return json.dumps({"error": f"Unknown query_type '{query_type}'. Available: {available}"})
+
+        script = script_map[query_type]
+
+        # Substitute parameters
+        script = script.replace("{OBJ}",    object_name)
+        script = script.replace("{COUNT}",  str(count))
+        script = script.replace("{RADIUS}", str(radius))
+
+        # Raycast origin/direction
+        if query_type == "raycast":
+            o = origin    or [0.0, 0.0, 0.0]
+            d = direction or [0.0, 0.0, -1.0]
+            script = script.replace("{OX}", str(o[0])).replace("{OY}", str(o[1])).replace("{OZ}", str(o[2]))
+            script = script.replace("{DX}", str(d[0])).replace("{DY}", str(d[1])).replace("{DZ}", str(d[2]))
+
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script, "required_mode": "OBJECT", "push_undo": False})
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.dumps(json.loads(line), indent=2, default=str)
+
+        return json.dumps({"error": "No JSON output from spatial query", "raw": output})
+
+    except Exception as e:
+        logger.error(f"Error in query_spatial: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def describe_object_context(object_name: str) -> str:
+    """
+    SPATIAL CONTEXT — Rich semantic description of a single object and its surroundings.
+
+    Instead of "Cube.004 — 12,840 vertices", returns:
+      "Cube.004 — likely a seat or platform (dimensions suggest furniture scale).
+       Sits 0.03m above Floor.001. 0.7m left of Table.003. 1.3m from Lamp.002
+       (above-left). Inside collection 'LivingRoom'. No parent. 2 children.
+       No intersections detected."
+
+    This is what the LLM should read before making any spatial decision about
+    an object — it gives relationship context, not just geometry stats.
+
+    Uses a combination of:
+    - Exact world-space position and dimensions from matrix_world
+    - BVH intersection check against nearby objects
+    - Raycast downward for floor/support detection
+    - Name-based semantic inference (chair, table, lamp, wall, floor, etc.)
+    - Nearest neighbor relationships with direction labels
+
+    Returns:
+      object_name      : confirmed object name
+      semantic_role    : inferred role from name + geometry signals
+      position         : world center [x, y, z]
+      dimensions       : [w, d, h] in meters
+      collections      : which collections this object belongs to
+      parent           : parent object name or null
+      children         : list of child object names
+      floor_contact    : True if resting on/near z=0 plane
+      supported_by     : name of object directly below (from raycast), or null
+      nearest          : top 5 nearest objects with distance + direction
+      intersecting     : list of objects whose geometry overlaps this one
+      spatial_sentence : one plain-English sentence summarising the object's
+                         spatial context — ready to paste into a prompt
+    """
+    script = r"""
+import bpy, json, math, re
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+
+OBJ_NAME = '{OBJ_NAME}'
+obj = bpy.data.objects.get(OBJ_NAME)
+if obj is None:
+    print(json.dumps({{"error": f"Object not found: {{OBJ_NAME}}"}}))
+else:
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    center    = obj.matrix_world.to_translation()
+    dims      = obj.dimensions
+
+    # ── Semantic role inference ──────────────────────────────────────────
+    name_lower = obj.name.lower()
+    role = "mesh object"
+    role_map = [
+        (["chair","seat","stool","bench","throne"],        "seat / furniture"),
+        (["table","desk","counter","shelf","ledge"],       "surface / furniture"),
+        (["lamp","light","lantern","torch","sconce"],      "light fixture"),
+        (["floor","ground","terrain","plane"],             "floor / ground surface"),
+        (["wall","partition","divider"],                   "wall / partition"),
+        (["door","gate","portal","hatch"],                 "door / opening"),
+        (["window","glass","pane"],                        "window"),
+        (["box","crate","container","chest","bin"],        "container"),
+        (["sword","weapon","gun","rifle","blade","bow"],   "weapon"),
+        (["tree","bush","plant","flower","grass"],         "vegetation"),
+        (["rock","stone","boulder","cliff"],               "rock / terrain"),
+        (["car","truck","vehicle","wheel","tire"],         "vehicle"),
+        (["character","human","person","npc","enemy"],     "character"),
+        (["pillar","column","post","pole"],                "structural column"),
+        (["roof","ceiling","canopy"],                      "ceiling / roof"),
+    ]
+    for keywords, label in role_map:
+        if any(k in name_lower for k in keywords):
+            role = label
+            break
+    # Geometry-based role fallback
+    if role == "mesh object":
+        h, w, d = dims.z, dims.x, dims.y
+        if h < 0.15 and w > 1.0:
+            role = "floor / flat surface"
+        elif w > 5.0 and h < 1.0:
+            role = "large flat surface (floor/terrain)"
+        elif h > 2.0 and w < 0.5:
+            role = "vertical structure (wall/pillar)"
+        elif h > 0.5 and w < 2.0 and d < 2.0:
+            role = "mid-scale prop"
+
+    # ── Nearest objects ──────────────────────────────────────────────────
+    def dir_label(fc, tc):
+        dx, dy, dz = tc.x-fc.x, tc.y-fc.y, tc.z-fc.z
+        adx, ady, adz = abs(dx), abs(dy), abs(dz)
+        if adz > max(adx, ady) * 1.5:
+            return "above" if dz > 0 else "below"
+        return ("right" if dx > 0 else "left") if adx >= ady else ("forward" if dy > 0 else "behind")
+
+    meshes   = [o for o in bpy.context.scene.objects if o.type == 'MESH' and o is not obj and not o.hide_viewport]
+    nearest  = []
+    for o in meshes:
+        oc   = o.matrix_world.to_translation()
+        dist = (center - oc).length
+        nearest.append({{"name": o.name, "distance": round(dist,3), "direction": dir_label(center,oc)}})
+    nearest.sort(key=lambda x: x["distance"])
+    nearest = nearest[:5]
+
+    # ── Floor contact ────────────────────────────────────────────────────
+    bbox_pts  = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    z_min     = min(v.z for v in bbox_pts)
+    floor_contact = z_min < 0.12
+
+    # ── Supported by (raycast down) ──────────────────────────────────────
+    ray_origin = Vector((center.x, center.y, z_min - 0.001))
+    hit, loc, _, _, hit_obj, _ = bpy.context.scene.ray_cast(depsgraph, ray_origin, Vector((0,0,-1)))
+    supported_by = hit_obj.name if (hit and hit_obj and (ray_origin - loc).length < 0.5) else None
+
+    # ── Intersecting objects (BVH) ───────────────────────────────────────
+    intersecting = []
+    try:
+        eval_a = obj.evaluated_get(depsgraph)
+        mesh_a = eval_a.to_mesh()
+        bvh_a  = BVHTree.FromPolygons(
+            [obj.matrix_world @ v.co for v in mesh_a.vertices],
+            [list(p.vertices) for p in mesh_a.polygons]
+        )
+        eval_a.to_mesh_clear()
+        for other in meshes:
+            dist = (center - other.matrix_world.to_translation()).length
+            if dist > 5.0:
+                continue
+            try:
+                eval_b = other.evaluated_get(depsgraph)
+                mesh_b = eval_b.to_mesh()
+                bvh_b  = BVHTree.FromPolygons(
+                    [other.matrix_world @ v.co for v in mesh_b.vertices],
+                    [list(p.vertices) for p in mesh_b.polygons]
+                )
+                eval_b.to_mesh_clear()
+                if bvh_a.overlap(bvh_b):
+                    intersecting.append(other.name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── Spatial sentence ─────────────────────────────────────────────────
+    parts = [f"{{OBJ_NAME}} ({role})"]
+    if supported_by:
+        parts.append(f"resting on {{supported_by}}")
+    elif floor_contact:
+        parts.append("on/near the floor")
+    elif not supported_by:
+        parts.append("floating (nothing directly below)")
+    if nearest:
+        nn = nearest[0]
+        parts.append(f"{{nn['distance']}}m {{nn['direction']}} of {{nn['name']}}")
+    if len(nearest) > 1:
+        others_str = ", ".join(f"{{n['name']}} ({{n['distance']}}m)" for n in nearest[1:3])
+        parts.append(f"near {{others_str}}")
+    cols = [c.name for c in obj.users_collection]
+    if cols:
+        parts.append(f"in collection '{{', '.join(cols)}}'")
+    if intersecting:
+        parts.append(f"WARN: intersecting {{', '.join(intersecting)}}")
+    spatial_sentence = "; ".join(parts) + "."
+
+    print(json.dumps({{
+        "object_name":     OBJ_NAME,
+        "semantic_role":   role,
+        "position":        [round(center.x,3), round(center.y,3), round(center.z,3)],
+        "dimensions":      {{"w": round(dims.x,3), "d": round(dims.y,3), "h": round(dims.z,3)}},
+        "collections":     [c.name for c in obj.users_collection],
+        "parent":          obj.parent.name if obj.parent else None,
+        "children":        [c.name for c in obj.children if c.type == 'MESH'],
+        "floor_contact":   floor_contact,
+        "supported_by":    supported_by,
+        "nearest":         nearest,
+        "intersecting":    intersecting,
+        "spatial_sentence": spatial_sentence,
+        "vertex_count":    len(obj.data.vertices) if obj.data else 0,
+    }}))
+""".replace("{OBJ_NAME}", object_name)
+
+    try:
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script, "required_mode": "OBJECT", "push_undo": False})
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.dumps(json.loads(line), indent=2, default=str)
+        return json.dumps({"error": "No JSON output from describe_object_context", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in describe_object_context: {e}")
         return json.dumps({"error": str(e)})
 
 
