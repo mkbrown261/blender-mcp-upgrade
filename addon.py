@@ -154,13 +154,16 @@ class BlenderMCPServer:
                                     client.sendall(response_json.encode('utf-8'))
                                 except:
                                     print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print(f"Error executing command: {str(e)}")
+                            except BaseException as e:
+                                # BaseException catches SystemExit, KeyboardInterrupt etc.
+                                # — must not let these escape into bpy.app.timers or
+                                # they propagate to Blender's main thread and crash the app.
+                                print(f"Error executing command: {type(e).__name__}: {str(e)}")
                                 traceback.print_exc()
                                 try:
                                     error_response = {
                                         "status": "error",
-                                        "message": str(e)
+                                        "message": f"{type(e).__name__}: {str(e)}"
                                     }
                                     client.sendall(json.dumps(error_response).encode('utf-8'))
                                 except:
@@ -452,9 +455,12 @@ class BlenderMCPServer:
             self._log("execute_code_safe", "ok")
             return {**result, "mode_before": original_mode, "undo_pushed": push_undo}
 
-        except Exception as e:
-            self._log("execute_code_safe", "error", str(e))
-            return {"executed": False, "result": "", "error": str(e),
+        except BaseException as e:
+            # BaseException guard — mirrors execute_code; prevents SystemExit
+            # and KeyboardInterrupt from escaping into the timers callback.
+            err_msg = f"{type(e).__name__}: {str(e)}"
+            self._log("execute_code_safe", "error", err_msg)
+            return {"executed": False, "result": "", "error": err_msg,
                     "mode_before": original_mode, "undo_pushed": push_undo}
         finally:
             # --- restore mode if we changed it ---
@@ -1905,8 +1911,18 @@ class BlenderMCPServer:
 
             captured_output = capture_buffer.getvalue()
             return {"executed": True, "result": captured_output}
-        except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+        except BaseException as e:
+            # Catch BaseException (includes SystemExit, KeyboardInterrupt) so
+            # they never escape execute_code and reach bpy.app.timers, which
+            # would crash Blender's main thread. Return as structured error.
+            err_msg = f"{type(e).__name__}: {str(e)}"
+            print(f"execute_code caught BaseException: {err_msg}")
+            captured_output = ""
+            try:
+                captured_output = capture_buffer.getvalue()
+            except Exception:
+                pass
+            return {"executed": False, "result": captured_output, "error": err_msg}
 
 
 
