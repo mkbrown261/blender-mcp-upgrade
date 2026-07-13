@@ -6377,8 +6377,6 @@ import bpy
 import json
 import math
 from mathutils import Vector
-from mathutils.bvhtree import BVHTree
-
 MAX_OBJECTS = {MAX_OBJECTS}
 REL_RADIUS  = {REL_RADIUS}
 INCLUDE_COL = {INCLUDE_COL}
@@ -6458,25 +6456,21 @@ def check_floor_contact(obj, threshold=0.15):
     z_min = min(v.z for v in min_pts)
     return z_min < threshold
 
-def check_intersecting_bvh(obj_a, obj_b):
-    # True if the two meshes overlap using BVH tree intersection
+def check_intersecting_aabb(obj_a, obj_b):
+    # AABB overlap test — 6 axis-aligned comparisons.
+    # Catches coplanar/flush cases that BVHTree.overlap() misses (parallel faces
+    # never cross so BVH returns empty; AABB separation = 0 so it correctly fires).
+    # Trade-off: ignores mesh rotation, uses world-space bounding box extents.
+    # For precise rotated-mesh intersection use query_spatial(query_type='intersecting')
+    # which runs full 15-axis SAT on oriented bounding boxes.
     try:
-        eval_a = obj_a.evaluated_get(depsgraph)
-        eval_b = obj_b.evaluated_get(depsgraph)
-        mesh_a = eval_a.to_mesh()
-        mesh_b = eval_b.to_mesh()
-        bvh_a  = BVHTree.FromPolygons(
-            [obj_a.matrix_world @ Vector(v.co) for v in mesh_a.vertices],
-            [list(p.vertices) for p in mesh_a.polygons]
-        )
-        bvh_b  = BVHTree.FromPolygons(
-            [obj_b.matrix_world @ Vector(v.co) for v in mesh_b.vertices],
-            [list(p.vertices) for p in mesh_b.polygons]
-        )
-        overlaps = bvh_a.overlap(bvh_b)
-        eval_a.to_mesh_clear()
-        eval_b.to_mesh_clear()
-        return len(overlaps) > 0
+        amin, amax = bbox_min_max(obj_a)
+        bmin, bmax = bbox_min_max(obj_b)
+        # Separated on any axis → no overlap
+        if amax[0] <= bmin[0] or bmax[0] <= amin[0]: return False
+        if amax[1] <= bmin[1] or bmax[1] <= amin[1]: return False
+        if amax[2] <= bmin[2] or bmax[2] <= amin[2]: return False
+        return True
     except Exception:
         return False
 
@@ -6535,7 +6529,7 @@ for i, obj_a in enumerate(all_objects):
 
         # Check intersection first (most important relationship)
         if dist < 2.0:  # only check close pairs for performance
-            intersects = check_intersecting_bvh(obj_a, obj_b)
+            intersects = check_intersecting_aabb(obj_a, obj_b)
             if intersects:
                 relationships.append({
                     "subject":   obj_a.name,
@@ -6719,45 +6713,83 @@ else:
 """,
 
 "intersecting": r"""
-import bpy, json
-from mathutils import Vector
-from mathutils.bvhtree import BVHTree
+import bpy, json, math
+from mathutils import Vector, Matrix
+
+# Separating Axis Theorem (SAT) on Oriented Bounding Boxes.
+# Tests 15 axes: 3 face normals from box A, 3 from box B, 9 cross-product pairs.
+# If all 15 axes show overlap → objects intersect.
+# Catches coplanar/flush cases that BVHTree.overlap() misses because parallel
+# faces never cross (no triangle-triangle intersection) but have zero separation
+# on the SAT axis — correctly detected here.
+
+def get_obb(obj):
+    # Returns OBB as (center_vec, [axis0, axis1, axis2], [half_ext0, half_ext1, half_ext2])
+    # Axes are the world-space columns of the rotation matrix, half_extents are half-dimensions.
+    mw   = obj.matrix_world
+    dims = obj.dimensions
+    center = mw.to_translation()
+    # Extract rotation axes (columns of the 3x3 rotation part, normalised)
+    rot  = mw.to_3x3().normalized()
+    axes = [rot.col[0].copy(), rot.col[1].copy(), rot.col[2].copy()]
+    half = [dims.x * 0.5, dims.y * 0.5, dims.z * 0.5]
+    return center, axes, half
+
+def sat_overlap(obb_a, obb_b):
+    # Returns True if the two OBBs overlap (no separating axis found).
+    ca, axes_a, ha = obb_a
+    cb, axes_b, hb = obb_b
+    t = cb - ca  # translation vector between centres
+
+    def project_onto(axis):
+        # Projected half-extent of each OBB onto axis, plus centre separation.
+        ra = sum(ha[i] * abs(axes_a[i].dot(axis)) for i in range(3))
+        rb = sum(hb[i] * abs(axes_b[i].dot(axis)) for i in range(3))
+        separation = abs(t.dot(axis))
+        return separation <= ra + rb  # True → no separation on this axis
+
+    # Test 3 face normals of A
+    for ax in axes_a:
+        if not project_onto(ax):
+            return False
+    # Test 3 face normals of B
+    for ax in axes_b:
+        if not project_onto(ax):
+            return False
+    # Test 9 cross-product edge pairs (A_i x B_j)
+    for ax_a in axes_a:
+        for ax_b in axes_b:
+            cross = ax_a.cross(ax_b)
+            if cross.length < 1e-6:
+                continue  # parallel edges — skip degenerate axis
+            if not project_onto(cross.normalized()):
+                return False
+    return True  # no separating axis found → overlap
 
 obj = bpy.data.objects.get('{OBJ}')
 if obj is None:
     print(json.dumps({"error": "Object not found: {OBJ}"}))
 else:
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_a = obj.evaluated_get(depsgraph)
-    mesh_a = eval_a.to_mesh()
-    bvh_a  = BVHTree.FromPolygons(
-        [obj.matrix_world @ v.co for v in mesh_a.vertices],
-        [list(p.vertices) for p in mesh_a.polygons]
-    )
-    eval_a.to_mesh_clear()
+    obb_a = get_obb(obj)
+    center_a = obj.matrix_world.to_translation()
     found = []
     for other in bpy.context.scene.objects:
         if other.type != 'MESH' or other is obj or other.hide_viewport:
             continue
         oc   = other.matrix_world.to_translation()
-        dist = (obj.matrix_world.to_translation() - oc).length
+        dist = (center_a - oc).length
         if dist > 10.0:  # skip distant objects
             continue
         try:
-            eval_b = other.evaluated_get(depsgraph)
-            mesh_b = eval_b.to_mesh()
-            bvh_b  = BVHTree.FromPolygons(
-                [other.matrix_world @ v.co for v in mesh_b.vertices],
-                [list(p.vertices) for p in mesh_b.polygons]
-            )
-            eval_b.to_mesh_clear()
-            overlaps = bvh_a.overlap(bvh_b)
-            if overlaps:
-                found.append({"name": other.name, "overlap_pairs": len(overlaps), "distance": round(dist,3)})
+            obb_b = get_obb(other)
+            if sat_overlap(obb_a, obb_b):
+                found.append({"name": other.name, "distance": round(dist, 3),
+                    "method": "SAT-OBB"})
         except Exception:
             pass
     print(json.dumps({"query": "intersecting", "reference": "{OBJ}", "count": len(found), "results": found,
-        "verdict": "WARN: intersecting objects detected — likely placement errors" if found else "PASS: no intersections"}))
+        "verdict": "WARN: intersecting objects detected — likely placement errors" if found else "PASS: no intersections",
+        "method_note": "SAT on oriented bounding boxes — catches coplanar/flush overlaps that BVH misses"}))
 """,
 
 "supporting": r"""
@@ -6979,7 +7011,6 @@ def describe_object_context(object_name: str) -> str:
     script = r"""
 import bpy, json, math, re
 from mathutils import Vector
-from mathutils.bvhtree import BVHTree
 
 OBJ_NAME = '{OBJ_NAME}'
 obj = bpy.data.objects.get(OBJ_NAME)
@@ -7054,34 +7085,34 @@ else:
     hit, loc, _, _, hit_obj, _ = bpy.context.scene.ray_cast(depsgraph, ray_origin, Vector((0,0,-1)))
     supported_by = hit_obj.name if (hit and hit_obj and (ray_origin - loc).length < 0.5) else None
 
-    # ── Intersecting objects (BVH) ───────────────────────────────────────
+    # ── Intersecting objects (AABB) ──────────────────────────────────────
+    # Uses axis-aligned bounding box overlap — 6 comparisons per pair.
+    # Catches coplanar/flush cases that BVHTree.overlap() misses.
+    # For precise rotated-mesh intersection use query_spatial(query_type='intersecting')
+    # which runs full 15-axis SAT on oriented bounding boxes.
+    def bbox_min_max_local(o):
+        pts = [o.matrix_world @ Vector(c) for c in o.bound_box]
+        xs = [v.x for v in pts]; ys = [v.y for v in pts]; zs = [v.z for v in pts]
+        return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+    def aabb_overlap(o_a, o_b):
+        amin, amax = bbox_min_max_local(o_a)
+        bmin, bmax = bbox_min_max_local(o_b)
+        if amax[0] <= bmin[0] or bmax[0] <= amin[0]: return False
+        if amax[1] <= bmin[1] or bmax[1] <= amin[1]: return False
+        if amax[2] <= bmin[2] or bmax[2] <= amin[2]: return False
+        return True
+
     intersecting = []
-    try:
-        eval_a = obj.evaluated_get(depsgraph)
-        mesh_a = eval_a.to_mesh()
-        bvh_a  = BVHTree.FromPolygons(
-            [obj.matrix_world @ v.co for v in mesh_a.vertices],
-            [list(p.vertices) for p in mesh_a.polygons]
-        )
-        eval_a.to_mesh_clear()
-        for other in meshes:
-            dist = (center - other.matrix_world.to_translation()).length
-            if dist > 5.0:
-                continue
-            try:
-                eval_b = other.evaluated_get(depsgraph)
-                mesh_b = eval_b.to_mesh()
-                bvh_b  = BVHTree.FromPolygons(
-                    [other.matrix_world @ v.co for v in mesh_b.vertices],
-                    [list(p.vertices) for p in mesh_b.polygons]
-                )
-                eval_b.to_mesh_clear()
-                if bvh_a.overlap(bvh_b):
-                    intersecting.append(other.name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    for other in meshes:
+        dist = (center - other.matrix_world.to_translation()).length
+        if dist > 5.0:
+            continue
+        try:
+            if aabb_overlap(obj, other):
+                intersecting.append(other.name)
+        except Exception:
+            pass
 
     # ── Spatial sentence ─────────────────────────────────────────────────
     parts = [f"{OBJ_NAME} ({role})"]
