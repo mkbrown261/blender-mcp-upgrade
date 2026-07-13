@@ -200,6 +200,60 @@ def _session_append(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION PERSISTENCE — write _SESSION to disk so context survives MCP restarts.
+# File lives next to server.py. Only scalar-safe types (str, int, bool, list).
+# _load_session() is called once at startup; _save_session() on every update.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SESSION_FILE: Path = Path(__file__).parent / ".blender_mcp_session.json"
+
+# Keys whose values are safe to persist (exclude runtime-only flags if added later)
+_SESSION_PERSIST_KEYS = [
+    "asset_type", "active_playbook", "confirmed_stage", "active_object",
+    "verified_checks", "open_issues", "user_corrections", "surfaced_conflicts",
+    "apprentice_mode", "td_mode",
+]
+
+
+def _save_session() -> None:
+    """Write current _SESSION to disk. Silent on failure — never crash the server."""
+    try:
+        payload = {k: _SESSION[k] for k in _SESSION_PERSIST_KEYS if k in _SESSION}
+        _SESSION_FILE.write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        logger.warning(f"_save_session: could not write {_SESSION_FILE}: {e}")
+
+
+def _load_session() -> None:
+    """Read persisted session from disk into _SESSION. Called once at startup."""
+    global _SESSION
+    if not _SESSION_FILE.exists():
+        return
+    try:
+        data = json.loads(_SESSION_FILE.read_text())
+        for k in _SESSION_PERSIST_KEYS:
+            if k in data and k in _SESSION:
+                _SESSION[k] = data[k]
+        logger.info(f"_load_session: restored session from {_SESSION_FILE}")
+    except Exception as e:
+        logger.warning(f"_load_session: could not read {_SESSION_FILE}: {e}")
+
+
+# Load persisted session immediately at import time
+_load_session()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNAPSHOT STORE — in-memory dict of mesh state snapshots keyed by object name.
+# snapshot_mesh_state() writes here; compare_mesh_state() diffs against it.
+# Snapshots are NOT persisted — they're per-MCP-session only (intentional:
+# mesh state can change between Blender sessions, stale snapshots mislead).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SNAPSHOTS: dict = {}   # { object_name: { ...mesh stats... , "_timestamp": str } }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION PLAYBOOKS — named workflows with asset-type-aware standards.
 # what_next, production_review, and plan_production_path all consult
 # the active playbook via _get_active_playbook().
@@ -1823,6 +1877,11 @@ TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
                                animation principles. Apprentice lessons if apprentice_mode=True.
   session_update               record confirmed facts: asset_type, stage, verified checks, issues
+  snapshot_mesh_state          SNAPSHOT: capture vert/face/ngon/topology baseline before any repair.
+                               Call before auto_repair_mesh or any destructive op.
+  compare_mesh_state           DIFF: compare current mesh against snapshot — signed deltas,
+                               IMPROVED/REGRESSED/UNCHANGED per stat, overall verdict.
+                               Call after repair to show the artist exactly what changed.
   get_scene_graph              SPATIAL: full relationship graph — positions, distances, predicates
                                (above/beside/contains/intersecting), collection tree, floor contacts.
                                Use before any spatial reasoning or layout decision.
@@ -1904,7 +1963,8 @@ When user says "stop explaining" / "expert mode" / "just do it":
   "make a plan/plan it out"       → plan_production_path(object_name) — WAIT FOR APPROVAL
   "topology/loops/quads/critique" → critique_mesh(object_name)
   "what's wrong/check"            → analyze_mesh_for_unreal() (covers all systems)
-  "fix/clean/repair"              → describe plan → WAIT "yes/do it" → auto_repair_mesh()
+  "fix/clean/repair"              → snapshot_mesh_state() → describe plan → WAIT "yes/do it"
+                                    → auto_repair_mesh() → compare_mesh_state() → show delta
   "rig/weights/skinning/bones"    → analyze_rig_weights() then analyze_rig_skeleton()
   "bake/baking/normal map/AO"    → validate_bake_setup(low_poly, high_poly) FIRST
   "animation/coach/teach me anim" → animation_coach(name, focus=...)
@@ -1940,6 +2000,8 @@ NEVER:
   ✗ Delete user data
   ✗ Resolve a playbook conflict silently — surface it, ask for confirmation
   ✗ Execute a TD plan without presenting it first
+  ✗ Run auto_repair_mesh() without snapshot_mesh_state() first
+  ✗ Call compare_mesh_state() without a prior snapshot — it will error
 
 ── REPORT FORMAT ──────────────────────────────────────────────────────────────
 ── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
@@ -1960,9 +2022,17 @@ AI/SCAN ASSETS: Very high poly + irregular topology → state:
    Do not export in current state."
 
 SESSION MEMORY: Always call session_status() at start of each turn if context may exist.
+  Session is PERSISTED TO DISK — context survives MCP server restarts automatically.
+  session_status() returns persisted=true and session_file path when disk state exists.
   After confirming asset type or stage → session_update() immediately.
   Don't re-run tools unless scene changed or user requests. Cite earlier findings.
   Stage shift mid-session → state it: "Shifting to Stage 5 standards from here."
+
+SNAPSHOT / DIFF WORKFLOW — always use before destructive ops:
+  1. snapshot_mesh_state(object_name)   ← capture baseline
+  2. [repair / destructive operation]
+  3. compare_mesh_state(object_name)    ← show signed delta + IMPROVED/REGRESSED verdict
+  Never skip the snapshot step — without it compare_mesh_state will fail.
 """,
 )
 
@@ -2027,6 +2097,7 @@ def session_update(
     if td_mode is not None:
         _session_set(td_mode=td_mode)
 
+    _save_session()
     return json.dumps({"session_updated": True, "current_session": _SESSION}, indent=2)
 
 
@@ -2075,9 +2146,11 @@ def session_status() -> str:
         orientation = "No session context yet. Run screenshot → get_scene_info → get_object_info to orient."
 
     return json.dumps({
-        "has_context": has_context,
+        "has_context":        has_context,
         "orientation_summary": orientation,
-        "session": _SESSION,
+        "session":            _SESSION,
+        "persisted":          _SESSION_FILE.exists(),
+        "session_file":       str(_SESSION_FILE),
     }, indent=2)
 
 
@@ -2127,6 +2200,7 @@ def set_playbook(playbook: str) -> str:
     if not _session_get("asset_type"):
         _session_set(asset_type=TYPE_MAP.get(playbook, playbook))
 
+    _save_session()
     return json.dumps({
         "playbook_activated": playbook,
         "name":              pb["name"],
@@ -2168,6 +2242,201 @@ def list_playbooks() -> str:
         "active_playbook": active,
         "available_playbooks": summary,
         "how_to_activate": "Call set_playbook(playbook='hero_char') to activate a playbook.",
+    }, indent=2)
+
+
+@mcp.tool()
+def snapshot_mesh_state(object_name: str) -> str:
+    """
+    SNAPSHOT — Capture current mesh stats for an object as a baseline.
+
+    Stores vert count, face count, ngon count, non-manifold edges, topology
+    score, UV state, and problem counts in memory. Call before a repair pass
+    or any destructive operation so compare_mesh_state() can show the delta.
+
+    Snapshots are per-MCP-session only (not persisted to disk — mesh state
+    can change between Blender sessions and stale snapshots mislead).
+
+    Parameters:
+      object_name : Blender object name to snapshot
+    """
+    import datetime
+
+    blender = get_blender_connection()
+
+    # Pull mesh quality (counts, face_types, problems, uv)
+    raw_quality = blender.send_command("get_mesh_quality_report", {"name": object_name})
+    if isinstance(raw_quality, dict) and "error" in raw_quality:
+        return json.dumps({"error": f"get_mesh_quality_report failed: {raw_quality['error']}"})
+
+    # Pull topology score
+    raw_topo = blender.send_command("analyze_topology", {"name": object_name, "context": "generic"})
+    if isinstance(raw_topo, dict) and "error" in raw_topo:
+        return json.dumps({"error": f"analyze_topology failed: {raw_topo['error']}"})
+
+    # Extract from real schema keys (verified against _reason_mesh_quality / _reason_topology)
+    counts     = raw_quality.get("counts", {})
+    face_types = raw_quality.get("face_types", {})
+    problems   = raw_quality.get("problems", {})
+    uv         = raw_quality.get("uv", {})
+    topo_stats = raw_topo.get("stats", {})
+
+    snapshot = {
+        "_timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
+        "_object":          object_name,
+        "vert_count":       counts.get("verts", 0),
+        "edge_count":       counts.get("edges", 0),
+        "face_count":       counts.get("faces", 0),
+        "tris":             face_types.get("tris", 0),
+        "quads":            face_types.get("quads", 0),
+        "ngons":            face_types.get("ngons", 0),
+        "non_manifold":     problems.get("non_manifold_edges", 0),
+        "isolated_verts":   problems.get("isolated_verts", 0),
+        "zero_area_faces":  problems.get("zero_area_faces", 0),
+        "duplicate_faces":  problems.get("duplicate_faces", 0),
+        "uv_oob_loops":     uv.get("out_of_bounds_loops", 0),
+        "has_uvs":          uv.get("has_uvs", False),
+        "uv_layer_count":   uv.get("layer_count", 0),
+        "topology_score":   raw_topo.get("topology_score", 0),
+        "topology_rating":  raw_topo.get("rating", "unknown"),
+        "quad_ratio_pct":   topo_stats.get("quad_ratio_pct", 0.0),
+        "ngon_pct":         topo_stats.get("tris_pct", 0.0),  # tris_pct from stats
+    }
+
+    _SNAPSHOTS[object_name] = snapshot
+
+    return json.dumps({
+        "snapshot_taken":  True,
+        "object":          object_name,
+        "timestamp":       snapshot["_timestamp"],
+        "baseline": {
+            "verts":           snapshot["vert_count"],
+            "faces":           snapshot["face_count"],
+            "ngons":           snapshot["ngons"],
+            "non_manifold":    snapshot["non_manifold"],
+            "topology_score":  snapshot["topology_score"],
+            "topology_rating": snapshot["topology_rating"],
+            "has_uvs":         snapshot["has_uvs"],
+        },
+        "note": "Call compare_mesh_state(object_name) after your repair pass to see the delta.",
+    }, indent=2)
+
+
+@mcp.tool()
+def compare_mesh_state(object_name: str) -> str:
+    """
+    COMPARE — Diff current mesh state against the stored snapshot.
+
+    Runs a fresh analysis and shows the delta for every tracked stat:
+    vert count, face count, ngon count, non-manifold edges, topology score,
+    UV state. Each delta is signed (+/-) and tagged IMPROVED / REGRESSED / UNCHANGED.
+
+    Requires snapshot_mesh_state(object_name) to have been called first this session.
+
+    Parameters:
+      object_name : Blender object name to compare (must have a snapshot)
+    """
+    if object_name not in _SNAPSHOTS:
+        return json.dumps({
+            "error": f"No snapshot found for '{object_name}'. "
+                     f"Call snapshot_mesh_state('{object_name}') first.",
+            "available_snapshots": list(_SNAPSHOTS.keys()),
+        })
+
+    baseline = _SNAPSHOTS[object_name]
+    blender  = get_blender_connection()
+
+    # Fresh analysis — same calls as snapshot_mesh_state
+    raw_quality = blender.send_command("get_mesh_quality_report", {"name": object_name})
+    if isinstance(raw_quality, dict) and "error" in raw_quality:
+        return json.dumps({"error": f"get_mesh_quality_report failed: {raw_quality['error']}"})
+
+    raw_topo = blender.send_command("analyze_topology", {"name": object_name, "context": "generic"})
+    if isinstance(raw_topo, dict) and "error" in raw_topo:
+        return json.dumps({"error": f"analyze_topology failed: {raw_topo['error']}"})
+
+    counts     = raw_quality.get("counts", {})
+    face_types = raw_quality.get("face_types", {})
+    problems   = raw_quality.get("problems", {})
+    uv         = raw_quality.get("uv", {})
+    topo_stats = raw_topo.get("stats", {})
+
+    current = {
+        "vert_count":      counts.get("verts", 0),
+        "face_count":      counts.get("faces", 0),
+        "ngons":           face_types.get("ngons", 0),
+        "non_manifold":    problems.get("non_manifold_edges", 0),
+        "isolated_verts":  problems.get("isolated_verts", 0),
+        "zero_area_faces": problems.get("zero_area_faces", 0),
+        "duplicate_faces": problems.get("duplicate_faces", 0),
+        "uv_oob_loops":    uv.get("out_of_bounds_loops", 0),
+        "topology_score":  raw_topo.get("topology_score", 0),
+        "topology_rating": raw_topo.get("rating", "unknown"),
+        "quad_ratio_pct":  topo_stats.get("quad_ratio_pct", 0.0),
+    }
+
+    # For each numeric stat: lower is better for problems, higher is better for score/ratio
+    # higher_better: topology_score, quad_ratio_pct, vert_count (neutral — flag both directions)
+    lower_is_better = {
+        "ngons", "non_manifold", "isolated_verts",
+        "zero_area_faces", "duplicate_faces", "uv_oob_loops",
+    }
+    higher_is_better = {"topology_score", "quad_ratio_pct"}
+    neutral = {"vert_count", "face_count"}
+
+    deltas = {}
+    overall_improved = 0
+    overall_regressed = 0
+
+    for key in current:
+        if key == "topology_rating":
+            continue
+        b_val = baseline.get(key, 0)
+        c_val = current[key]
+        if not isinstance(b_val, (int, float)) or not isinstance(c_val, (int, float)):
+            continue
+        delta = c_val - b_val
+        if delta == 0:
+            status = "UNCHANGED"
+        elif key in lower_is_better:
+            status = "IMPROVED" if delta < 0 else "REGRESSED"
+            if delta < 0: overall_improved += 1
+            else:         overall_regressed += 1
+        elif key in higher_is_better:
+            status = "IMPROVED" if delta > 0 else "REGRESSED"
+            if delta > 0: overall_improved += 1
+            else:         overall_regressed += 1
+        else:  # neutral
+            status = "CHANGED"
+
+        deltas[key] = {
+            "before": b_val,
+            "after":  c_val,
+            "delta":  f"{'+' if delta > 0 else ''}{delta:.0f}" if isinstance(delta, float) and delta == int(delta)
+                      else f"{'+' if delta > 0 else ''}{delta:.1f}",
+            "status": status,
+        }
+
+    # Overall verdict
+    if overall_regressed == 0 and overall_improved > 0:
+        verdict = "PASS — mesh improved across the board"
+    elif overall_regressed > 0 and overall_improved > overall_regressed:
+        verdict = f"MIXED — {overall_improved} stat(s) improved, {overall_regressed} regressed"
+    elif overall_regressed > 0 and overall_improved == 0:
+        verdict = f"REGRESSED — {overall_regressed} stat(s) got worse, none improved"
+    else:
+        verdict = "UNCHANGED — no measurable difference"
+
+    return json.dumps({
+        "object":           object_name,
+        "snapshot_taken":   baseline["_timestamp"],
+        "verdict":          verdict,
+        "topology_rating":  f"{baseline.get('topology_rating','?')} → {current['topology_rating']}",
+        "deltas":           deltas,
+        "note": (
+            "Positive delta on problem counts (ngons, non_manifold, etc.) = REGRESSED. "
+            "Positive delta on topology_score = IMPROVED."
+        ),
     }, indent=2)
 
 
