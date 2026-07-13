@@ -198,6 +198,160 @@ def _session_append(key: str, value):
         lst.append(value)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION PLAYBOOKS — named workflows with asset-type-aware standards.
+# what_next, production_review, and plan_production_path all consult
+# the active playbook via _get_active_playbook().
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PLAYBOOKS: dict = {
+    "hero_char": {
+        "name":        "Hero Character",
+        "description": "Main playable or cinematic character. Held to the highest standards.",
+        "vert_budget": 80_000,
+        "face_budget": 80_000,
+        "uv_channels": 2,           # channel 0 = colour, channel 1 = lightmap
+        "material_limit": 3,        # strict draw-call discipline
+        "topology_score_min": 75,   # quad-dominant, joint loops required
+        "mandatory_checks": [
+            "analyze_mesh_for_unreal",
+            "analyze_rig_weights",
+            "analyze_rig_skeleton",
+            "run_unreal_readiness_check",
+            "analyze_material_pbr",
+        ],
+        "skip_checks": [],
+        "stage_standards": {
+            2: "Quad dominance >85% in ALL deformation zones. Edge loops at shoulder, elbow, knee, wrist. No poles in deformation areas.",
+            3: "Two UV channels required. Channel 1 lightmap must be non-overlapping 0–1. Normal map bake at 4K minimum.",
+            4: "Principled BSDF only. No procedural-only materials. Texture paths must resolve. Normal map Y-flip for UE5.",
+            5: "Max 4 influences per vertex preferred, hard limit 8. Root bone at world origin ±0.001. No orphan bones.",
+            6: "Scale applied (1,1,1). FBX axis: Y-forward, Z-up. LODs required at 50%/25%/12.5%.",
+        },
+        "gotchas": [
+            "Shoulder deformation: needs 3 loops minimum — axilla loop, clavicle loop, deltoid loop.",
+            "Knee/elbow: perpendicular loops to joint axis. Single loop = creasing on full bend.",
+            "UE5 import: do not apply Armature modifier before export — export with modifier live.",
+            "Root bone: must be at world origin. Even 0.1 unit offset causes animation drift.",
+            "Vertex count includes hidden geometry — check in viewport not Properties panel.",
+        ],
+    },
+
+    "creature": {
+        "name":        "Creature / Monster",
+        "description": "Non-human characters — animals, monsters, aliens. Similar rig standards to hero but topology priorities differ.",
+        "vert_budget": 60_000,
+        "face_budget": 60_000,
+        "uv_channels": 1,
+        "material_limit": 4,
+        "topology_score_min": 65,
+        "mandatory_checks": [
+            "analyze_mesh_for_unreal",
+            "analyze_rig_weights",
+            "analyze_rig_skeleton",
+            "run_unreal_readiness_check",
+        ],
+        "skip_checks": [],
+        "stage_standards": {
+            2: "Focus joint loops on creature-specific anatomy. Fins, tails, and wings need span loops for deformation.",
+            3: "UV layout: atlas or per-region. Fur/scale assets often use tiling textures — UV channel discipline critical.",
+            5: "Creature rigs often use non-standard bone naming. Verify UE5 retargeter compatibility before assuming names are correct.",
+        },
+        "gotchas": [
+            "Creature tails: need 2 edge loops per bone segment minimum for smooth arc deformation.",
+            "Fins and membranes: check for zero-area faces at thin areas — baking will show black patches.",
+            "Non-standard bone names: UE5 retargeting requires explicit mapping if not UE5 convention.",
+        ],
+    },
+
+    "weapon": {
+        "name":        "Weapon",
+        "description": "Hand-held or carried weapon. Hard surface, no rig (unless procedural animation). Strict budget.",
+        "vert_budget": 15_000,
+        "face_budget": 15_000,
+        "uv_channels": 1,
+        "material_limit": 2,
+        "topology_score_min": 60,
+        "mandatory_checks": [
+            "analyze_mesh_for_unreal",
+            "run_unreal_readiness_check",
+            "analyze_material_pbr",
+        ],
+        "skip_checks": ["analyze_rig_weights", "analyze_rig_skeleton"],
+        "stage_standards": {
+            2: "Hard-surface: beveled edges on silhouette. Tris acceptable in hidden/interior areas. No ngons on visible surfaces.",
+            3: "Single UV channel. 2K texture typical, 4K for hero-tier weapons. Texel density consistent across all surfaces.",
+            4: "Metal surfaces: metallic 0.8–1.0, roughness varies. Emissive for scopes/optics/energy weapons only.",
+            6: "Pivot at grip/handle base for correct in-hand positioning. Apply all transforms before export.",
+        },
+        "gotchas": [
+            "Pivot point: barrel should align with UE5 socket — wrong pivot = floating in player's hand.",
+            "Interior geometry: delete faces that are never visible. Silencers, stocks — check for unnecessary hidden geo.",
+            "Hard-surface UV: avoid UV islands smaller than 8x8 pixels at target texture resolution.",
+        ],
+    },
+
+    "env_prop": {
+        "name":        "Environment Prop",
+        "description": "Background/environment asset. Optimised for density and batching. LODs critical.",
+        "vert_budget": 20_000,
+        "face_budget": 20_000,
+        "uv_channels": 2,           # lightmap UV required
+        "material_limit": 1,        # single material preferred for batching
+        "topology_score_min": 50,   # lower bar — tris fine, ngons acceptable on flat surfaces
+        "mandatory_checks": [
+            "analyze_mesh_for_unreal",
+            "run_unreal_readiness_check",
+        ],
+        "skip_checks": ["analyze_rig_weights", "analyze_rig_skeleton", "critique_animation"],
+        "stage_standards": {
+            2: "Tris acceptable on flat/non-visible surfaces. Silhouette quality matters — profile edges should be clean.",
+            3: "Lightmap UV (channel 1) is mandatory for static props — no overlapping islands, no islands outside 0–1.",
+            4: "Single material preferred for instanced rendering performance. Texture atlas if multiple surface types.",
+            6: "LOD required: LOD0 full, LOD1 50%, LOD2 25%. Collision mesh separate (simple convex hulls).",
+        },
+        "gotchas": [
+            "Lightmap resolution: small props at 64px, medium at 128px, large at 256px. Mismatched = shadow bleeding.",
+            "Pivot at base center for floor props, geometric center for hanging/floating props.",
+            "Instanced static meshes: any variation must be a separate asset — do not rely on material parameters for variation.",
+        ],
+    },
+
+    "vehicle": {
+        "name":        "Vehicle",
+        "description": "Driveable or cinematically animated vehicle. Complex structure, strict draw-call discipline.",
+        "vert_budget": 60_000,
+        "face_budget": 60_000,
+        "uv_channels": 2,
+        "material_limit": 5,
+        "topology_score_min": 65,
+        "mandatory_checks": [
+            "analyze_mesh_for_unreal",
+            "run_unreal_readiness_check",
+            "analyze_material_pbr",
+        ],
+        "skip_checks": [],
+        "stage_standards": {
+            2: "Hard-surface: beveled panel edges. Tris inside wheel wells/undercarriage are fine. Silhouette must be clean.",
+            3: "Separate UV tiles per major region (body, interior, wheels) acceptable. Consistent texel density across exterior.",
+            4: "Vehicle glass: translucent material, two-sided, sorted after opaque. Interior faces need backface material.",
+            6: "Wheel bones must align with rotation axis exactly. Even 0.1 unit offset = visible tire wobble at speed.",
+        },
+        "gotchas": [
+            "Wheel pivot: must be exactly at wheel center — use 'Set Origin to Geometry' then manually verify axis alignment.",
+            "Vehicle glass: transparent surfaces sort after opaque in UE5 — test in engine, not in Blender.",
+            "Separate meshes for doors/hood/trunk if interactive. Do not bake moving parts into body mesh.",
+        ],
+    },
+}
+
+
+def _get_active_playbook() -> Optional[dict]:
+    """Return the active playbook dict, or None if none is set."""
+    key = _session_get("active_playbook")
+    return _PLAYBOOKS.get(key) if key else None
+
+
 def get_blender_connection() -> BlenderConnection:
     global _blender_connection
     if _blender_connection is not None and _blender_connection.sock is not None:
@@ -1869,6 +2023,96 @@ def session_status() -> str:
     }, indent=2)
 
 
+@mcp.tool()
+def set_playbook(playbook: str) -> str:
+    """
+    PRODUCTION PLAYBOOK — Activate a named workflow for this asset.
+
+    Sets the active playbook so what_next, production_review, and
+    plan_production_path all evaluate this asset against the right
+    standards, vertex budgets, mandatory checks, and known gotchas.
+
+    Available playbooks:
+      hero_char   — Main playable/cinematic character (80k vert limit, 2 UV channels,
+                    full rig QA, 3-material max, LODs required)
+      creature    — Non-human characters, animals, monsters (60k, creature rig notes)
+      weapon      — Hand-held weapons, hard surface, no rig (15k, 2-material max)
+      env_prop    — Background/environment prop (20k, single material, lightmap UV)
+      vehicle     — Driveable or cinematic vehicle (60k, wheel bone alignment notes)
+
+    After setting a playbook, what_next and production_review will:
+      - Apply this playbook's vertex budget in conflict checks
+      - Show playbook-specific gotchas relevant to the current stage
+      - Mark playbook-mandatory checks as required
+      - Skip checks that don't apply (e.g. rig QA on weapons)
+
+    Parameters:
+      playbook : one of "hero_char" | "creature" | "weapon" | "env_prop" | "vehicle"
+    """
+    if playbook not in _PLAYBOOKS:
+        available = ", ".join(_PLAYBOOKS.keys())
+        return json.dumps({
+            "error": f"Unknown playbook '{playbook}'. Available: {available}",
+        })
+
+    pb = _PLAYBOOKS[playbook]
+    _session_set(active_playbook=playbook)
+
+    # Derive asset_type from playbook if not already set
+    TYPE_MAP = {
+        "hero_char": "hero_character",
+        "creature":  "creature",
+        "weapon":    "weapon",
+        "env_prop":  "environment_prop",
+        "vehicle":   "vehicle",
+    }
+    if not _session_get("asset_type"):
+        _session_set(asset_type=TYPE_MAP.get(playbook, playbook))
+
+    return json.dumps({
+        "playbook_activated": playbook,
+        "name":              pb["name"],
+        "description":       pb["description"],
+        "vert_budget":       pb["vert_budget"],
+        "uv_channels":       pb["uv_channels"],
+        "material_limit":    pb["material_limit"],
+        "topology_score_min": pb["topology_score_min"],
+        "mandatory_checks":  pb["mandatory_checks"],
+        "skip_checks":       pb["skip_checks"],
+        "gotchas":           pb["gotchas"],
+        "note": (
+            f"Playbook '{pb['name']}' is now active. what_next, production_review, "
+            "and plan_production_path will use these standards. "
+            "Use session_status() to see full session context."
+        ),
+    }, indent=2)
+
+
+@mcp.tool()
+def list_playbooks() -> str:
+    """
+    LIST PLAYBOOKS — Show all available production playbooks with their key standards.
+
+    Use this when you need to know which playbook to activate, or when the user
+    asks what playbooks are available.
+    """
+    summary = {}
+    for key, pb in _PLAYBOOKS.items():
+        summary[key] = {
+            "name":        pb["name"],
+            "description": pb["description"],
+            "vert_budget": pb["vert_budget"],
+            "material_limit": pb["material_limit"],
+            "mandatory_checks": pb["mandatory_checks"],
+        }
+    active = _session_get("active_playbook")
+    return json.dumps({
+        "active_playbook": active,
+        "available_playbooks": summary,
+        "how_to_activate": "Call set_playbook(playbook='hero_char') to activate a playbook.",
+    }, indent=2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ORIGINAL LAYER (~22 commands) — unchanged from v2.1
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3164,7 +3408,38 @@ def what_next(object_name: str, context: str = "") -> str:
             blocking_ct = 0
             after_this  = "Proceed to the next stage requirement when ready."
 
-        return json.dumps({
+        # ── Playbook context ───────────────────────────────────────────────────
+        pb = _get_active_playbook()
+        playbook_block = None
+        playbook_conflicts = []
+        if pb:
+            pb_name = pb["name"]
+            pb_vert = pb["vert_budget"]
+            # Vertex budget conflict check — state it, don't resolve silently
+            if vertex_count > pb_vert:
+                ratio = vertex_count / pb_vert
+                playbook_conflicts.append(
+                    f"Vertex count ({vertex_count:,}) is {ratio:.1f}× the {pb_name} "
+                    f"budget ({pb_vert:,}). Is this intentional (cinematic tier) "
+                    f"or should the playbook be changed?"
+                )
+            # Stage-specific standard for current stage
+            stage_standard = pb.get("stage_standards", {}).get(stage_num, "")
+            # Gotchas (always surface — they're the ones that burn people)
+            playbook_block = {
+                "active_playbook":    pb_name,
+                "vert_budget":        pb_vert,
+                "mandatory_checks":   pb["mandatory_checks"],
+                "skip_checks":        pb["skip_checks"],
+                "stage_standard":     stage_standard,
+                "gotchas":            pb["gotchas"],
+            }
+
+        # ── Session context hint ───────────────────────────────────────────────
+        verified = _session_get("verified_checks") or []
+        open_iss = _session_get("open_issues") or []
+
+        result = {
             "object":          object_name,
             "assumed_context": assumed_context,
             "correct_me":      (
@@ -3193,7 +3468,17 @@ def what_next(object_name: str, context: str = "") -> str:
                 "nm_edges":       nm_edges,
                 "ngons":          ngon_count,
             },
-        }, indent=2, default=str)
+        }
+        if playbook_block:
+            result["playbook"] = playbook_block
+        if playbook_conflicts:
+            result["playbook_conflicts"] = playbook_conflicts
+        if verified:
+            result["session_verified_checks"] = verified
+        if open_iss:
+            result["session_open_issues"] = open_iss
+
+        return json.dumps(result, indent=2, default=str)
 
     except Exception as e:
         logger.error(f"Error in what_next: {e}")
