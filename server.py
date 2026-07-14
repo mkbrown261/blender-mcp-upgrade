@@ -10446,6 +10446,29 @@ def _compress_manifest_vocab(manifest: dict, scene_asset_names: list[str]) -> st
     return "\n".join(lines)
 
 
+def _get_blend_dir() -> Optional[Path]:
+    """
+    Directory of the currently open .blend file, or None if unsaved/unavailable.
+    get_scene_info's schema has no "filepath" key — query bpy.data.filepath
+    directly via execute_code_safe instead.
+    """
+    raw = _send_raw(
+        "execute_code_safe",
+        code="import bpy, json\nprint(json.dumps({'filepath': bpy.data.filepath}))",
+        required_mode=None,
+        push_undo=False,
+    )
+    output = raw.get("result", "") if isinstance(raw, dict) else ""
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            blend_path = json.loads(line).get("filepath", "")
+            if blend_path and blend_path != "//":
+                return Path(blend_path).parent
+            break
+    return None
+
+
 def _find_manifest(hint_path: str = "") -> str:
     """
     Locate the user's world manifest JSON. Search order:
@@ -10462,25 +10485,10 @@ def _find_manifest(hint_path: str = "") -> str:
     if hint_path:
         candidates.append(Path(hint_path))
 
-    # 2. Directory of the open .blend file — ask Blender directly.
-    # get_scene_info's real schema has no "filepath" key (it's name/object_count/
-    # objects/materials_count only) — query bpy.data.filepath directly instead.
+    # 2. Directory of the open .blend file
     try:
-        raw = _send_raw(
-            "execute_code_safe",
-            code="import bpy, json\nprint(json.dumps({'filepath': bpy.data.filepath}))",
-            required_mode=None,
-            push_undo=False,
-        )
-        output = raw.get("result", "") if isinstance(raw, dict) else ""
-        blend_path = ""
-        for line in output.strip().splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                blend_path = json.loads(line).get("filepath", "")
-                break
-        if blend_path and blend_path != "//":
-            blend_dir = Path(blend_path).parent
+        blend_dir = _get_blend_dir()
+        if blend_dir:
             candidates.append(blend_dir / "ERYNDOR_master_manifest.json")
             # Also support any *_master_manifest.json in that dir
             for p in blend_dir.glob("*_master_manifest.json"):
@@ -10504,20 +10512,18 @@ def _find_manifest(hint_path: str = "") -> str:
 @mcp.tool()
 def load_manifest(manifest_path: str = "") -> str:
     """
-    Load the ERYNDOR master asset manifest and report what's in it.
-    Auto-discovers manifest next to server.py if no path given.
+    Load the world asset manifest and report what's in it.
+    Auto-discovers *_master_manifest.json next to the currently open .blend
+    file (or CWD) if no path given — never next to server.py.
     Call this first in any construction session to confirm manifest is readable.
     Returns: asset count, world name, scale reference, list of all known assets.
     """
     path = _find_manifest(manifest_path)
     if not path:
         return json.dumps({
-            "error": "ERYNDOR_master_manifest.json not found",
-            "searched": [
-                str(Path(__file__).parent / "ERYNDOR_master_manifest.json"),
-                str(Path.cwd() / "ERYNDOR_master_manifest.json"),
-            ],
-            "fix": "Place ERYNDOR_master_manifest.json next to server.py, or pass manifest_path explicitly."
+            "error": "*_master_manifest.json not found",
+            "searched": "directory of the currently open .blend file, then current working directory",
+            "fix": "Place a *_master_manifest.json next to your .blend file, or pass manifest_path explicitly."
         }, indent=2)
     manifest = _load_manifest(path)
     assets = manifest.get("assets", {})
@@ -10560,8 +10566,11 @@ def add_asset_to_manifest(
     """
     path = _find_manifest(manifest_path)
     if not path:
-        # Create next to server.py if it doesn't exist yet
-        path = str(Path(__file__).parent / "ERYNDOR_master_manifest.json")
+        # Create next to the open .blend file if it doesn't exist yet — NEVER
+        # next to server.py, that's the shared repo, not the user's project.
+        blend_dir = _get_blend_dir()
+        base_dir = blend_dir if blend_dir else Path.cwd()
+        path = str(base_dir / "ERYNDOR_master_manifest.json")
 
     if Path(path).exists():
         with open(path, "r", encoding="utf-8") as f:
