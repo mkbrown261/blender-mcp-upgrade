@@ -173,6 +173,8 @@ _SESSION: dict = {
     "apprentice_mode": False,
     # TD mode — when True, plan_production_path prepends a 5-step plan to every run
     "td_mode": False,
+    # Multiview capture metadata — images are NOT persisted, only this record
+    "multiview": None,   # None or dict: {object, timestamp, views_captured, wireframe_set, capture_stale}
 }
 
 
@@ -212,6 +214,7 @@ _SESSION_PERSIST_KEYS = [
     "asset_type", "active_playbook", "confirmed_stage", "active_object",
     "verified_checks", "open_issues", "user_corrections", "surfaced_conflicts",
     "apprentice_mode", "td_mode",
+    "multiview",   # metadata only — no image bytes, safe to persist
 ]
 
 
@@ -1868,6 +1871,11 @@ Then deliver ONE orientation sentence:
    Correct me if wrong — awaiting direction."
 STOP. Wait for user. Do not auto-run further tools.
 
+MULTIVIEW: When user asks for deep analysis, topology review, or spatial reasoning:
+  → get_multiview_capture(object_name) immediately after session start.
+  Check session multiview.capture_stale — if True, re-capture before reasoning.
+  7 views = complete geometry visibility. No excuses for missing occluded topology.
+
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
 TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   session_status               read session context before starting any work
@@ -1882,6 +1890,11 @@ TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
                                animation principles. Apprentice lessons if apprentice_mode=True.
   session_update               record confirmed facts: asset_type, stage, verified checks, issues
+  get_multiview_capture        VISION: 7-angle capture (front/back/left/right/top/bottom/persp).
+                               Gives complete spatial visibility — no hidden geometry, no depth
+                               ambiguity. Use before ANY topology or spatial analysis.
+                               include_wireframe=True adds 7 wireframe views (topology as lines).
+                               Session stores metadata; capture_stale=True after any repair.
   snapshot_mesh_state          SNAPSHOT: capture vert/face/ngon/topology baseline before any repair.
                                Call before auto_repair_mesh or any destructive op.
   compare_mesh_state           DIFF: compare current mesh against snapshot — signed deltas,
@@ -1976,6 +1989,10 @@ When user says "stop explaining" / "expert mode" / "just do it":
   "this is a weapon/hero/prop"    → set_playbook() + session_update(asset_type=...) first
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → gap report
+  "scan/full view/see the mesh/deep analysis/topology review"
+                                  → get_multiview_capture(object_name) — 7 angles, complete visibility
+  "show me the wireframe/topology lines/edge flow"
+                                  → get_multiview_capture(object_name, include_wireframe=True)
   "where is / what's near / layout / spatial / scene graph"
                                   → get_scene_graph() then describe_object_context(name)
   "what's floating/intersecting/isolated/in radius/supporting"
@@ -2007,6 +2024,9 @@ NEVER:
   ✗ Execute a TD plan without presenting it first
   ✗ Run auto_repair_mesh() without snapshot_mesh_state() first
   ✗ Call compare_mesh_state() without a prior snapshot — it will error
+  ✗ Reason about topology or spatial placement from a single screenshot alone
+     when multiview is available — get_multiview_capture gives 7 angles
+  ✗ Trust a stale multiview capture after repairs — check capture_stale in session
 
 ── REPORT FORMAT ──────────────────────────────────────────────────────────────
 ── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
@@ -2596,6 +2616,271 @@ else:
     except Exception as e:
         logger.error(f"Error in close_boundary_holes: {e}")
         return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_multiview_capture(object_name: str, include_wireframe: bool = False) -> list:
+    """
+    MULTIVIEW CAPTURE — Render 7 viewport shots of an object (front, back, left,
+    right, top, bottom, perspective) and return them all as images.
+
+    This gives Claude complete spatial visibility: every face, every silhouette,
+    every occluded surface. No geometry is hidden. Use this before any analysis
+    that depends on understanding the object's 3D shape — topology review,
+    spatial reasoning, deformation assessment.
+
+    If include_wireframe=True, captures a second set of 7 views in wireframe
+    shading mode so topology (edge loops, poles, ngons) is directly visible
+    as lines rather than inferred from stats.
+
+    Saves view metadata to session (object, timestamp, stale flag). Images are
+    NOT persisted to disk — they live in Claude's context window for this turn.
+    Call again if the mesh has been repaired or modified (session will show
+    capture_stale=True when that happens).
+
+    Parameters:
+      object_name      : Blender object name to frame and capture
+      include_wireframe: also capture 7 wireframe views (topology visible as lines)
+
+    Returns list of Image objects: 7 solid views [+ 7 wireframe views if requested].
+    """
+    import datetime, tempfile, os
+
+    blender = get_blender_connection()
+
+    # The 6 orthographic axes + 1 perspective.
+    # view_axis type enum: FRONT|BACK|LEFT|RIGHT|TOP|BOTTOM
+    # Perspective is handled separately via region_3d.view_perspective property.
+    ORTHO_VIEWS = ["FRONT", "BACK", "LEFT", "RIGHT", "TOP", "BOTTOM"]
+
+    # Script: set up one view, frame the object, return viewport state confirmation.
+    # Runs for each view axis. Screenshot is taken by the Python side using the
+    # existing screenshot_area pattern from get_viewport_screenshot.
+    #
+    # IMPORTANT context rules (confirmed from addon.py analysis):
+    #   view_axis   → needs area + region (WINDOW) in temp_override
+    #   view_selected → same family, same requirement
+    #   screenshot_area → needs area only (no region)
+    #   All three operators must find the VIEW_3D area explicitly.
+
+    def _make_view_script(axis: str, obj_name: str) -> str:
+        """Generate Blender Python to set view axis and frame the named object."""
+        if axis == "PERSP":
+            # Perspective: don't call view_axis, just set perspective mode + frame
+            return f"""
+import bpy, json
+scene = bpy.context.scene
+obj   = bpy.data.objects.get({repr(obj_name)})
+result = {{"ok": False, "error": None}}
+if obj is None:
+    result["error"] = "Object not found: {obj_name}"
+else:
+    area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+    if area is None:
+        result["error"] = "No VIEW_3D area found"
+    else:
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region is None:
+            result["error"] = "No WINDOW region in VIEW_3D area"
+        else:
+            space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+            if space:
+                space.region_3d.view_perspective = 'PERSP'
+            bpy.context.view_layer.objects.active = obj
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.view3d.view_selected()
+            result["ok"] = True
+print(__import__('json').dumps(result))
+"""
+        else:
+            return f"""
+import bpy, json
+scene = bpy.context.scene
+obj   = bpy.data.objects.get({repr(obj_name)})
+result = {{"ok": False, "error": None}}
+if obj is None:
+    result["error"] = "Object not found: {obj_name}"
+else:
+    area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+    if area is None:
+        result["error"] = "No VIEW_3D area found"
+    else:
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region is None:
+            result["error"] = "No WINDOW region in VIEW_3D area"
+        else:
+            bpy.context.view_layer.objects.active = obj
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.view3d.view_axis(type={repr(axis)}, align_active=False)
+                bpy.ops.view3d.view_selected()
+            result["ok"] = True
+print(__import__('json').dumps(result))
+"""
+
+    def _make_shading_script(shading_type: str) -> str:
+        """Set viewport shading mode. Returns space.shading.type before change."""
+        return f"""
+import bpy, json
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+if area:
+    space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+    if space:
+        prev = space.shading.type
+        space.shading.type = {repr(shading_type)}
+        print(__import__('json').dumps({{"ok": True, "previous_shading": prev}}))
+    else:
+        print(__import__('json').dumps({{"ok": False, "error": "No VIEW_3D space"}}))
+else:
+    print(__import__('json').dumps({{"ok": False, "error": "No VIEW_3D area"}}))
+"""
+
+    def _take_screenshot() -> bytes:
+        """Take a screenshot using the same pattern as get_viewport_screenshot."""
+        temp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"blender_mv_{os.getpid()}_{id(object())}.png"
+        )
+        result = blender.send_command(
+            "get_viewport_screenshot",
+            {"max_size": 900, "filepath": temp_path, "format": "png"}
+        )
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(f"Screenshot failed: {result['error']}")
+        if not os.path.exists(temp_path):
+            raise RuntimeError("Screenshot file not created")
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return data
+
+    # ── Save current view state ────────────────────────────────────────────
+    save_script = """
+import bpy, json
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+if area:
+    space  = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+    r3d    = space.region_3d if space else None
+    result = {
+        "shading":     space.shading.type if space else "SOLID",
+        "perspective": r3d.view_perspective if r3d else "PERSP",
+        "view_distance": r3d.view_distance if r3d else 10.0,
+    }
+else:
+    result = {"shading": "SOLID", "perspective": "PERSP", "view_distance": 10.0}
+print(__import__('json').dumps(result))
+"""
+    save_raw = blender.send_command("execute_code_safe", {
+        "code": save_script, "required_mode": "OBJECT", "push_undo": False
+    })
+    saved_state = {"shading": "SOLID", "perspective": "PERSP"}
+    if isinstance(save_raw, dict):
+        output = save_raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    saved_state = json.loads(line)
+                except Exception:
+                    pass
+                break
+
+    # ── Capture loop ───────────────────────────────────────────────────────
+    all_views  = ORTHO_VIEWS + ["PERSP"]
+    images_out = []   # list of Image objects
+    view_errors = []
+
+    def _capture_pass(shading_label: str) -> None:
+        """Run all 7 views in the current shading mode, append Image objects."""
+        for axis in all_views:
+            script = _make_view_script(axis, object_name)
+            raw = blender.send_command("execute_code_safe", {
+                "code": script, "required_mode": "OBJECT", "push_undo": False
+            })
+            # Check for view-set error
+            ok = True
+            if isinstance(raw, dict):
+                output = raw.get("result", "")
+                for line in output.strip().splitlines():
+                    line = line.strip()
+                    if line.startswith("{"):
+                        try:
+                            parsed = json.loads(line)
+                            if not parsed.get("ok"):
+                                view_errors.append(
+                                    f"{shading_label}/{axis}: {parsed.get('error','unknown')}"
+                                )
+                                ok = False
+                        except Exception:
+                            pass
+                        break
+            if not ok:
+                continue
+            try:
+                img_bytes = _take_screenshot()
+                images_out.append(Image(data=img_bytes, format="png"))
+            except RuntimeError as e:
+                view_errors.append(f"{shading_label}/{axis} screenshot: {e}")
+
+    # Solid pass
+    _capture_pass("SOLID")
+
+    # Wireframe pass (if requested)
+    if include_wireframe:
+        set_raw = blender.send_command("execute_code_safe", {
+            "code": _make_shading_script("WIREFRAME"),
+            "required_mode": "OBJECT", "push_undo": False
+        })
+        _capture_pass("WIREFRAME")
+
+    # ── Restore shading ────────────────────────────────────────────────────
+    restore_shading = saved_state.get("shading", "SOLID")
+    blender.send_command("execute_code_safe", {
+        "code": _make_shading_script(restore_shading),
+        "required_mode": "OBJECT", "push_undo": False
+    })
+
+    # ── Store metadata in session ──────────────────────────────────────────
+    import datetime
+    mv_meta = {
+        "object":         object_name,
+        "timestamp":      datetime.datetime.now().isoformat(timespec="seconds"),
+        "views_captured": all_views,
+        "wireframe_set":  include_wireframe,
+        "capture_stale":  False,
+        "view_errors":    view_errors,
+        "image_count":    len(images_out),
+    }
+    _session_set(multiview=mv_meta)
+    _save_session()
+
+    # ── Build return: images first, then a metadata summary image-list entry ──
+    # MCP tool returning a list — images + a trailing JSON summary as text
+    # so Claude can read capture metadata alongside the images.
+    summary = {
+        "multiview_capture": "complete",
+        "object":            object_name,
+        "images_returned":   len(images_out),
+        "views":             all_views,
+        "wireframe_included": include_wireframe,
+        "view_errors":       view_errors,
+        "note": (
+            "Images are ordered: FRONT, BACK, LEFT, RIGHT, TOP, BOTTOM, PERSP"
+            + (", then WIREFRAME same order" if include_wireframe else "")
+            + ". Reason across all views before forming any spatial conclusion."
+        ),
+    }
+    # Return images followed by the JSON summary encoded as a final image-wrapper.
+    # FastMCP handles list returns — each Image in the list becomes a separate
+    # image content block; we append the metadata as a plain string via a hack-free
+    # approach: store it on the session (already done above) and include it in
+    # the last element description by returning it as the tool's string result
+    # alongside the images. Since FastMCP @mcp.tool() with list return sends
+    # each element, we return images + summary dict serialised to a final entry.
+    images_out.append(summary)   # FastMCP will serialise non-Image as text content
+    return images_out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3511,6 +3796,14 @@ if obj:
         status = "success" if repairs_executed and not repair_errors and not repairs_no_effect and not remaining_critical else (
             "partial" if (repairs_executed or repairs_no_effect) else "failed"
         )
+
+        # Mark multiview capture stale — mesh geometry has changed
+        if status in ("success", "partial"):
+            mv = _session_get("multiview")
+            if isinstance(mv, dict):
+                mv["capture_stale"] = True
+                _session_set(multiview=mv)
+                _save_session()
 
         return json.dumps({
             "object": name,
