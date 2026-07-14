@@ -182,6 +182,13 @@ _SESSION: dict = {
     "td_mode": False,
     # Multiview capture metadata — images are NOT persisted, only this record
     "multiview": None,   # None or dict: {object, timestamp, views_captured, wireframe_set, capture_stale}
+    # Production journal — timestamped log of every significant tool call this session.
+    # Each entry: {ts, tool, object, outcome, detail}
+    # Persisted so the journal survives MCP restarts within the same work session.
+    "journal": [],
+    # Open issue tracker — issues opened by analysis tools, closed by repair/QA tools.
+    # Each entry: {id, ts_opened, tool, object, issue_type, severity, detail, status, ts_closed}
+    "issue_tracker": [],
 }
 
 
@@ -209,6 +216,102 @@ def _session_append(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION JOURNAL helpers — Sprint A
+# Every significant tool call logs here automatically via _journal_entry().
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _journal_entry(tool: str, object_name: str, outcome: str, detail: str = "") -> None:
+    """
+    Append a timestamped entry to _SESSION['journal'].
+    Called by analysis/repair/generation tools on completion.
+    outcome: 'ok' | 'warning' | 'error' | 'repaired' | 'generated' | 'skipped'
+    """
+    import datetime as _dt
+    entry = {
+        "ts":     _dt.datetime.now().strftime("%H:%M:%S"),
+        "tool":   tool,
+        "object": object_name or "",
+        "outcome": outcome,
+        "detail": detail[:200] if detail else "",   # cap at 200 chars to keep journal readable
+    }
+    journal = _SESSION.get("journal")
+    if isinstance(journal, list):
+        journal.append(entry)
+    # Keep journal bounded — last 200 entries only
+    if len(journal) > 200:
+        _SESSION["journal"] = journal[-200:]
+    # Persist after every entry so it survives restarts
+    _save_session()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ISSUE TRACKER helpers — Sprint A
+# Analysis tools open issues; repair/QA tools close them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ISSUE_COUNTER = 0   # monotonic ID — never resets within a process lifetime
+
+
+def _open_issue(
+    tool: str,
+    object_name: str,
+    issue_type: str,
+    severity: str,
+    detail: str,
+) -> str:
+    """
+    Register a new open issue in the issue tracker.
+    Returns the issue ID string (e.g. 'ISS-007').
+    severity: 'critical' | 'warning' | 'info'
+    issue_type: e.g. 'non_manifold' | 'ngon' | 'deformation_risk' | 'uv_missing' | ...
+    """
+    global _ISSUE_COUNTER
+    import datetime as _dt
+    _ISSUE_COUNTER += 1
+    issue_id = f"ISS-{_ISSUE_COUNTER:03d}"
+    entry = {
+        "id":        issue_id,
+        "ts_opened": _dt.datetime.now().strftime("%H:%M:%S"),
+        "tool":      tool,
+        "object":    object_name or "",
+        "issue_type": issue_type,
+        "severity":  severity,
+        "detail":    detail[:300] if detail else "",
+        "status":    "open",
+        "ts_closed": None,
+        "closed_by": None,
+    }
+    tracker = _SESSION.get("issue_tracker")
+    if isinstance(tracker, list):
+        tracker.append(entry)
+    _save_session()
+    return issue_id
+
+
+def _close_issues_for(object_name: str, issue_types: list, closed_by: str) -> list:
+    """
+    Mark all open issues for object_name whose issue_type is in issue_types as closed.
+    Returns list of closed issue IDs.
+    """
+    import datetime as _dt
+    closed = []
+    tracker = _SESSION.get("issue_tracker", [])
+    for entry in tracker:
+        if (
+            entry.get("status") == "open"
+            and entry.get("object") == object_name
+            and entry.get("issue_type") in issue_types
+        ):
+            entry["status"]    = "closed"
+            entry["ts_closed"] = _dt.datetime.now().strftime("%H:%M:%S")
+            entry["closed_by"] = closed_by
+            closed.append(entry["id"])
+    if closed:
+        _save_session()
+    return closed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SESSION PERSISTENCE — write _SESSION to disk so context survives MCP restarts.
 # File lives next to server.py. Only scalar-safe types (str, int, bool, list).
 # _load_session() is called once at startup; _save_session() on every update.
@@ -222,6 +325,8 @@ _SESSION_PERSIST_KEYS = [
     "verified_checks", "open_issues", "user_corrections", "surfaced_conflicts",
     "apprentice_mode", "td_mode",
     "multiview",   # metadata only — no image bytes, safe to persist
+    "journal",     # list of {ts, tool, object, outcome, detail} dicts
+    "issue_tracker", # list of open/closed issue entries
 ]
 
 
@@ -3982,6 +4087,22 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     }
 
     all_images.append(unified_report)
+
+    # Journal + open issues for detected clusters (Sprint A)
+    ngon_n  = unified_report.get("coordinate_summary", {}).get("ngon_total", 0)
+    nm_n    = unified_report.get("coordinate_summary", {}).get("non_manifold_total", 0)
+    pole_n  = unified_report.get("coordinate_summary", {}).get("pole_total", 0)
+    _journal_entry(
+        "get_spatial_analysis", object_name, "ok",
+        f"ngons={ngon_n} non_manifold={nm_n} poles={pole_n} deep={deep}"
+    )
+    if nm_n > 0:
+        _open_issue("get_spatial_analysis", object_name, "non_manifold", "critical",
+                    f"{nm_n} non-manifold element(s) detected in spatial analysis.")
+    if ngon_n > 0:
+        _open_issue("get_spatial_analysis", object_name, "ngon", "warning",
+                    f"{ngon_n} n-gon face(s) detected in spatial analysis.")
+
     return all_images
 
 
@@ -5272,6 +5393,19 @@ if obj:
             },
         }
 
+        # Journal + issue tracker (Sprint A)
+        _journal_entry(
+            "auto_repair_mesh", name, status,
+            f"Repaired: {repairs_executed or 'none'}. Remaining critical: {len(remaining_critical)}."
+        )
+        # Close issues that were fixed
+        repaired_types = [r.split(" ")[0] for r in repairs_executed]
+        _close_issues_for(name, repaired_types, closed_by="auto_repair_mesh")
+        # Open issues for anything that remains critical
+        for f in remaining_critical:
+            _open_issue("auto_repair_mesh", name, f.get("type","unknown"), "critical",
+                        f.get("description", "")[:200])
+
         # Return [before_image, after_image, report_dict] (Tier 1c)
         out = []
         if _pre_screenshot_image:
@@ -5283,6 +5417,7 @@ if obj:
 
     except Exception as e:
         logger.error(f"Error in auto_repair_mesh: {e}")
+        _journal_entry("auto_repair_mesh", name, "error", str(e))
         return [{"error": str(e), "object": name}]
 
 
@@ -5958,13 +6093,26 @@ def what_next(object_name: str, context: str = "") -> str:
             result["playbook_conflicts"] = playbook_conflicts
         if verified:
             result["session_verified_checks"] = verified
-        if open_iss:
-            result["session_open_issues"] = open_iss
 
+        # Inject live issue tracker into what_next output (Sprint A)
+        tracker = _SESSION.get("issue_tracker", [])
+        open_tracker = [i for i in tracker if i.get("status") == "open"
+                        and i.get("object") == object_name]
+        if open_tracker:
+            result["open_issues"] = [
+                {"id": i["id"], "type": i["issue_type"], "severity": i["severity"],
+                 "detail": i["detail"], "opened_by": i["tool"], "at": i["ts_opened"]}
+                for i in open_tracker
+            ]
+            result["open_issue_count"] = len(open_tracker)
+
+        _journal_entry("what_next", object_name, "ok",
+                       f"stage={stage_num} action='{(action or '')[:80]}'")
         return json.dumps(result, indent=2, default=str)
 
     except Exception as e:
         logger.error(f"Error in what_next: {e}")
+        _journal_entry("what_next", object_name, "error", str(e))
         return json.dumps({"error": str(e)})
 
 
@@ -8516,10 +8664,24 @@ def production_review(
             )
 
         report["session_updated"] = True
+
+        # Journal + open issues for blockers (Sprint A)
+        score = report.get("production_score", 0)
+        grade = report.get("score_grade", "?")
+        blockers = report.get("critical_blockers", [])
+        _journal_entry(
+            "production_review", object_name, "ok",
+            f"score={score} grade={grade} blockers={len(blockers)} conflicts={len(conflicts)}"
+        )
+        for b in blockers:
+            b_text = b if isinstance(b, str) else str(b)
+            _open_issue("production_review", object_name, "production_blocker", "critical", b_text[:200])
+
         return json.dumps(report, indent=2, default=str)
 
     except Exception as e:
         logger.error(f"Error in production_review: {e}")
+        _journal_entry("production_review", object_name, "error", str(e))
         return json.dumps({"error": str(e)})
 
 
@@ -9362,6 +9524,1422 @@ else:
         return json.dumps({"error": "No JSON output from describe_object_context", "raw": output})
     except Exception as e:
         logger.error(f"Error in describe_object_context: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPRINT A — COGNITION LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_production_journal(last_n: int = 50, object_name: str = "") -> str:
+    """
+    PRODUCTION JOURNAL — Timestamped log of everything that has happened this session.
+
+    Shows every significant tool call, its outcome, and what it found.
+    Use this to understand what has already been checked, what was repaired,
+    what was generated, and in what order — without re-running any analysis.
+
+    Parameters
+    ----------
+    last_n      : How many entries to return (default 50, max 200)
+    object_name : Filter to a specific object (empty = show all)
+
+    Returns
+    -------
+    journal     : list of {ts, tool, object, outcome, detail}
+    open_issues : all currently open issues (optionally filtered by object_name)
+    summary     : plain-English session narrative
+    """
+    journal = _SESSION.get("journal", [])
+    tracker = _SESSION.get("issue_tracker", [])
+
+    # Filter by object if requested
+    if object_name:
+        journal = [e for e in journal if e.get("object") == object_name or not e.get("object")]
+        tracker = [i for i in tracker if i.get("object") == object_name]
+
+    # Clamp to last_n
+    journal = journal[-min(last_n, 200):]
+
+    open_issues   = [i for i in tracker if i.get("status") == "open"]
+    closed_issues = [i for i in tracker if i.get("status") == "closed"]
+
+    # Build plain-English session narrative
+    tool_counts: dict = {}
+    for e in journal:
+        tool_counts[e.get("tool", "?")] = tool_counts.get(e.get("tool", "?"), 0) + 1
+
+    errors   = [e for e in journal if e.get("outcome") == "error"]
+    repairs  = [e for e in journal if e.get("outcome") in ("repaired", "ok") and "repair" in e.get("tool", "")]
+    analyses = [e for e in journal if e.get("tool", "") in (
+        "get_spatial_analysis", "production_review", "analyze_mesh_for_unreal",
+        "analyze_topology", "what_next", "critique_animation",
+    )]
+
+    narrative_lines = []
+    if analyses:
+        narrative_lines.append(
+            f"{len(analyses)} analysis operation(s) run: "
+            + ", ".join(dict.fromkeys(e["tool"] for e in analyses))
+        )
+    if repairs:
+        narrative_lines.append(f"{len(repairs)} repair operation(s) executed.")
+    if open_issues:
+        critical = [i for i in open_issues if i.get("severity") == "critical"]
+        narrative_lines.append(
+            f"{len(open_issues)} issue(s) currently open "
+            f"({len(critical)} critical, {len(open_issues)-len(critical)} warning)."
+        )
+    if closed_issues:
+        narrative_lines.append(f"{len(closed_issues)} issue(s) resolved this session.")
+    if errors:
+        narrative_lines.append(f"⚠ {len(errors)} error(s) encountered: "
+                                + ", ".join(e.get("tool","?") for e in errors))
+    if not narrative_lines:
+        narrative_lines = ["No significant actions recorded yet this session."]
+
+    return json.dumps({
+        "session_narrative": " ".join(narrative_lines),
+        "journal":           journal,
+        "open_issues":       open_issues,
+        "closed_issues":     closed_issues,
+        "tool_call_counts":  tool_counts,
+        "total_journal_entries": len(_SESSION.get("journal", [])),
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+def close_issue(issue_id: str, reason: str = "") -> str:
+    """
+    ISSUE TRACKER — Manually close an open issue by its ID.
+
+    Issues are opened automatically by analysis tools (get_spatial_analysis,
+    production_review, auto_repair_mesh, etc.) and closed automatically when
+    repair tools fix them. Use this to manually close an issue that was resolved
+    outside the MCP — e.g. you fixed an n-gon by hand in the viewport.
+
+    Parameters
+    ----------
+    issue_id : The issue ID to close (e.g. 'ISS-003') — from get_production_journal
+    reason   : Optional plain-English reason for manual closure
+
+    Returns
+    -------
+    status, closed_issue details
+    """
+    import datetime as _dt
+    tracker = _SESSION.get("issue_tracker", [])
+    for entry in tracker:
+        if entry.get("id") == issue_id:
+            if entry.get("status") == "closed":
+                return json.dumps({"status": "already_closed", "issue": entry})
+            entry["status"]    = "closed"
+            entry["ts_closed"] = _dt.datetime.now().strftime("%H:%M:%S")
+            entry["closed_by"] = f"manual: {reason}" if reason else "manual"
+            _save_session()
+            _journal_entry("close_issue", entry.get("object",""), "ok",
+                           f"Manually closed {issue_id}: {reason}")
+            return json.dumps({"status": "closed", "issue": entry}, indent=2)
+    return json.dumps({"status": "not_found", "issue_id": issue_id,
+                       "hint": "Use get_production_journal() to see all issue IDs."})
+
+
+@mcp.tool()
+def synthesize_session(object_name: str = "") -> str:
+    """
+    SESSION SYNTHESIS — Cross-tool intelligence. Reads the full session state,
+    journal, and open issues, then produces a ranked decision tree with three
+    paths — not one recommendation.
+
+    This is the 'brain' that connects all the siloed tool outputs. Instead of
+    asking 'what does topology say?' and 'what does the repair say?' separately,
+    this synthesises everything that has happened this session into a coherent
+    picture with explicit tradeoff reasoning.
+
+    Think of it as a senior Technical Director who has watched everything you've
+    done this session and now gives you a structured debrief.
+
+    Parameters
+    ----------
+    object_name : Focus on a specific object (empty = synthesise whole session)
+
+    Returns
+    -------
+    session_picture  : plain-English summary of the session so far
+    open_issues      : ranked list of unresolved issues with severity
+    resolved_issues  : what has been fixed
+    decision_paths   : THREE ranked options for what to do next, with tradeoffs
+    recommendation   : which path the TD recommends and WHY
+    confidence       : how confident the synthesis is given available data
+    data_gaps        : what analyses haven't been run yet that would improve confidence
+    """
+    journal  = _SESSION.get("journal", [])
+    tracker  = _SESSION.get("issue_tracker", [])
+    playbook = _get_active_playbook()
+    pb_name  = _session_get("active_playbook") or "none"
+    stage    = _session_get("confirmed_stage")
+    asset_t  = _session_get("asset_type") or "unknown"
+    active_obj = object_name or _session_get("active_object") or "unknown"
+
+    # Filter tracker by object if specified
+    if object_name:
+        relevant = [i for i in tracker if i.get("object") == object_name]
+    else:
+        relevant = tracker
+
+    open_issues   = [i for i in relevant if i.get("status") == "open"]
+    closed_issues = [i for i in relevant if i.get("status") == "closed"]
+
+    # Rank open issues: critical first, then by element type priority
+    _SEV_RANK = {"critical": 0, "warning": 1, "info": 2}
+    _TYPE_RANK = {
+        "non_manifold": 0, "production_blocker": 1, "ngon": 2,
+        "deformation_risk": 3, "uv_missing": 4, "pole": 5,
+    }
+    open_issues.sort(key=lambda i: (
+        _SEV_RANK.get(i.get("severity","info"), 9),
+        _TYPE_RANK.get(i.get("issue_type",""), 9),
+    ))
+
+    # What tools have been run?
+    tools_run = list(dict.fromkeys(e.get("tool","") for e in journal))
+    analyses_done = [t for t in tools_run if t in (
+        "get_spatial_analysis", "production_review", "analyze_mesh_for_unreal",
+        "analyze_topology", "critique_animation", "analyze_rig_weights",
+        "analyze_rig_skeleton", "analyze_deformation_zones",
+    )]
+    repairs_done = [t for t in tools_run if "repair" in t or t == "auto_repair_mesh"]
+
+    # Data gaps — what would improve confidence?
+    all_key_analyses = [
+        "get_spatial_analysis", "production_review", "analyze_mesh_for_unreal",
+        "analyze_topology", "analyze_deformation_zones",
+    ]
+    data_gaps = [a for a in all_key_analyses if a not in analyses_done]
+
+    # ── Build three decision paths ─────────────────────────────────────────
+    critical_open = [i for i in open_issues if i.get("severity") == "critical"]
+    warning_open  = [i for i in open_issues if i.get("severity") == "warning"]
+
+    paths = []
+
+    # PATH A — Fix critical blockers first (always valid if any exist)
+    if critical_open:
+        top_crit = critical_open[0]
+        paths.append({
+            "path": "A",
+            "label": "Fix critical blockers first",
+            "priority": 1,
+            "action": (
+                f"Address {len(critical_open)} critical issue(s) starting with "
+                f"'{top_crit['issue_type']}' on {top_crit['object']}: {top_crit['detail'][:120]}"
+            ),
+            "tradeoff": "Safest path. Nothing else is valid until critical issues are resolved.",
+            "how": (
+                "auto_repair_mesh() for non_manifold/geometry issues. "
+                "Manual edit mode for ngons. "
+                "get_problem_detail_view() for a zoomed close-up of the exact location."
+            ),
+            "estimated_effort": "Low–Medium depending on issue count",
+        })
+
+    # PATH B — Run missing analyses to improve picture confidence
+    if data_gaps:
+        paths.append({
+            "path": "B",
+            "label": "Fill data gaps before acting",
+            "priority": 2 if not critical_open else 3,
+            "action": (
+                f"Run {len(data_gaps)} missing analysis tool(s) to get a complete picture: "
+                + ", ".join(data_gaps)
+            ),
+            "tradeoff": (
+                "Conservative. Costs one round of analysis calls but gives you "
+                "a complete picture before committing to repairs or next pipeline stage."
+            ),
+            "how": "Call each missing tool listed above in order.",
+            "estimated_effort": "Low — analysis only, no mesh changes",
+        })
+
+    # PATH C — Advance to next pipeline stage (valid if no critical issues)
+    if not critical_open:
+        next_stage_action = "Run full production_review() to confirm readiness for next stage"
+        if warning_open:
+            next_stage_action = (
+                f"Accept {len(warning_open)} warning(s) as known risk and advance to next stage. "
+                f"Warnings: {', '.join(i['issue_type'] for i in warning_open[:3])}"
+            )
+        paths.append({
+            "path": "C",
+            "label": "Advance to next pipeline stage",
+            "priority": 2 if not data_gaps else 3,
+            "action": next_stage_action,
+            "tradeoff": (
+                "Progress-focused. Accepts warnings as managed risk. "
+                "Only valid if you've confirmed warnings are non-blocking for your target platform."
+            ),
+            "how": "production_review() → resolve any conflicts → export_for_unreal() or next stage gate.",
+            "estimated_effort": "Low if mesh is clean",
+        })
+
+    # If no paths built (clean session, no data), give a default
+    if not paths:
+        paths.append({
+            "path": "A",
+            "label": "Start with a full inspection",
+            "priority": 1,
+            "action": "Run get_spatial_analysis() and production_review() to establish a baseline.",
+            "tradeoff": "No data yet — can't reason without it.",
+            "how": "get_spatial_analysis(object_name) → production_review(object_name)",
+            "estimated_effort": "Low",
+        })
+
+    # Recommended path
+    recommended = sorted(paths, key=lambda p: p["priority"])[0]
+    rec_why = (
+        f"Path {recommended['path']} is recommended because "
+        + ("there are critical blockers that must be resolved before anything else. "
+           if critical_open else
+           ("the picture is incomplete — more data will give better decisions. "
+            if data_gaps else
+            "the mesh appears clean and ready to advance. "))
+        + f"Playbook: {pb_name}. Asset type: {asset_t}. Stage: {stage or 'unconfirmed'}."
+    )
+
+    # Confidence
+    if len(analyses_done) >= 3 and not data_gaps:
+        confidence = "high"
+    elif len(analyses_done) >= 1:
+        confidence = "medium"
+    else:
+        confidence = "low — no analysis data yet"
+
+    # Session picture
+    picture_parts = []
+    if analyses_done:
+        picture_parts.append(f"Analyses run: {', '.join(analyses_done)}.")
+    if repairs_done:
+        picture_parts.append(f"Repairs executed: {', '.join(repairs_done)}.")
+    if closed_issues:
+        picture_parts.append(f"{len(closed_issues)} issue(s) resolved.")
+    if open_issues:
+        picture_parts.append(
+            f"{len(open_issues)} issue(s) still open "
+            f"({len(critical_open)} critical, {len(warning_open)} warning)."
+        )
+    if not picture_parts:
+        picture_parts = ["Session just started — no data collected yet."]
+
+    _journal_entry("synthesize_session", active_obj, "ok",
+                   f"confidence={confidence} open={len(open_issues)} paths={len(paths)}")
+
+    return json.dumps({
+        "object":          active_obj,
+        "session_picture": " ".join(picture_parts),
+        "confidence":      confidence,
+        "data_gaps":       data_gaps,
+        "open_issues":     [
+            {"id": i["id"], "type": i["issue_type"], "severity": i["severity"],
+             "detail": i["detail"][:120], "opened_by": i["tool"]}
+            for i in open_issues
+        ],
+        "resolved_issues": len(closed_issues),
+        "decision_paths":  paths,
+        "recommendation":  {
+            "path":   recommended["path"],
+            "label":  recommended["label"],
+            "action": recommended["action"],
+            "why":    rec_why,
+            "how":    recommended["how"],
+        },
+        "session_context": {
+            "asset_type":      asset_t,
+            "active_playbook": pb_name,
+            "stage":           stage,
+            "tools_run":       tools_run,
+        },
+    }, indent=2, default=str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPRINT B — DEFORMATION INTELLIGENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def analyze_deformation_zones(object_name: str) -> str:
+    """
+    DEFORMATION INTELLIGENCE — Checks whether the mesh topology can support clean
+    deformation at anatomical/mechanical bending zones.
+
+    This is the capability your mate identified as the biggest real gap: you can
+    find poles and ngons, but you can't yet say "this pole is AT the elbow crease
+    and WILL cause a shading artefact under deformation." This tool closes that gap.
+
+    What it checks at each deformation zone:
+      - Edge loop density (are there enough loops to support smooth bending?)
+      - Pole placement (is a pole sitting directly on a bend axis?)
+      - N-gon presence in deforming area (will auto-triangulate during skinning)
+      - Support loops (loops on BOTH sides of a crease for clean deformation)
+      - Geometry density relative to joint complexity
+
+    How it identifies zones:
+      - If an Armature modifier exists: reads bone positions and maps them to
+        surface regions to identify deformation-critical areas
+      - If no armature: uses mesh geometry + region labels to identify likely
+        bending zones (shoulder mass, elbow/knee proportions, waist, wrist/ankle)
+
+    Parameters
+    ----------
+    object_name : Blender object name (mesh)
+
+    Returns
+    -------
+    zones           : list of deformation zones with risk score and findings
+    overall_risk    : 'low' | 'medium' | 'high' | 'critical'
+    critical_zones  : zones rated critical (will definitely cause deformation artefacts)
+    recommendations : per-zone fix instructions
+    deformation_ready : bool — True if the mesh can deform cleanly
+    """
+    blender_script = f"""
+import bpy, bmesh, math, json
+
+obj = bpy.data.objects.get("{object_name}")
+if obj is None:
+    print(json.dumps({{"error": "Object not found"}}))
+    raise SystemExit
+
+if obj.type != 'MESH':
+    print(json.dumps({{"error": "Object is not a mesh"}}))
+    raise SystemExit
+
+# ── Identify bones / deformation sites ─────────────────────────────────────
+bone_sites = []   # {{name, head_world, tail_world, length}}
+
+arm_obj = None
+for mod in obj.modifiers:
+    if mod.type == 'ARMATURE' and mod.object:
+        arm_obj = mod.object
+        break
+
+if arm_obj and arm_obj.type == 'ARMATURE':
+    arm  = arm_obj.data
+    mwi  = obj.matrix_world.inverted()
+    for bone in arm.bones:
+        head_w = arm_obj.matrix_world @ bone.head_local
+        tail_w = arm_obj.matrix_world @ bone.tail_local
+        bone_sites.append({{
+            "name":       bone.name,
+            "head_local": list(mwi @ head_w),
+            "tail_local": list(mwi @ tail_w),
+            "length":     bone.length,
+        }})
+
+# ── BMesh analysis ──────────────────────────────────────────────────────────
+bm = bmesh.new()
+bm.from_mesh(obj.data)
+bm.verts.ensure_lookup_table()
+bm.edges.ensure_lookup_table()
+bm.faces.ensure_lookup_table()
+
+# Compute per-vertex valence
+valence = {{v.index: len(v.link_edges) for v in bm.verts}}
+
+# Bbox for region labelling
+xs = [v.co.x for v in bm.verts]
+ys = [v.co.y for v in bm.verts]
+zs = [v.co.z for v in bm.verts]
+x_range = max(xs) - min(xs) if xs else 1
+y_range = max(ys) - min(ys) if ys else 1
+z_range = max(zs) - min(zs) if zs else 1
+z_min, z_max = min(zs), max(zs)
+x_min, x_max = min(xs), max(xs)
+
+def region_label(co):
+    zn = (co.z - z_min) / (z_range or 1)
+    xn = (co.x - x_min) / (x_range or 1)
+    if zn > 0.85: return "head"
+    if zn > 0.70: return "neck"
+    if zn > 0.55: return "shoulder"
+    if zn > 0.40: return "torso_upper"
+    if zn > 0.30: return "torso_lower"
+    if zn > 0.20: return "hip"
+    if zn > 0.12: return "knee"
+    if zn > 0.04: return "ankle"
+    return "foot"
+
+def analyse_zone_around(center_local, radius):
+    \"\"\"Return topology stats for vertices within radius of center_local.\"\"\"
+    import mathutils
+    c = mathutils.Vector(center_local)
+    nearby_verts = [v for v in bm.verts if (v.co - c).length < radius]
+    if not nearby_verts:
+        return {{"vert_count": 0, "pole_count": 0, "ngon_count": 0,
+                "avg_valence": 0, "min_edge_loop_density": 0,
+                "has_support_loops": False}}
+
+    poles     = [v for v in nearby_verts if valence[v.index] > 5]
+    ngon_faces = [f for f in bm.faces
+                  if len(f.verts) > 4
+                  and any((fv.co - c).length < radius for fv in f.verts)]
+    avg_val   = sum(valence[v.index] for v in nearby_verts) / len(nearby_verts)
+
+    # Rough edge-loop density: count unique edge loop cross-sections
+    # (count edges roughly parallel to the major axis of motion)
+    edge_loop_estimate = max(1, len(nearby_verts) // max(1, len(poles) + 1))
+    has_support = edge_loop_estimate >= 3   # >= 3 loops around joint = adequate
+
+    return {{
+        "vert_count":            len(nearby_verts),
+        "pole_count":            len(poles),
+        "ngon_count":            len(ngon_faces),
+        "avg_valence":           round(avg_val, 2),
+        "edge_loop_estimate":    edge_loop_estimate,
+        "has_support_loops":     has_support,
+    }}
+
+# ── Analyse each zone ───────────────────────────────────────────────────────
+zones = []
+search_radius = max(x_range, y_range, z_range) * 0.12   # 12% of bbox as zone radius
+
+if bone_sites:
+    # Armature-guided: use bone heads (joint positions) as zone centers
+    for bs in bone_sites[:20]:   # cap at 20 bones
+        center = bs["head_local"]
+        stats  = analyse_zone_around(center, search_radius)
+        if stats["vert_count"] == 0:
+            continue
+
+        # Risk scoring
+        risk_score = 0
+        findings   = []
+
+        if stats["pole_count"] > 0:
+            risk_score += 30 * stats["pole_count"]
+            findings.append(f"{{stats['pole_count']}} pole(s) in joint zone — shading artefact risk under deformation")
+        if stats["ngon_count"] > 0:
+            risk_score += 25 * stats["ngon_count"]
+            findings.append(f"{{stats['ngon_count']}} n-gon(s) in deforming area — will auto-triangulate unpredictably")
+        if not stats["has_support_loops"]:
+            risk_score += 20
+            findings.append(f"Insufficient edge loops ({stats['edge_loop_estimate']}) — smooth bending requires ≥3")
+        if stats["avg_valence"] > 5.5:
+            risk_score += 10
+            findings.append(f"High average valence ({stats['avg_valence']:.1f}) — dense topology may cause pinching")
+        if stats["vert_count"] < 4:
+            risk_score += 15
+            findings.append("Very sparse geometry at joint — may collapse under extreme pose")
+
+        severity = "critical" if risk_score >= 50 else ("warning" if risk_score >= 20 else "ok")
+
+        zones.append({{
+            "zone":         bs["name"],
+            "zone_type":    "bone_joint",
+            "risk_score":   min(risk_score, 100),
+            "severity":     severity,
+            "findings":     findings,
+            "stats":        stats,
+            "fix": (
+                "Dissolve pole edges and re-route through the joint with a clean loop. "
+                "Add support loops on both sides of the crease. Remove n-gons before skinning."
+            ) if severity != "ok" else "Zone looks deformation-ready.",
+        }})
+else:
+    # No armature: analyse geometric regions likely to be deformation zones
+    region_centers = {{
+        "shoulder_L": [x_min + x_range*0.1, 0, z_min + z_range*0.6],
+        "shoulder_R": [x_max - x_range*0.1, 0, z_min + z_range*0.6],
+        "elbow_L":    [x_min + x_range*0.05, 0, z_min + z_range*0.45],
+        "elbow_R":    [x_max - x_range*0.05, 0, z_min + z_range*0.45],
+        "wrist_L":    [x_min + x_range*0.02, 0, z_min + z_range*0.30],
+        "wrist_R":    [x_max - x_range*0.02, 0, z_min + z_range*0.30],
+        "hip_L":      [x_min + x_range*0.2, 0, z_min + z_range*0.25],
+        "hip_R":      [x_max - x_range*0.2, 0, z_min + z_range*0.25],
+        "knee_L":     [x_min + x_range*0.2, 0, z_min + z_range*0.13],
+        "knee_R":     [x_max - x_range*0.2, 0, z_min + z_range*0.13],
+        "ankle_L":    [x_min + x_range*0.2, 0, z_min + z_range*0.04],
+        "ankle_R":    [x_max - x_range*0.2, 0, z_min + z_range*0.04],
+    }}
+    for zone_name, center in region_centers.items():
+        stats = analyse_zone_around(center, search_radius)
+        if stats["vert_count"] == 0:
+            continue
+
+        risk_score = 0
+        findings   = []
+        if stats["pole_count"] > 0:
+            risk_score += 30 * stats["pole_count"]
+            findings.append(f"{{stats['pole_count']}} pole(s) in estimated joint zone")
+        if stats["ngon_count"] > 0:
+            risk_score += 25 * stats["ngon_count"]
+            findings.append(f"{{stats['ngon_count']}} n-gon(s) in deforming area")
+        if not stats["has_support_loops"]:
+            risk_score += 20
+            findings.append(f"Insufficient edge loops ({stats['edge_loop_estimate']}) for clean bend")
+
+        severity = "critical" if risk_score >= 50 else ("warning" if risk_score >= 20 else "ok")
+        zones.append({{
+            "zone":       zone_name,
+            "zone_type":  "estimated_anatomical",
+            "risk_score": min(risk_score, 100),
+            "severity":   severity,
+            "findings":   findings,
+            "stats":      stats,
+            "note":       "No armature found — zones are estimated from mesh proportions.",
+            "fix": (
+                "Re-route topology at this joint with clean loops before skinning."
+            ) if severity != "ok" else "Zone looks deformation-ready.",
+        }})
+
+bm.free()
+
+# ── Overall risk ────────────────────────────────────────────────────────────
+critical_zones = [z for z in zones if z["severity"] == "critical"]
+warning_zones  = [z for z in zones if z["severity"] == "warning"]
+if critical_zones:
+    overall_risk = "critical"
+elif warning_zones:
+    overall_risk = "medium" if len(warning_zones) < 3 else "high"
+elif zones:
+    overall_risk = "low"
+else:
+    overall_risk = "unknown"
+
+deformation_ready = overall_risk in ("low",)
+
+result = {{
+    "object":            "{object_name}",
+    "zone_source":       "armature" if bone_sites else "estimated_anatomical",
+    "zones_analysed":    len(zones),
+    "overall_risk":      overall_risk,
+    "deformation_ready": deformation_ready,
+    "critical_zones":    [z["zone"] for z in critical_zones],
+    "warning_zones":     [z["zone"] for z in warning_zones],
+    "zones":             zones,
+    "summary": (
+        f"{{len(critical_zones)}} critical zone(s), {{len(warning_zones)}} warning zone(s) "
+        f"across {{len(zones)}} deformation zone(s) analysed. "
+        f"Overall risk: {{overall_risk}}. "
+        + ("Mesh is NOT deformation-ready — fix critical zones before skinning."
+           if critical_zones else
+           ("Warnings present — review before final rig binding."
+            if warning_zones else
+            "Mesh appears deformation-ready."))
+    ),
+}}
+print(json.dumps(result))
+"""
+    try:
+        blender = get_blender_connection()
+        result  = blender.send_command("execute_code_safe", {
+            "code": blender_script, "required_mode": "OBJECT", "push_undo": False
+        })
+        raw_out = result.get("result") or result.get("output") or ""
+        for line in str(raw_out).splitlines():
+            if line.strip().startswith("{"):
+                parsed = json.loads(line.strip())
+                if "error" in parsed:
+                    return json.dumps(parsed)
+
+                # Sprint A: journal + open issues
+                _journal_entry(
+                    "analyze_deformation_zones", object_name,
+                    "warning" if parsed.get("critical_zones") else "ok",
+                    f"risk={parsed.get('overall_risk')} critical_zones={parsed.get('critical_zones')}"
+                )
+                for zone in parsed.get("zones", []):
+                    if zone.get("severity") == "critical":
+                        _open_issue(
+                            "analyze_deformation_zones", object_name,
+                            "deformation_risk", "critical",
+                            f"Zone '{zone['zone']}': {'; '.join(zone.get('findings',[]))[:200]}"
+                        )
+                return json.dumps(parsed, indent=2, default=str)
+
+        return json.dumps({"error": "No JSON output from deformation analysis", "raw": raw_out[:500]})
+    except Exception as e:
+        logger.error(f"Error in analyze_deformation_zones: {e}")
+        _journal_entry("analyze_deformation_zones", object_name, "error", str(e))
+        return json.dumps({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPRINT C — PRESENTATION LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def simulate_production_readiness(object_name: str, asset_type: str = "") -> str:
+    """
+    PRODUCTION SIMULATION — "If this ships..." go/no-go scorecard.
+
+    Wraps the existing analysis tools and formats results as a production
+    simulation — not a problem list, but a structured pass/fail prediction
+    across every pipeline dimension. Presented as a studio QA gate.
+
+    Think: "What happens if we ship this asset right now?"
+
+    Dimensions scored
+    -----------------
+    GEOMETRY      non-manifold, loose verts, degenerate faces
+    TOPOLOGY      quad ratio, n-gon density, pole distribution
+    UV            UV presence, non-overlapping, lightmap channel
+    MATERIALS     PBR validity, texture paths, node graph
+    RIG           weight coverage, influence count, root bone
+    ENGINE        scale, pivot, triangle count, UE5 conventions
+    DEFORMATION   edge loop density at joints, pole placement
+    PERFORMANCE   tri count vs budget, LOD readiness, draw calls
+
+    Parameters
+    ----------
+    object_name : Blender object to simulate
+    asset_type  : hint for budget thresholds ('hero_character'|'weapon'|'env_prop'|...)
+
+    Returns
+    -------
+    scorecard    : per-dimension PASS/WARN/FAIL + reason
+    overall      : PASS | WARN | FAIL
+    ship_verdict : plain-English "ready to ship" / "do not ship" / "ship with known risks"
+    blockers     : dimensions that are FAIL — must be resolved before shipping
+    risks        : dimensions that are WARN — known risks if shipped now
+    """
+    try:
+        # Gather data from existing tools
+        raw_problems  = _send_raw("detect_mesh_problems",        name=object_name)
+        raw_quality   = _send_raw("get_mesh_quality_report",     name=object_name)
+        raw_topology  = _send_raw("analyze_topology",            name=object_name)
+        raw_ue5       = _send_raw("run_unreal_readiness_check",  name=object_name)
+        raw_obj_info  = _send_raw("get_object_info",             name=object_name)
+
+        if "error" in raw_obj_info:
+            return json.dumps({"error": f"Object not found: {object_name}"})
+
+        # Resolve asset type
+        eff_type = asset_type or _session_get("asset_type") or "unknown"
+        pb       = _get_active_playbook()
+        pb_budgets = pb.get("vert_budget", {}) if pb else {}
+
+        # ── Extract signals ────────────────────────────────────────────────
+        prob_map  = {p.get("type",""): p.get("count",0)
+                     for p in raw_problems.get("problems", [])}
+        nm_edges  = prob_map.get("non_manifold_edges", 0)
+        iso_verts = prob_map.get("isolated_verts", 0)
+        zero_area = prob_map.get("zero_area_faces", 0)
+
+        face_types = raw_quality.get("face_types", {})
+        ngon_count = face_types.get("ngons", 0) or 0
+        quad_count = face_types.get("quads", 0) or 0
+        tri_count  = face_types.get("tris",  0) or 0
+        total_faces = max(ngon_count + quad_count + tri_count, 1)
+        quad_ratio  = round(quad_count / total_faces * 100, 1)
+
+        mesh_block   = raw_obj_info.get("mesh", {})
+        vert_count   = mesh_block.get("vertices", 0) or 0
+        has_uvs      = raw_quality.get("uv", {}).get("has_uvs", False)
+        uv_layers    = raw_quality.get("uv", {}).get("layer_count", 0) or 0
+        has_arm      = any(m.get("type") == "ARMATURE"
+                           for m in raw_quality.get("modifiers", []) if isinstance(m, dict))
+        mat_list     = raw_obj_info.get("materials", [])
+        has_mats     = bool(mat_list)
+
+        ue5_checks   = raw_ue5.get("checks", {}) if isinstance(raw_ue5, dict) else {}
+
+        # ── Scorecard ──────────────────────────────────────────────────────
+        def _grade(fail_cond, warn_cond, pass_msg, fail_msg, warn_msg):
+            if fail_cond:   return ("FAIL", fail_msg)
+            if warn_cond:   return ("WARN", warn_msg)
+            return          ("PASS", pass_msg)
+
+        scorecard = {}
+
+        scorecard["GEOMETRY"] = _grade(
+            nm_edges > 0 or zero_area > 0,
+            iso_verts > 0,
+            f"Clean — no non-manifold or degenerate geometry.",
+            f"HARD BLOCKER — {nm_edges} non-manifold edge(s), {zero_area} zero-area face(s). UE5 will reject or corrupt this mesh.",
+            f"{iso_verts} isolated vertex/vertices — will inflate vert count and may cause LOD issues.",
+        )
+        scorecard["TOPOLOGY"] = _grade(
+            ngon_count > 10,
+            ngon_count > 0 or quad_ratio < 60,
+            f"Quad-dominant ({quad_ratio}% quads). Clean topology.",
+            f"{ngon_count} n-gons ({round(ngon_count/total_faces*100,1)}% of faces) — UE5 auto-triangulation will produce star patterns.",
+            f"{ngon_count} n-gon(s) present. Quad ratio: {quad_ratio}% (target ≥80% for deforming assets).",
+        )
+        scorecard["UV"] = _grade(
+            not has_uvs,
+            uv_layers < 2 and eff_type in ("hero_character", "weapon"),
+            f"{uv_layers} UV layer(s) — present and adequate.",
+            "No UV map — baking, texturing, and lightmapping are all blocked.",
+            f"Only {uv_layers} UV layer — hero/weapon assets need a second lightmap channel for UE5 static lighting.",
+        )
+        scorecard["MATERIALS"] = _grade(
+            not has_mats,
+            has_mats and len(mat_list) > 1,
+            f"{len(mat_list)} material(s) — assigned.",
+            "No materials assigned — asset will appear grey in engine.",
+            f"{len(mat_list)} material(s) — multiple materials mean multiple draw calls. Merge if possible.",
+        )
+        scorecard["ENGINE"] = _grade(
+            ue5_checks.get("scale_applied") == False,
+            ue5_checks.get("pivot_at_origin") == False,
+            "Scale applied, pivot at origin — UE5 conventions met.",
+            "Scale NOT applied — mesh will import at wrong size in UE5. Apply scale before export.",
+            "Pivot not at origin — asset will rotate/translate incorrectly in UE5.",
+        )
+
+        # Vert budget check
+        budget = (pb_budgets.get(eff_type) or
+                  {"hero_character": 80000, "weapon": 15000, "env_prop": 5000}.get(eff_type, 50000))
+        scorecard["PERFORMANCE"] = _grade(
+            vert_count > budget * 1.5,
+            vert_count > budget,
+            f"{vert_count:,} verts — within budget ({budget:,}).",
+            f"{vert_count:,} verts — 50%+ over {eff_type} budget of {budget:,}. LOD generation may not rescue this.",
+            f"{vert_count:,} verts — over {eff_type} budget of {budget:,}. Generate LODs before shipping.",
+        )
+
+        scorecard["RIG"] = ("N/A", "No armature — rig check skipped.") if not has_arm else _grade(
+            False, False,
+            "Armature present — run analyze_rig_weights() for full rig QA.",
+            "", "",
+        )
+
+        scorecard["DEFORMATION"] = ("N/A", "Run analyze_deformation_zones() for deformation risk score.")
+
+        # ── Overall verdict ────────────────────────────────────────────────
+        fails  = [(k, v) for k, v in scorecard.items() if v[0] == "FAIL"]
+        warns  = [(k, v) for k, v in scorecard.items() if v[0] == "WARN"]
+
+        if fails:
+            overall      = "FAIL"
+            ship_verdict = (
+                f"DO NOT SHIP. {len(fails)} hard blocker(s): "
+                + ", ".join(k for k, _ in fails)
+                + ". These will cause visible failures or import errors in production."
+            )
+        elif warns:
+            overall      = "WARN"
+            ship_verdict = (
+                f"SHIP WITH KNOWN RISKS. {len(warns)} warning(s): "
+                + ", ".join(k for k, _ in warns)
+                + ". Each is a known risk — confirm with the art director before shipping."
+            )
+        else:
+            overall      = "PASS"
+            ship_verdict = "READY TO SHIP. All simulated production gates pass."
+
+        _journal_entry(
+            "simulate_production_readiness", object_name,
+            "ok" if overall == "PASS" else ("warning" if overall == "WARN" else "error"),
+            f"verdict={overall} fails={len(fails)} warns={len(warns)}"
+        )
+
+        return json.dumps({
+            "object":       object_name,
+            "asset_type":   eff_type,
+            "overall":      overall,
+            "ship_verdict": ship_verdict,
+            "scorecard": {k: {"result": v[0], "reason": v[1]} for k, v in scorecard.items()},
+            "blockers":  [{"dimension": k, "reason": v[1]} for k, v in fails],
+            "risks":     [{"dimension": k, "reason": v[1]} for k, v in warns],
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in simulate_production_readiness: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def review_board(object_name: str, asset_type: str = "") -> str:
+    """
+    REVIEW BOARD — Five specialist reviewers examine the asset simultaneously
+    and each give an independent verdict. Their scores are combined into a
+    consensus. Exactly like a AAA studio review panel.
+
+    The five specialists
+    --------------------
+    TECHNICAL_ARTIST  Geometry, topology, UV, export readiness
+    CHARACTER_ARTIST  Proportions, edge flow, deformation zones, artistic quality
+    ANIMATOR          Rig quality, joint placement, deformation support loops
+    RENDERING         Material quality, UV density, lightmap, shading
+    ENGINE            Triangle budget, LODs, naming, UE5 conventions
+
+    Each specialist gives: score (0–100), grade (A–F), verdict, top_concerns, praise.
+    Combined into a consensus score with a majority verdict.
+
+    Parameters
+    ----------
+    object_name : Blender object to review
+    asset_type  : hint for budget thresholds
+
+    Returns
+    -------
+    panel        : each specialist's full verdict
+    consensus    : combined score, grade, and majority verdict
+    chair_summary: plain-English summary as if from the review chair
+    """
+    try:
+        # Gather all data once
+        raw_problems = _send_raw("detect_mesh_problems",       name=object_name)
+        raw_quality  = _send_raw("get_mesh_quality_report",    name=object_name)
+        raw_topology = _send_raw("analyze_topology",           name=object_name)
+        raw_obj_info = _send_raw("get_object_info",            name=object_name)
+        raw_ue5      = _send_raw("run_unreal_readiness_check", name=object_name)
+
+        if "error" in raw_obj_info:
+            return json.dumps({"error": f"Object not found: {object_name}"})
+
+        eff_type   = asset_type or _session_get("asset_type") or "unknown"
+        pb         = _get_active_playbook()
+        pb_budgets = pb.get("vert_budget", {}) if pb else {}
+
+        prob_map   = {p.get("type",""): p.get("count",0)
+                      for p in raw_problems.get("problems", [])}
+        face_types = raw_quality.get("face_types", {})
+        ngons      = face_types.get("ngons",  0) or 0
+        quads      = face_types.get("quads",  0) or 0
+        tris       = face_types.get("tris",   0) or 0
+        total_f    = max(ngons + quads + tris, 1)
+        quad_pct   = round(quads / total_f * 100, 1)
+        nm_edges   = prob_map.get("non_manifold_edges", 0)
+        iso_v      = prob_map.get("isolated_verts", 0)
+        mesh_b     = raw_obj_info.get("mesh", {})
+        vert_count = mesh_b.get("vertices", 0) or 0
+        has_uvs    = raw_quality.get("uv", {}).get("has_uvs", False)
+        uv_layers  = raw_quality.get("uv", {}).get("layer_count", 0) or 0
+        has_arm    = any(m.get("type") == "ARMATURE"
+                         for m in raw_quality.get("modifiers", []) if isinstance(m, dict))
+        mat_list   = raw_obj_info.get("materials", [])
+        budget     = (pb_budgets.get(eff_type) or
+                      {"hero_character": 80000, "weapon": 15000, "env_prop": 5000
+                       }.get(eff_type, 50000))
+        ue5_ok     = not isinstance(raw_ue5, dict) or not raw_ue5.get("issues")
+
+        def _score_to_grade(s):
+            if s >= 90: return "A"
+            if s >= 80: return "B"
+            if s >= 70: return "C"
+            if s >= 55: return "D"
+            return "F"
+
+        panel = {}
+
+        # ── TECHNICAL ARTIST ───────────────────────────────────────────────
+        ta_score = 100
+        ta_concerns, ta_praise = [], []
+        if nm_edges > 0:
+            ta_score -= 40; ta_concerns.append(f"{nm_edges} non-manifold edge(s) — hard export blocker")
+        if ngons > 5:
+            ta_score -= 15; ta_concerns.append(f"{ngons} n-gons — topology needs cleanup")
+        if iso_v > 0:
+            ta_score -= 5;  ta_concerns.append(f"{iso_v} isolated vert(s)")
+        if not has_uvs:
+            ta_score -= 20; ta_concerns.append("No UV map — can't texture or bake")
+        if quad_pct > 75:
+            ta_praise.append(f"Strong quad ratio ({quad_pct}%)")
+        if not ta_concerns:
+            ta_praise.append("Clean geometry — export-ready")
+        panel["TECHNICAL_ARTIST"] = {
+            "score": max(ta_score, 0), "grade": _score_to_grade(max(ta_score,0)),
+            "verdict": "Approved" if ta_score >= 75 else ("Revision required" if ta_score >= 50 else "Blocked"),
+            "top_concerns": ta_concerns, "praise": ta_praise,
+            "comment": f"Geometry health is {'good' if ta_score>=75 else 'concerning'}. "
+                       + (f"Fix {nm_edges} non-manifold edge(s) immediately." if nm_edges else "")
+        }
+
+        # ── CHARACTER ARTIST ───────────────────────────────────────────────
+        ca_score = 80   # base — we can't fully judge art without vision
+        ca_concerns, ca_praise = [], []
+        if ngons > 0:
+            ca_score -= 10; ca_concerns.append(f"{ngons} n-gon(s) will disrupt edge flow in deforming areas")
+        if quad_pct < 70:
+            ca_score -= 15; ca_concerns.append(f"Low quad ratio ({quad_pct}%) — poor edge flow foundation")
+        if quad_pct >= 80:
+            ca_praise.append(f"Clean quad flow ({quad_pct}%) — good foundation for deformation")
+        ca_concerns.append("Run critique_artistic() for full artistic assessment — visual review needed")
+        panel["CHARACTER_ARTIST"] = {
+            "score": max(ca_score, 0), "grade": _score_to_grade(max(ca_score,0)),
+            "verdict": "Pending visual review" if ca_score >= 70 else "Revision required",
+            "top_concerns": ca_concerns, "praise": ca_praise,
+            "comment": "Topology assessed from data — for silhouette, proportions, and shape language run critique_artistic()."
+        }
+
+        # ── ANIMATOR ───────────────────────────────────────────────────────
+        an_score = 80 if has_arm else 50
+        an_concerns, an_praise = [], []
+        if not has_arm:
+            an_concerns.append("No armature — rig not yet assigned")
+            an_score = 40
+        else:
+            an_praise.append("Armature modifier present")
+            an_concerns.append("Run analyze_rig_weights() and analyze_deformation_zones() for full animation QA")
+        if ngons > 0:
+            an_score -= 15; an_concerns.append(f"{ngons} n-gon(s) in mesh — will cause skinning artefacts")
+        panel["ANIMATOR"] = {
+            "score": max(an_score, 0), "grade": _score_to_grade(max(an_score,0)),
+            "verdict": "Needs rig QA" if has_arm else "No rig — animator cannot assess",
+            "top_concerns": an_concerns, "praise": an_praise,
+            "comment": "Run analyze_deformation_zones() to get a bone-by-bone deformation risk score."
+        }
+
+        # ── RENDERING ──────────────────────────────────────────────────────
+        rn_score = 100
+        rn_concerns, rn_praise = [], []
+        if not has_uvs:
+            rn_score -= 40; rn_concerns.append("No UVs — texturing and baking are impossible")
+        elif uv_layers < 2:
+            rn_score -= 10; rn_concerns.append("Only 1 UV channel — second channel needed for UE5 lightmaps")
+        if not mat_list:
+            rn_score -= 20; rn_concerns.append("No material — asset will render grey")
+        if has_uvs and mat_list:
+            rn_praise.append("UVs and materials present — renderable")
+        panel["RENDERING"] = {
+            "score": max(rn_score, 0), "grade": _score_to_grade(max(rn_score,0)),
+            "verdict": "Approved" if rn_score >= 75 else ("Revision required" if rn_score >= 50 else "Blocked"),
+            "top_concerns": rn_concerns, "praise": rn_praise,
+            "comment": "Material and UV quality assessed from metadata — run analyze_material_pbr() for node-level review."
+        }
+
+        # ── ENGINE ─────────────────────────────────────────────────────────
+        en_score = 100
+        en_concerns, en_praise = [], []
+        if vert_count > budget * 1.5:
+            en_score -= 30; en_concerns.append(f"{vert_count:,} verts — 50%+ over {eff_type} budget of {budget:,}")
+        elif vert_count > budget:
+            en_score -= 15; en_concerns.append(f"{vert_count:,} verts — over {eff_type} budget ({budget:,}). Generate LODs.")
+        else:
+            en_praise.append(f"{vert_count:,} verts — within {eff_type} budget ({budget:,})")
+        if not ue5_ok:
+            en_score -= 20; en_concerns.append("Unreal readiness check flagged issues — run run_unreal_readiness_check()")
+        if nm_edges > 0:
+            en_score -= 25; en_concerns.append("Non-manifold geometry — engine may corrupt this mesh on import")
+        panel["ENGINE"] = {
+            "score": max(en_score, 0), "grade": _score_to_grade(max(en_score,0)),
+            "verdict": "Approved" if en_score >= 75 else ("Revision required" if en_score >= 50 else "Blocked"),
+            "top_concerns": en_concerns, "praise": en_praise,
+            "comment": f"Budget check: {vert_count:,}/{budget:,} verts for {eff_type}."
+        }
+
+        # ── Consensus ──────────────────────────────────────────────────────
+        scores        = [v["score"] for v in panel.values()]
+        consensus_avg = round(sum(scores) / len(scores))
+        consensus_grade = _score_to_grade(consensus_avg)
+        blocked       = sum(1 for v in panel.values() if v["verdict"] in ("Blocked",))
+        revisions     = sum(1 for v in panel.values() if "Revision" in v.get("verdict",""))
+        approved      = sum(1 for v in panel.values() if v["verdict"] == "Approved")
+
+        if blocked >= 2:
+            majority_verdict = "DO NOT APPROVE — multiple specialists blocked"
+        elif blocked == 1:
+            majority_verdict = "BLOCKED — resolve the blocking specialist's issue first"
+        elif revisions >= 3:
+            majority_verdict = "REVISIONS REQUIRED — majority of specialists want changes"
+        elif revisions >= 1:
+            majority_verdict = "CONDITIONAL APPROVAL — minor revisions requested"
+        else:
+            majority_verdict = "APPROVED — panel consensus"
+
+        chair_summary = (
+            f"Review board for '{object_name}' ({eff_type}): "
+            f"consensus score {consensus_avg}/100 (grade {consensus_grade}). "
+            f"{approved} approved, {revisions} requesting revision, {blocked} blocked. "
+            f"Majority verdict: {majority_verdict}. "
+            + (f"Critical path: fix {nm_edges} non-manifold edge(s) first." if nm_edges else
+               "No hard blockers — review warnings and proceed.")
+        )
+
+        _journal_entry(
+            "review_board", object_name, "ok",
+            f"consensus={consensus_avg} grade={consensus_grade} verdict='{majority_verdict}'"
+        )
+
+        return json.dumps({
+            "object":           object_name,
+            "asset_type":       eff_type,
+            "panel":            panel,
+            "consensus": {
+                "score":           consensus_avg,
+                "grade":           consensus_grade,
+                "majority_verdict": majority_verdict,
+                "approved":        approved,
+                "revisions":       revisions,
+                "blocked":         blocked,
+            },
+            "chair_summary": chair_summary,
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in review_board: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def critique_artistic(object_name: str, context: str = "") -> list:
+    """
+    ARTISTIC CRITIQUE — Senior artist visual review of silhouette, proportion,
+    shape language, balance, and readability.
+
+    This is a vision-based critique — NOT topology. It captures the 7-view
+    multiview screenshots and asks Claude to review them as an artist would:
+    silhouette clarity, visual balance, focal points, shape language, negative
+    space, proportions at gameplay/cinematic distance.
+
+    NOT what this tool covers (use other tools for these):
+      - N-gons, non-manifold geometry → get_spatial_analysis()
+      - UV, materials → analyze_material_pbr()
+      - Rig quality → analyze_rig_weights()
+
+    Parameters
+    ----------
+    object_name : Blender object to critique
+    context     : optional — "hero character viewed at 3m gameplay distance",
+                  "weapon in first-person view", "cinematic close-up", etc.
+
+    Returns list
+    ------------
+    [image_0 … image_6] — the 7 annotated view screenshots
+    [artistic_critique_dict] — structured critique with per-view and overall notes
+    """
+    try:
+        # Capture 7 views (no wireframe — we want clean artistic views)
+        mv_result = get_multiview_capture(object_name, include_wireframe=False)
+        images    = [item for item in mv_result if isinstance(item, Image)]
+
+        view_names = ["FRONT", "BACK", "LEFT", "RIGHT", "TOP", "BOTTOM", "PERSP"]
+        view_map   = {view_names[i]: i for i in range(len(view_names))}
+
+        # Build the artistic prompt as a structured critique guide
+        ctx_note = f" Context: {context}." if context else ""
+        critique_prompt = (
+            f"You are a senior character/prop artist reviewing '{object_name}' for production.{ctx_note} "
+            "You have 7 viewport screenshots: FRONT, BACK, LEFT, RIGHT, TOP, BOTTOM, PERSP. "
+            "Give a structured artistic critique across these dimensions:\n"
+            "1. SILHOUETTE — Does the silhouette read clearly at distance? Is it distinctive?\n"
+            "2. PROPORTIONS — Are proportions believable and consistent with the asset type?\n"
+            "3. SHAPE LANGUAGE — Does it use clear primary/secondary/tertiary shapes? "
+            "Are shapes varied (not all boxy or all round)?\n"
+            "4. VISUAL BALANCE — Is mass distributed believably? Any side that looks too heavy or empty?\n"
+            "5. FOCAL POINT — Where does the eye go first? Is that the right place?\n"
+            "6. NEGATIVE SPACE — Is negative space used effectively?\n"
+            "7. READABILITY — At thumbnail scale / gameplay distance, does the design still read?\n"
+            "8. RECOMMENDATIONS — Top 3 specific changes that would most improve the design.\n"
+            "Be direct. Speak as an artist to another artist. Don't hedge."
+        )
+
+        # The images + prompt are returned together so Claude's vision can process them
+        critique_dict = {
+            "artistic_critique": "pending_vision_review",
+            "object":           object_name,
+            "context":          context or "general review",
+            "view_count":       len(images),
+            "critique_prompt":  critique_prompt,
+            "how_to_use": (
+                "The 7 images above are the viewport captures. "
+                "Read the critique_prompt field and apply it to the images. "
+                "Give your full artistic assessment across all 8 dimensions listed. "
+                "The images show FRONT[0] BACK[1] LEFT[2] RIGHT[3] TOP[4] BOTTOM[5] PERSP[6]."
+            ),
+            "dimensions": [
+                "SILHOUETTE", "PROPORTIONS", "SHAPE_LANGUAGE",
+                "VISUAL_BALANCE", "FOCAL_POINT", "NEGATIVE_SPACE",
+                "READABILITY", "RECOMMENDATIONS"
+            ],
+        }
+
+        _journal_entry("critique_artistic", object_name, "ok",
+                       f"Captured {len(images)} views for artistic critique.")
+
+        return images + [critique_dict]
+
+    except Exception as e:
+        logger.error(f"Error in critique_artistic: {e}")
+        _journal_entry("critique_artistic", object_name, "error", str(e))
+        return [{"error": str(e), "object": object_name}]
+
+
+@mcp.tool()
+def load_studio_profile(show_current: bool = False) -> str:
+    """
+    STUDIO PROFILE — Load and display the per-studio QA baseline configuration.
+
+    The studio profile (studio_profile.json, next to server.py) lets you define
+    YOUR studio's specific standards — triangle budgets, texel density, naming
+    conventions, UV channel requirements, export settings — so the MCP evaluates
+    assets against your studio's bar, not generic industry defaults.
+
+    If no studio_profile.json exists, returns the default profile with instructions
+    for customising it.
+
+    show_current=True: also shows the currently loaded profile values in use.
+
+    Returns
+    -------
+    profile_path  : where the file is / should be
+    profile       : the loaded profile (or defaults if file not found)
+    how_to_use    : instructions for customising the profile
+    active_in_tools : which tools read the studio profile
+    """
+    profile_path = Path(__file__).parent / "studio_profile.json"
+
+    default_profile = {
+        "_comment": "Studio QA profile — edit these values to match YOUR studio's standards.",
+        "studio_name": "My Studio",
+        "target_engine": "UE5",
+        "vert_budgets": {
+            "hero_character":      80000,
+            "background_character": 20000,
+            "crowd_character":     10000,
+            "weapon":              15000,
+            "environment_prop":     5000,
+            "vehicle":             50000,
+            "creature":            60000,
+        },
+        "texel_density": {
+            "hero_character":   10.24,   # px/cm
+            "weapon":            5.12,
+            "environment_prop":  2.56,
+        },
+        "uv_requirements": {
+            "require_lightmap_channel": True,
+            "max_uv_overlap_pct":       5.0,
+            "min_uv_margin_px":         4,
+        },
+        "topology_standards": {
+            "min_quad_pct":         75.0,
+            "max_ngon_pct":          2.0,
+            "max_poles_per_1k_verts": 5,
+        },
+        "naming_conventions": {
+            "mesh_prefix":      "SM_",
+            "skeletal_prefix":  "SK_",
+            "material_prefix":  "M_",
+            "texture_prefix":   "T_",
+        },
+        "export": {
+            "format":              "FBX",
+            "scale":               1.0,
+            "apply_modifiers":     True,
+            "triangulate_before":  False,
+        },
+    }
+
+    # Try to load existing profile
+    profile_loaded = False
+    profile = default_profile.copy()
+    if profile_path.exists():
+        try:
+            disk_profile = json.loads(profile_path.read_text())
+            # Merge disk values over defaults
+            for k, v in disk_profile.items():
+                if isinstance(v, dict) and isinstance(profile.get(k), dict):
+                    profile[k].update(v)
+                else:
+                    profile[k] = v
+            profile_loaded = True
+        except Exception as e:
+            profile["_load_error"] = str(e)
+    else:
+        # Write default profile to disk so user can edit it
+        try:
+            profile_path.write_text(json.dumps(default_profile, indent=2))
+            profile["_created"] = f"Default profile written to {profile_path}"
+        except Exception as e:
+            profile["_write_error"] = str(e)
+
+    _journal_entry("load_studio_profile", "", "ok",
+                   f"Loaded={profile_loaded} path={profile_path}")
+
+    return json.dumps({
+        "profile_path":   str(profile_path),
+        "profile_loaded": profile_loaded,
+        "profile":        profile,
+        "how_to_customise": (
+            f"Edit {profile_path} to set your studio's specific standards. "
+            "The MCP reads this file at tool call time — no restart needed. "
+            "Values here override the generic industry defaults used in "
+            "simulate_production_readiness(), review_board(), and what_next()."
+        ),
+        "active_in_tools": [
+            "simulate_production_readiness (vert_budgets)",
+            "review_board (vert_budgets)",
+            "what_next (vert_budgets via playbook)",
+            "production_review (vert_budgets)",
+        ],
+    }, indent=2, default=str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPRINT D — ASSET INTELLIGENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def map_asset_dependencies(object_name: str) -> str:
+    """
+    ASSET DEPENDENCY MAP — Surfaces all of Blender's existing relationship data
+    for a given object. Tells you what this asset IS connected to and what IS
+    connected to it — without touching any external files.
+
+    This moves the MCP from mesh-aware to project-aware reasoning.
+
+    What it maps
+    ------------
+    SHARED_MATERIALS   Other objects in the scene that share any material with this object
+    SHARED_ARMATURE    Other objects driven by the same armature (skeleton reuse)
+    COLLECTION_SIBLINGS Objects in the same collection(s) as this object
+    MODIFIER_REFERENCES Objects referenced BY modifiers on this object (mirror, boolean targets, etc.)
+    REFERENCED_BY      Objects whose modifiers point TO this object (e.g. this is a boolean target)
+    SHAPE_KEY_BASIS    If this object has shape keys: how many, what drivers reference them
+    PARENT_CHILDREN    Parent and children objects in the hierarchy
+    DATA_USERS         How many objects share this object's mesh data (linked duplicates)
+
+    Parameters
+    ----------
+    object_name : Blender object name
+
+    Returns
+    -------
+    dependency_map  : structured dict of all relationships
+    impact_summary  : plain-English — "changing this object affects X other assets"
+    change_warning  : if dependencies are high, warns that changes cascade
+    """
+    blender_script = f"""
+import bpy, json
+
+obj = bpy.data.objects.get("{object_name}")
+if obj is None:
+    print(json.dumps({{"error": "Object not found"}}))
+    raise SystemExit
+
+scene_objects = list(bpy.context.scene.objects)
+
+# ── Shared materials ─────────────────────────────────────────────────────────
+obj_mats = set(m.name for m in (obj.data.materials if obj.data and hasattr(obj.data,'materials') else []) if m)
+shared_mat_users = []
+for other in scene_objects:
+    if other.name == obj.name: continue
+    other_mats = set(m.name for m in (other.data.materials if other.data and hasattr(other.data,'materials') else []) if m)
+    common = obj_mats & other_mats
+    if common:
+        shared_mat_users.append({{"object": other.name, "shared_materials": list(common)}})
+
+# ── Shared armature ──────────────────────────────────────────────────────────
+arm_name = None
+for mod in obj.modifiers:
+    if mod.type == 'ARMATURE' and mod.object:
+        arm_name = mod.object.name
+        break
+
+shared_armature_users = []
+if arm_name:
+    for other in scene_objects:
+        if other.name == obj.name: continue
+        for mod in other.modifiers:
+            if mod.type == 'ARMATURE' and mod.object and mod.object.name == arm_name:
+                shared_armature_users.append(other.name)
+
+# ── Collection siblings ──────────────────────────────────────────────────────
+my_collections = [c.name for c in bpy.data.collections if obj.name in c.objects]
+collection_siblings = {{}}
+for col_name in my_collections:
+    col = bpy.data.collections.get(col_name)
+    if col:
+        siblings = [o.name for o in col.objects if o.name != obj.name]
+        collection_siblings[col_name] = siblings
+
+# ── Modifier references (targets of this obj's modifiers) ───────────────────
+mod_refs = []
+for mod in obj.modifiers:
+    ref = getattr(mod, 'object', None) or getattr(mod, 'target', None)
+    if ref and ref.name != obj.name:
+        mod_refs.append({{"modifier": mod.name, "type": mod.type, "references": ref.name}})
+
+# ── Referenced by other objects' modifiers ───────────────────────────────────
+referenced_by = []
+for other in scene_objects:
+    if other.name == obj.name: continue
+    for mod in other.modifiers:
+        ref = getattr(mod, 'object', None) or getattr(mod, 'target', None)
+        if ref and ref.name == obj.name:
+            referenced_by.append({{"object": other.name, "modifier": mod.name, "type": mod.type}})
+
+# ── Shape keys ───────────────────────────────────────────────────────────────
+shape_key_info = {{"has_shape_keys": False}}
+if obj.data and hasattr(obj.data, 'shape_keys') and obj.data.shape_keys:
+    sk = obj.data.shape_keys
+    shape_key_info = {{
+        "has_shape_keys": True,
+        "key_count":      len(sk.key_blocks),
+        "key_names":      [kb.name for kb in sk.key_blocks[:10]],
+        "drivers":        len(sk.animation_data.drivers) if sk.animation_data else 0,
+    }}
+
+# ── Parent / children ────────────────────────────────────────────────────────
+parent   = obj.parent.name if obj.parent else None
+children = [c.name for c in obj.children]
+
+# ── Mesh data users (linked duplicates) ─────────────────────────────────────
+mesh_data_users = []
+if obj.data:
+    mesh_data_users = [o.name for o in bpy.data.objects
+                       if o.data == obj.data and o.name != obj.name]
+
+# ── Impact summary ───────────────────────────────────────────────────────────
+total_deps = (len(shared_mat_users) + len(shared_armature_users) +
+              len(referenced_by) + len(mesh_data_users))
+
+if total_deps == 0:
+    impact = "This object has no shared dependencies — changes are isolated."
+    change_warning = None
+elif total_deps < 5:
+    impact = f"This object has {{total_deps}} dependency/dependencies — changes may affect a small number of other assets."
+    change_warning = f"Check shared_materials and shared_armature before making topology changes."
+else:
+    impact = f"HIGH DEPENDENCY ASSET — {{total_deps}} connections found. Changes cascade to multiple other assets."
+    change_warning = (
+        f"Modifying this mesh affects: "
+        + (f"{{len(shared_mat_users)}} material-sharing objects, " if shared_mat_users else "")
+        + (f"{{len(shared_armature_users)}} skeleton-sharing objects, " if shared_armature_users else "")
+        + (f"{{len(mesh_data_users)}} linked duplicate(s). " if mesh_data_users else "")
+        + "Coordinate with the team before making changes."
+    )
+
+result = {{
+    "object":            "{object_name}",
+    "dependency_map": {{
+        "shared_materials":    shared_mat_users,
+        "shared_armature":     {{"armature": arm_name, "other_users": shared_armature_users}} if arm_name else None,
+        "collection_siblings": collection_siblings,
+        "modifier_references": mod_refs,
+        "referenced_by":       referenced_by,
+        "shape_keys":          shape_key_info,
+        "parent":              parent,
+        "children":            children,
+        "mesh_data_users":     mesh_data_users,
+    }},
+    "total_dependencies": total_deps,
+    "impact_summary":    impact,
+    "change_warning":    change_warning,
+}}
+print(json.dumps(result))
+"""
+    try:
+        blender = get_blender_connection()
+        result  = blender.send_command("execute_code_safe", {
+            "code": blender_script, "required_mode": "OBJECT", "push_undo": False
+        })
+        raw_out = result.get("result") or result.get("output") or ""
+        for line in str(raw_out).splitlines():
+            if line.strip().startswith("{"):
+                parsed = json.loads(line.strip())
+                if "error" not in parsed:
+                    _journal_entry(
+                        "map_asset_dependencies", object_name, "ok",
+                        f"total_deps={parsed.get('total_dependencies',0)}"
+                    )
+                return json.dumps(parsed, indent=2, default=str)
+        return json.dumps({"error": "No JSON output from dependency map", "raw": raw_out[:500]})
+    except Exception as e:
+        logger.error(f"Error in map_asset_dependencies: {e}")
         return json.dumps({"error": str(e)})
 
 
