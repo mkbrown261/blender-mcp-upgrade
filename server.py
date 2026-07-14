@@ -1872,15 +1872,18 @@ Then deliver ONE orientation sentence:
 STOP. Wait for user. Do not auto-run further tools.
 
 SPATIAL VISION: When user asks for deep analysis, topology review, or spatial reasoning:
-  → get_spatial_analysis(object_name) — one call, everything: clean views + wireframe
-    + annotated highlights + world-space coordinates + spatial narrative.
-  For lighter use (orientation only): get_multiview_capture(object_name).
+  → get_spatial_analysis(object_name) — 7 clean views + world-space coordinates
+    + spatial narrative. Same image cost as a single get_multiview_capture() call.
+  Only escalate to get_spatial_analysis(object_name, deep=True) when 7 views +
+    coordinates aren't enough to visually pinpoint a specific problem — it adds
+    wireframe + annotated highlights + severity heat map, up to 42 images. Expensive:
+    don't reach for it by default.
   Check session multiview.capture_stale — if True, re-capture before reasoning.
   HOW TO READ get_spatial_analysis output:
     1. Read spatial_narrative — WHAT/HOW MANY/WHERE (world coords + region label)
-    2. Use image_guide to find image numbers for each problem type
-    3. view_projections x/y (0=left/bottom → 1=right/top) locates cluster in image
-    4. Severity heat map (last 7 images): red=critical, fix first
+    2. view_projections x/y (0=left/bottom → 1=right/top) locates cluster in any image
+    3. deep=True only: image_guide maps image numbers to pass type, severity heat
+       map (red=critical) shows priority at a glance
 
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
 TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
@@ -1896,12 +1899,13 @@ TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
                                animation principles. Apprentice lessons if apprentice_mode=True.
   session_update               record confirmed facts: asset_type, stage, verified checks, issues
-  get_spatial_analysis         VISION COMPOUND — one call, complete spatial picture:
-                               clean views + wireframe + annotated highlights + coordinates.
-                               THE tool for deep mesh analysis. Returns all image passes
-                               + world-space problem coordinates + spatial narrative that
-                               tells you WHAT, WHERE, and which image shows it.
-                               Use this instead of get_multiview_capture for any serious analysis.
+  get_spatial_analysis         VISION — default entry point for spatial/topology analysis:
+                               7 clean views + world-space problem coordinates + narrative
+                               that tells you WHAT and WHERE. Same image cost as
+                               get_multiview_capture. Pass deep=True only when you need to
+                               visually pinpoint a specific problem beyond coordinates
+                               (adds wireframe + annotated highlights + heat map, 42 images
+                               total — expensive, don't default to it).
   get_multiview_capture        VISION: 7-angle capture (front/back/left/right/top/bottom/persp).
                                Gives complete spatial visibility — no hidden geometry, no depth
                                ambiguity. Use before ANY topology or spatial analysis.
@@ -2010,7 +2014,8 @@ When user says "stop explaining" / "expert mode" / "just do it":
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → gap report
   "scan/full view/deep analysis/topology review/where is the problem"
-                                  → get_spatial_analysis(object_name) — complete picture in one call
+                                  → get_spatial_analysis(object_name) — 7 views + coordinates
+                                    (add deep=True only if that's not enough to pinpoint it)
   "show me the wireframe/topology lines/edge flow/just the views"
                                   → get_multiview_capture(object_name, include_wireframe=True)
   "where exactly/which part/highlight the problems/show me what's wrong"
@@ -2049,7 +2054,9 @@ NEVER:
   ✗ Run auto_repair_mesh() without snapshot_mesh_state() first
   ✗ Call compare_mesh_state() without a prior snapshot — it will error
   ✗ Reason about topology or spatial placement from a single screenshot alone
-     — get_spatial_analysis gives annotated views + exact coordinates
+     — get_spatial_analysis gives 7 angles + exact coordinates
+  ✗ Default to get_spatial_analysis(deep=True) — 42 images is expensive, only
+     escalate when 7 views + coordinates can't pinpoint the problem
   ✗ Trust a stale multiview capture after repairs — check capture_stale in session
   ✗ Say "I can see the problem is somewhere on the mesh" — get_problem_coordinates
      gives exact world position, region label, and view projection coordinates
@@ -2855,20 +2862,23 @@ print(__import__('json').dumps(result))
     # Solid pass
     _capture_pass("SOLID")
 
-    # Wireframe pass (if requested)
-    if include_wireframe:
-        set_raw = blender.send_command("execute_code_safe", {
-            "code": _make_shading_script("WIREFRAME"),
-            "required_mode": "OBJECT", "push_undo": False
-        })
-        _capture_pass("WIREFRAME")
-
-    # ── Restore shading ────────────────────────────────────────────────────
-    restore_shading = saved_state.get("shading", "SOLID")
-    blender.send_command("execute_code_safe", {
-        "code": _make_shading_script(restore_shading),
-        "required_mode": "OBJECT", "push_undo": False
-    })
+    # Wireframe pass (if requested). try/finally guarantees shading is restored
+    # even if the capture loop raises mid-pass (e.g. an MCP connection drop) —
+    # a bare sequential restore call after it would get skipped by that exception.
+    try:
+        if include_wireframe:
+            blender.send_command("execute_code_safe", {
+                "code": _make_shading_script("WIREFRAME"),
+                "required_mode": "OBJECT", "push_undo": False
+            })
+            _capture_pass("WIREFRAME")
+    finally:
+        if include_wireframe:
+            restore_shading = saved_state.get("shading", "SOLID")
+            blender.send_command("execute_code_safe", {
+                "code": _make_shading_script(restore_shading),
+                "required_mode": "OBJECT", "push_undo": False
+            })
 
     # ── Store metadata in session ──────────────────────────────────────────
     import datetime
@@ -3086,7 +3096,7 @@ else:
             cen = c["centroid"]
             fp  = c.get("view_projections", {{}}).get("FRONT", {{}})
             narrative_parts.append(
-                f"{{c['severity'].upper()}} {{label}} cluster #{i+1}:"
+                f"{{c['severity'].upper()}} {{label}} cluster #{{i+1}}:"
                 f" {{c['element_count']}} element(s) at world {{cen}},"
                 f" region '{{c['region_label']}}'"
                 f" (FRONT view approx x={{fp.get('x','?')}}, y={{fp.get('y','?')}})"
@@ -3262,42 +3272,8 @@ print(__import__('json').dumps(result))
             "for v in bm.verts: v.select = (len(v.link_edges) >= 6)"))
 
     for pass_name, select_mode, select_expr in ELEMENT_PASSES:
-        enter_script = f"""
-import bpy, bmesh
-obj = bpy.data.objects.get({repr(object_name)})
-result = {{"ok": False, "error": None, "found": 0}}
-if obj is None:
-    result["error"] = "Object not found"
-else:
-    try:
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        # Deselect all first
-        for f in bm.faces: f.select = False
-        for e in bm.edges: e.select = False
-        for v in bm.verts: v.select = False
-        # Set select mode and select problem elements
-        bpy.context.tool_settings.mesh_select_mode = (
-            {'select_mode' == 'VERT'}, {'select_mode' == 'EDGE'}, {'select_mode' == 'FACE'}
-        )
-        {select_expr}
-        bmesh.update_edit_mesh(obj.data)
-        found = sum(1 for f in bm.faces if f.select) if {repr(select_mode)} == 'FACE' else \\
-                sum(1 for e in bm.edges if e.select) if {repr(select_mode)} == 'EDGE' else \\
-                sum(1 for v in bm.verts if v.select)
-        result = {{"ok": True, "found": found}}
-    except Exception as ex:
-        result["error"] = str(ex)
-        try: bpy.ops.object.mode_set(mode='OBJECT')
-        except: pass
-print(__import__('json').dumps(result))
-"""
-        # Fix the select_mode tuple — can't use comparison in f-string cleanly,
-        # build it explicitly per mode
+        # select_mode tuple built explicitly per mode (can't use a comparison
+        # cleanly inside an f-string embedded in the generated script)
         sv = (select_mode == "VERT")
         se = (select_mode == "EDGE")
         sf = (select_mode == "FACE")
@@ -3350,25 +3326,24 @@ print(__import__('json').dumps(result))
                     pass
                 break
 
-        if ok:
-            # Capture 7 views in edit mode — view_axis still works in edit mode
-            # but execute_code_safe required_mode='OBJECT' won't let us run the
-            # view script, so we send it as a separate OBJECT-mode-agnostic call.
-            # Actually: view scripts don't change mesh — we just need the viewport
-            # to set the angle. Use required_mode=None via push_undo=False only.
-            for axis in ALL_VIEWS:
-                view_ok = _set_view_and_frame(axis)
-                if not view_ok:
-                    errors.append(f"{pass_name}/{axis}: view set failed")
-                    continue
-                try:
-                    images_out.append(Image(data=_screenshot(), format="png"))
-                except RuntimeError as e:
-                    errors.append(f"{pass_name}/{axis}: {e}")
-            passes_done.append(f"{pass_name}({found} elements highlighted)")
-
-        # Always exit edit mode — even if capture failed
-        exit_script = f"""
+        # Always exit edit mode — even if the capture loop below raises an
+        # exception execute_code_safe's own try/except doesn't catch (e.g. an
+        # MCP connection drop mid-capture). A bare sequential call here would
+        # get skipped by that exception; try/finally guarantees it runs.
+        try:
+            if ok:
+                for axis in ALL_VIEWS:
+                    view_ok = _set_view_and_frame(axis)
+                    if not view_ok:
+                        errors.append(f"{pass_name}/{axis}: view set failed")
+                        continue
+                    try:
+                        images_out.append(Image(data=_screenshot(), format="png"))
+                    except RuntimeError as e:
+                        errors.append(f"{pass_name}/{axis}: {e}")
+                passes_done.append(f"{pass_name}({found} elements highlighted)")
+        finally:
+            exit_script = f"""
 import bpy
 try:
     if bpy.context.object and bpy.context.object.mode == 'EDIT':
@@ -3377,9 +3352,9 @@ try:
 except Exception as ex:
     print(__import__('json').dumps({{"ok": False, "error": str(ex)}}))
 """
-        blender.send_command("execute_code_safe", {
-            "code": exit_script, "required_mode": "OBJECT", "push_undo": False
-        })
+            blender.send_command("execute_code_safe", {
+                "code": exit_script, "required_mode": "OBJECT", "push_undo": False
+            })
 
     # ══════════════════════════════════════════════════════════════════════
     # PASS 2 — Severity heat map via temporary emission materials
@@ -3506,10 +3481,14 @@ else:
                     pass
                 break
 
-        if sev_ok:
-            # Set MATERIAL shading so emission colors are visible
-            blender.send_command("execute_code_safe", {
-                "code": """
+        # try/finally guarantees material + shading restore even if capture
+        # raises mid-pass (e.g. an MCP connection drop) — a bare sequential
+        # call after the capture would get skipped by that exception.
+        try:
+            if sev_ok:
+                # Set MATERIAL shading so emission colors are visible
+                blender.send_command("execute_code_safe", {
+                    "code": """
 import bpy
 area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
 if area:
@@ -3517,19 +3496,18 @@ if area:
     if space: space.shading.type = 'MATERIAL'
 print(__import__('json').dumps({"ok": True}))
 """,
-                "required_mode": "OBJECT", "push_undo": False
-            })
-            _capture_7_views("severity_map", images_out, errors)
-            passes_done.append(
-                f"severity_map({sev_data.get('critical_faces',0)} critical, "
-                f"{sev_data.get('warning_faces',0)} warning faces colored)"
-            )
+                    "required_mode": "OBJECT", "push_undo": False
+                })
+                _capture_7_views("severity_map", images_out, errors)
+                passes_done.append(
+                    f"severity_map({sev_data.get('critical_faces',0)} critical, "
+                    f"{sev_data.get('warning_faces',0)} warning faces colored)"
+                )
+        finally:
+            if sev_ok:
+                orig_face_mats  = sev_data.get("orig_face_mats", [])
 
-        # ALWAYS restore — try/finally equivalent: run restore regardless of ok
-        orig_face_mats  = sev_data.get("orig_face_mats", [])
-        orig_slot_count = sev_data.get("orig_slot_count", 0)
-
-        restore_script = f"""
+                restore_script = f"""
 import bpy
 obj = bpy.data.objects.get({repr(object_name)})
 if obj:
@@ -3551,13 +3529,13 @@ if obj:
     obj.data.update()
 print(__import__('json').dumps({{"ok": True}}))
 """
-        blender.send_command("execute_code_safe", {
-            "code": restore_script, "required_mode": "OBJECT", "push_undo": False
-        })
+                blender.send_command("execute_code_safe", {
+                    "code": restore_script, "required_mode": "OBJECT", "push_undo": False
+                })
 
-        # Restore original shading
-        blender.send_command("execute_code_safe", {
-            "code": """
+                # Restore original shading
+                blender.send_command("execute_code_safe", {
+                    "code": """
 import bpy
 area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
 if area:
@@ -3565,8 +3543,8 @@ if area:
     if space: space.shading.type = 'SOLID'
 print(__import__('json').dumps({"ok": True}))
 """,
-            "required_mode": "OBJECT", "push_undo": False
-        })
+                    "required_mode": "OBJECT", "push_undo": False
+                })
 
     # ── Build return ───────────────────────────────────────────────────────
     summary = {
@@ -3591,60 +3569,55 @@ print(__import__('json').dumps({"ok": True}))
 
 
 @mcp.tool()
-def get_spatial_analysis(object_name: str, include_wireframe: bool = True) -> list:
+def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     """
-    SPATIAL ANALYSIS — The complete spatial intelligence compound tool.
+    SPATIAL ANALYSIS — Initial-inspection spatial intelligence: 7 clean views
+    (FRONT/BACK/LEFT/RIGHT/TOP/BOTTOM/PERSP) plus world-space problem
+    coordinates in one call. This is the default entry point for "look at
+    this mesh from every angle" — 7 images total, same cost as a single
+    get_multiview_capture() call.
 
-    Combines every visual and coordinate layer into one call:
+    deep=False (default): 7 solid views + get_problem_coordinates() data,
+      folded into a spatial narrative (world coords, region label, view
+      projection coords per problem cluster). No wireframe, no annotated
+      highlight passes, no heat map — just the 7 angles plus text.
 
-    1. get_problem_coordinates()  — world-space clusters with region labels
-                                    and view projection coordinates
-    2. get_multiview_capture()    — 7 clean views [+ 7 wireframe if requested]
-    3. get_annotated_capture()    — element highlights (edit mode, per problem type)
-                                    + severity heat map (colored materials)
-
-    Returns all images plus a unified spatial report that correlates what
-    Claude sees in each image with exact world coordinates:
-
-      "The CRITICAL ngon cluster (34 faces) is at world [0.23, 1.47, 1.82].
-       In the FRONT view it appears at normalised position x=0.42, y=0.78
-       (upper-center area). Look at the FRONT annotated_ngons image at that
-       position — the orange highlight confirms the location.
-       Region label: upper_front_center. Fix this before export."
-
-    This is the tool to call when you need complete spatial understanding
-    of a mesh's problems — not just what's wrong, but exactly where it is,
-    visible from every angle, highlighted for unambiguous identification.
+    deep=True: adds wireframe (+7), per-problem-type edit-mode highlights
+      (+21), and a severity heat map (+7) — up to 42 images total. Only use
+      this when you already know there's a specific problem and need to
+      visually pinpoint it after get_problem_coordinates/the 7-view pass
+      wasn't enough — it is expensive, don't reach for it by default.
 
     Parameters:
-      object_name      : Blender object name
-      include_wireframe: include wireframe views in multiview pass (default True)
+      object_name : Blender object name
+      deep        : False (default) = 7 images + coordinates.
+                    True = full 42-image annotated/heatmap breakdown.
 
-    Returns list: [multiview images] + [annotated images] + [coordinate JSON]
-                  + [unified spatial report dict]
+    Returns list: [images] + [unified spatial report dict]
     """
     all_images = []
     errors     = []
 
-    # ── Step 1: Problem coordinates (structured data) ──────────────────────
+    # ── Step 1: Problem coordinates (structured data, no images) ───────────
     coords_json = get_problem_coordinates(object_name)
     try:
         coords = json.loads(coords_json)
     except Exception:
         coords = {"error": "Could not parse coordinate data"}
 
-    # ── Step 2: Clean multiview (7 or 14 images) ──────────────────────────
-    mv_result = get_multiview_capture(object_name, include_wireframe=include_wireframe)
+    # ── Step 2: Clean multiview — 7 images, no wireframe by default ─────────
+    mv_result = get_multiview_capture(object_name, include_wireframe=deep)
     for item in mv_result:
         if isinstance(item, Image):
             all_images.append(item)
         # dict summary is the last item — skip, we build our own
 
-    # ── Step 3: Annotated captures (element highlights + severity map) ─────
-    ann_result = get_annotated_capture(object_name, modes="all")
-    for item in ann_result:
-        if isinstance(item, Image):
-            all_images.append(item)
+    # ── Step 3 (deep only): annotated highlights + severity heat map ───────
+    if deep:
+        ann_result = get_annotated_capture(object_name, modes="all")
+        for item in ann_result:
+            if isinstance(item, Image):
+                all_images.append(item)
 
     # ── Step 4: Build unified spatial report ──────────────────────────────
     narrative = []
@@ -3696,25 +3669,25 @@ def get_spatial_analysis(object_name: str, include_wireframe: bool = True) -> li
         narrative = ["No mesh problems detected. Mesh appears clean."]
 
     # Image index guide — helps Claude know which image number = which pass
-    wireframe_count = 7 if include_wireframe else 0
     idx = 0
     image_guide = []
     image_guide.append(f"Images 1-7: Clean solid views (FRONT,BACK,LEFT,RIGHT,TOP,BOTTOM,PERSP)")
     idx = 7
-    if include_wireframe:
+    if deep:
         image_guide.append(f"Images 8-14: Wireframe views (same order)")
         idx = 14
-    image_guide.append(f"Images {idx+1}-{idx+7}: Ngon highlight (orange = ngon faces selected)")
-    idx += 7
-    image_guide.append(f"Images {idx+1}-{idx+7}: Non-manifold edge highlight (highlighted edges)")
-    idx += 7
-    image_guide.append(f"Images {idx+1}-{idx+7}: High-valence pole highlight (highlighted verts)")
-    idx += 7
-    image_guide.append(f"Images {idx+1}-{idx+7}: Severity heat map (red=critical, orange=warning, green=clean)")
+        image_guide.append(f"Images {idx+1}-{idx+7}: Ngon highlight (orange = ngon faces selected)")
+        idx += 7
+        image_guide.append(f"Images {idx+1}-{idx+7}: Non-manifold edge highlight (highlighted edges)")
+        idx += 7
+        image_guide.append(f"Images {idx+1}-{idx+7}: High-valence pole highlight (highlighted verts)")
+        idx += 7
+        image_guide.append(f"Images {idx+1}-{idx+7}: Severity heat map (red=critical, orange=warning, green=clean)")
 
     unified_report = {
         "spatial_analysis":    "complete",
         "object":              object_name,
+        "deep":                deep,
         "total_images":        len(all_images),
         "image_guide":         image_guide,
         "coordinate_summary": {
@@ -3729,9 +3702,12 @@ def get_spatial_analysis(object_name: str, include_wireframe: bool = True) -> li
         "raw_coordinates":     coords,
         "how_to_read": (
             "1. Read spatial_narrative — each entry tells you WHAT, HOW MANY, WHERE (world coords + view coords + region label). "
-            "2. Use image_guide to find the right image number for each problem type. "
-            "3. Look at the view_projections x/y (0=left/bottom, 1=right/top) to locate the cluster in that image. "
-            "4. The severity heat map (last 7 images) shows priority at a glance: red=fix first."
+            "2. view_projections x/y (0=left/bottom, 1=right/top) locates the cluster within any of the 7 images. "
+            + ("3. Use image_guide to find the right image number for each problem type. "
+               "4. The severity heat map (last 7 images) shows priority at a glance: red=fix first."
+               if deep else
+               "3. Need a visual pinpoint beyond coordinates? Call get_spatial_analysis(object_name, deep=True) "
+               "for annotated highlights + severity heat map (42 images — expensive, use only when needed).")
         ),
     }
 
