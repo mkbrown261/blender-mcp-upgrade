@@ -2193,6 +2193,15 @@ NEVER:
      gives exact world position, region label, and view projection coordinates
   ✗ Leave mesh in edit mode if annotated capture fails — restore is guaranteed
      but confirm with session_status if something went wrong
+  ✗ Call generate_collision_mesh() without asking first — many Unreal teams
+     build collision in-engine instead of in Blender. A missing UCX_/UBX_
+     mesh is a WORKFLOW CHOICE, not a defect to silently fix. Ask: "want me
+     to generate a collision mesh in Blender, or are you handling that in
+     Unreal?" before ever calling this tool.
+  ✗ Dump export_for_unreal output loose in an arbitrary directory —
+     organize_folder=True (default) nests it under <dir>/<AssetName>/ with
+     textures copied alongside; don't pass organize_folder=False without
+     the user asking for that specifically.
 
 ── REPORT FORMAT ──────────────────────────────────────────────────────────────
 ── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
@@ -4779,10 +4788,14 @@ def export_for_unreal(
     scale: float = 100.0,
     embed_textures: bool = False,
     export_animations: bool = False,
+    organize_folder: bool = True,
 ) -> str:
     """
     Export a named object/armature as an FBX file with UE5 conventions:
     -Z forward / Y up axis, scale ×100 (Blender m → UE5 cm), triangulation.
+    organize_folder=True (default): nests output under <dir>/<AssetName>/
+    and copies referenced textures alongside the FBX instead of leaving
+    the FBX loose with textures referenced at scattered original paths.
     Post-export validates file exists and has non-zero size.
     """
     return _send_json(
@@ -4794,6 +4807,7 @@ def export_for_unreal(
         scale=scale,
         embed_textures=embed_textures,
         export_animations=export_animations,
+        organize_folder=organize_folder,
     )
 
 
@@ -4837,6 +4851,98 @@ def execute_code_safe(code: str, required_mode: Optional[str] = None, push_undo:
 def prepare_lod_names(base_name: str, lod_count: int = 4) -> str:
     """Generate/validate LOD naming convention (e.g. SM_AssetName_LOD0..N) for a given base object name."""
     return _send_json("prepare_lod_names", base_name=base_name, lod_count=lod_count)
+
+
+@mcp.tool()
+def generate_collision_mesh(object_name: str, collision_type: str = "convex") -> str:
+    """
+    COLLISION MESH — creates a UCX_/UBX_ collision object for UE5 import.
+
+    ASK THE USER FIRST before calling this. Many Unreal teams build collision
+    directly in-engine instead of in Blender — this is a workflow choice, not
+    a mechanical fix like a mesh repair. Only call after explicit confirmation
+    that Blender-side collision generation (not in-Unreal) is what's wanted.
+
+    collision_type: "convex" (UCX_ prefix, tight-fitting hull, duplicates+
+    reduces the source mesh) | "box" (UBX_ prefix, axis-aligned bounding box —
+    cheaper, looser fit). Creates a new object, hidden in the viewport by
+    default (collision meshes aren't meant to be seen).
+    """
+    script = r"""
+import bpy, json
+from mathutils import Vector
+
+src = bpy.data.objects.get('{OBJ}')
+if src is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+else:
+    col_type = '{COLTYPE}'
+    prefix   = "UCX_" if col_type == "convex" else "UBX_"
+    col_name = prefix + '{OBJ}'
+
+    existing = bpy.data.objects.get(col_name)
+    if existing:
+        bpy.data.objects.remove(existing, do_unlink=True)
+
+    bpy.context.view_layer.objects.active = src
+    bpy.ops.object.select_all(action='DESELECT')
+
+    if col_type == "convex":
+        src.select_set(True)
+        bpy.ops.object.duplicate()
+        hull_obj = bpy.context.active_object
+        hull_obj.name = col_name
+        hull_obj.data.name = col_name + "_mesh"
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.convex_hull()
+        bpy.ops.object.mode_set(mode='OBJECT')
+    else:
+        corners = [Vector(c) for c in src.bound_box]
+        local_min = Vector((min(c.x for c in corners), min(c.y for c in corners), min(c.z for c in corners)))
+        local_max = Vector((max(c.x for c in corners), max(c.y for c in corners), max(c.z for c in corners)))
+        center = (local_min + local_max) / 2
+        size   = local_max - local_min
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=src.matrix_world @ center)
+        hull_obj = bpy.context.active_object
+        hull_obj.name = col_name
+        hull_obj.data.name = col_name + "_mesh"
+        hull_obj.rotation_euler = src.rotation_euler.copy()
+        hull_obj.scale = (
+            max(size.x, 0.001) * src.scale.x,
+            max(size.y, 0.001) * src.scale.y,
+            max(size.z, 0.001) * src.scale.z,
+        )
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    hull_obj.hide_set(True)
+
+    print(json.dumps({
+        "collision_object": col_name,
+        "collision_type": col_type,
+        "verts": len(hull_obj.data.vertices),
+        "faces": len(hull_obj.data.polygons),
+        "hidden_in_viewport": True,
+        "note": "Object created and hidden. Export alongside the source mesh in the same FBX for UE5 to pick it up as collision.",
+    }))
+""".replace("{OBJ}", object_name.replace("'", "\\'")).replace("{COLTYPE}", collision_type)
+
+    try:
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {
+            "code": script, "required_mode": "OBJECT", "push_undo": True
+        })
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.dumps(json.loads(line), indent=2)
+        return json.dumps({"error": "No JSON output from generate_collision_mesh", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in generate_collision_mesh: {e}")
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()

@@ -1532,11 +1532,15 @@ class BlenderMCPServer:
                 # Collision mesh
                 col_variants = ([f"UCX_{name}", f"UBX_{name}", f"USP_{name}"]
                                 + [f"UCX_{name}_{i:02d}" for i in range(5)])
-                has_collision = any(bpy.data.objects.get(cn) for cn in col_variants)
+                found_collision = next((bpy.data.objects.get(cn) for cn in col_variants
+                                         if bpy.data.objects.get(cn)), None)
+                has_collision = found_collision is not None
                 checks["collision_mesh"] = {
                     "pass": has_collision,
                     "severity": "warning",
-                    "detail": f"No UCX_/UBX_ collision mesh — UE5 will use auto-convex hull",
+                    "detail": (f"Collision mesh '{found_collision.name}' found"
+                               if has_collision else
+                               "No UCX_/UBX_ collision mesh — UE5 will use auto-convex hull"),
                 }
 
                 # LOD naming
@@ -1607,24 +1611,42 @@ class BlenderMCPServer:
     def export_for_unreal(self, name, export_path,
                            apply_modifiers=True, triangulate=True,
                            scale=100.0, embed_textures=False,
-                           export_animations=False):
+                           export_animations=False, organize_folder=True):
         """
         Export object/armature as FBX with correct UE5 settings.
         FIX: pre-export QA gate (warns but doesn't block); always includes ARMATURE
              in object_types when exporting animations; path validation added.
+
+        organize_folder=True (default): nests the export under
+        <given_dir>/<AssetName>/ instead of dropping the FBX loose in
+        whatever directory was given, and copies referenced textures into
+        that same folder (path_mode='COPY') instead of leaving them
+        referenced at their original, possibly scattered, absolute paths.
         """
         try:
             obj = bpy.data.objects.get(name)
             if not obj:
                 return {"error": f"Object '{name}' not found"}
 
-            # Validate path
-            if not export_path.lower().endswith('.fbx'):
-                export_path = export_path.rstrip('/\\') + '.fbx'
+            # Split the given path into a base directory + desired filename,
+            # whether export_path was given as a directory or a full .fbx path.
+            if export_path.lower().endswith('.fbx'):
+                base_dir = os.path.dirname(export_path)
+                fbx_filename = os.path.basename(export_path)
+            else:
+                base_dir = export_path.rstrip('/\\')
+                fbx_filename = f"{name}.fbx"
 
-            export_dir = os.path.dirname(export_path)
+            if organize_folder:
+                asset_folder = re.sub(r'[^A-Za-z0-9_\-]', '_', name)
+                export_dir = os.path.join(base_dir, asset_folder) if base_dir else asset_folder
+            else:
+                export_dir = base_dir
+
             if export_dir and not os.path.exists(export_dir):
                 os.makedirs(export_dir, exist_ok=True)
+
+            export_path = os.path.join(export_dir, fbx_filename) if export_dir else fbx_filename
 
             # FIX: pre-export advisory QA (non-blocking)
             qa = self.detect_mesh_problems(name) if obj.type == 'MESH' else {}
@@ -1669,7 +1691,10 @@ class BlenderMCPServer:
                 bake_anim=export_animations,
                 bake_anim_use_all_bones=export_animations,
                 bake_anim_simplify_factor=1.0,
-                path_mode='COPY' if embed_textures else 'AUTO',
+                # 'COPY' copies referenced texture files next to the FBX (relative
+                # paths) instead of 'AUTO', which leaves them referenced at their
+                # original absolute paths wherever they happened to be on disk.
+                path_mode='COPY' if (embed_textures or organize_folder) else 'AUTO',
                 embed_textures=embed_textures,
             )
 
@@ -1686,6 +1711,8 @@ class BlenderMCPServer:
                 "exported": True,
                 "object": name,
                 "path": export_path,
+                "export_folder": export_dir,
+                "organized_in_folder": organize_folder,
                 "file_size_kb": round(file_size / 1024, 1),
                 "pre_export_warnings": pre_export_warnings,
                 "settings": {
@@ -1694,6 +1721,11 @@ class BlenderMCPServer:
                     "apply_modifiers": apply_modifiers,
                     "animations": export_animations,
                     "axis": "-Z forward, Y up (UE5 standard)",
+                    "textures": (
+                        "embedded in FBX" if embed_textures else
+                        "copied into export_folder alongside FBX" if organize_folder else
+                        "referenced at original file paths (not copied)"
+                    ),
                 },
             }
         except Exception as e:
