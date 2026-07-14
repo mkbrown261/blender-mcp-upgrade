@@ -3726,25 +3726,39 @@ def _annotate_image_with_clusters(
         # Composite the overlay onto the original image
         pil_img = PILImage.alpha_composite(pil_img, overlay)
 
-        # Add a small legend strip at the top-left corner if anything was drawn
+        # Add a small legend strip if anything was drawn. Anchored to the
+        # BOTTOM-left corner with an opaque background panel — Blender's own
+        # viewport chrome (mode dropdown, menu bar, object/collection name,
+        # grid scale text) all live in the TOP-left corner, so a top-left
+        # legend used to render on top of and blend into that UI text.
         if drawn > 0:
-            legend_draw = ImageDraw.Draw(pil_img)
+            # mode="RGBA" is required for ImageDraw to actually alpha-blend
+            # fill colors against the existing image instead of overwriting
+            # pixels (and their alpha) outright.
+            legend_draw = ImageDraw.Draw(pil_img, "RGBA")
             legend_items = [
                 ("N = ngon",        _OVERLAY_COLORS["critical"][0]),
                 ("M = non-manifold",_OVERLAY_COLORS["warning"][0]),
                 ("P = pole",        _OVERLAY_COLORS["pole"][0]),
                 ("red=critical, orange=warning, blue=pole", None),
             ]
-            ly = 6
+            row_h = 14
+            pad   = 6
+            panel_h = len(legend_items) * row_h + pad
+            panel_w = 190
+            panel_top = H - panel_h - pad
+            legend_draw.rectangle(
+                [0, panel_top, panel_w, H],
+                fill=(20, 20, 20, 190),
+            )
+            ly = panel_top + pad // 2
             for legend_text, color in legend_items:
                 if color:
                     legend_draw.rectangle([6, ly, 18, ly + 10], fill=color + (220,), outline=(255,255,255,255))
                     legend_draw.text((22, ly - 1), legend_text, font=font_small, fill=(255, 255, 255, 255))
-                    legend_draw.text((23, ly),     legend_text, font=font_small, fill=(30,  30,  30, 200))
-                    legend_draw.text((22, ly - 1), legend_text, font=font_small, fill=(255, 255, 255, 255))
                 else:
                     legend_draw.text((6, ly), legend_text, font=font_small, fill=(220, 220, 220, 255))
-                ly += 14
+                ly += row_h
 
         # Convert back to RGB PNG bytes
         out = io.BytesIO()
