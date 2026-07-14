@@ -241,6 +241,11 @@ class BlenderMCPServer:
             "prepare_lod_names": self.prepare_lod_names,
             # --- Session ---
             "get_session_log": self.get_session_log,
+            # --- Construction Mode ---
+            "get_asset_library": self.get_asset_library,
+            "execute_construction": self.execute_construction,
+            "get_construction_positions": self.get_construction_positions,
+            "move_object": self.move_object,
         }
 
         # Add Polyhaven handlers only if enabled
@@ -3850,6 +3855,195 @@ class BlenderMCPServer:
             except Exception as e:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
     #endregion
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONSTRUCTION MODE HANDLERS
+    # Called by server.py construction_mode tools via TCP
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_asset_library(self):
+        """
+        Return all SM_ prefixed objects in the current scene.
+        Used by construction_mode() to build the filtered asset vocabulary.
+        Returns unique asset base names (strips trailing .001 etc.) and
+        also the full list of object names for instance awareness.
+        """
+        import re
+        sm_objects = []
+        sm_base_names = set()
+
+        for obj in bpy.data.objects:
+            if obj.name.startswith("SM_"):
+                sm_objects.append(obj.name)
+                # Strip Blender's duplicate suffix (.001, .002 etc.)
+                base = re.sub(r'\.\d{3}$', '', obj.name)
+                sm_base_names.add(base)
+
+        return {
+            "sm_assets": sorted(sm_base_names),          # unique base names → manifest lookup
+            "sm_object_instances": sorted(sm_objects),   # full object names → for reference
+            "total_unique": len(sm_base_names),
+            "total_instances": len(sm_objects),
+        }
+
+    def execute_construction(self, placements: list, collection_name: str, scene_name: str):
+        """
+        Place assets in Blender from a construction plan.
+        Each placement: {instance_id, asset, world_x, world_y, world_z,
+                         rotation_x_deg, rotation_y_deg, rotation_z_deg,
+                         scale, mirrored}
+        Assets are duplicated from scene objects or linked from data.
+        All placed objects go into a named collection.
+        Returns: {placed: [{instance_id, blender_name}], failed: [{instance_id, reason}]}
+        """
+        import math
+
+        placed = []
+        failed = []
+
+        # Get or create the target collection
+        if collection_name not in bpy.data.collections:
+            coll = bpy.data.collections.new(collection_name)
+            bpy.context.scene.collection.children.link(coll)
+        else:
+            coll = bpy.data.collections[collection_name]
+
+        for p in placements:
+            asset_name = p.get("asset", "")
+            instance_id = p.get("instance_id", asset_name)
+
+            # Find source object — exact name or base name match
+            source_obj = bpy.data.objects.get(asset_name)
+            if source_obj is None:
+                # Try case-insensitive search
+                for obj in bpy.data.objects:
+                    import re
+                    base = re.sub(r'\.\d{3}$', '', obj.name)
+                    if base == asset_name:
+                        source_obj = obj
+                        break
+
+            if source_obj is None:
+                failed.append({
+                    "instance_id": instance_id,
+                    "asset": asset_name,
+                    "reason": f"Asset '{asset_name}' not found in scene objects"
+                })
+                continue
+
+            try:
+                # Duplicate the source object (linked duplicate = shared mesh data)
+                new_obj = source_obj.copy()
+                new_obj.data = source_obj.data  # shared mesh — memory efficient
+                new_obj.name = instance_id
+
+                # Link to construction collection (not scene root)
+                coll.objects.link(new_obj)
+
+                # Set world position
+                new_obj.location.x = float(p.get("world_x", 0.0))
+                new_obj.location.y = float(p.get("world_y", 0.0))
+                new_obj.location.z = float(p.get("world_z", 0.0))
+
+                # Set rotation (degrees → radians)
+                rx = math.radians(float(p.get("rotation_x_deg", 0.0)))
+                ry = math.radians(float(p.get("rotation_y_deg", 0.0)))
+                rz = math.radians(float(p.get("rotation_z_deg", 0.0)))
+                new_obj.rotation_euler = (rx, ry, rz)
+
+                # Set scale
+                s = float(p.get("scale", 1.0))
+                new_obj.scale = (s, s, s)
+
+                # Mirror on X if requested
+                if p.get("mirrored", False):
+                    new_obj.scale.x = -abs(new_obj.scale.x)
+
+                placed.append({
+                    "instance_id": instance_id,
+                    "blender_name": new_obj.name,
+                    "asset": asset_name,
+                    "location": [new_obj.location.x, new_obj.location.y, new_obj.location.z],
+                })
+
+            except Exception as e:
+                failed.append({
+                    "instance_id": instance_id,
+                    "asset": asset_name,
+                    "reason": str(e),
+                })
+
+        # Force viewport update
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        return {
+            "placed": placed,
+            "failed": failed,
+            "collection": collection_name,
+            "placed_count": len(placed),
+            "failed_count": len(failed),
+        }
+
+    def get_construction_positions(self, object_names: list, collection_name: str = ""):
+        """
+        Read current world positions of construction objects from Blender.
+        Called by sync_construction_state() to resync agent state after
+        manual viewport edits.
+        Returns: {positions: {blender_name: {x, y, z, rotation_z, scale}}}
+        """
+        import math
+        positions = {}
+
+        for name in object_names:
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            positions[name] = {
+                "x": round(obj.location.x, 4),
+                "y": round(obj.location.y, 4),
+                "z": round(obj.location.z, 4),
+                "rotation_x": round(math.degrees(obj.rotation_euler.x), 2),
+                "rotation_y": round(math.degrees(obj.rotation_euler.y), 2),
+                "rotation_z": round(math.degrees(obj.rotation_euler.z), 2),
+                "scale": round(obj.scale.x, 4),  # assume uniform scale
+            }
+
+        return {"positions": positions, "found": len(positions), "requested": len(object_names)}
+
+    def move_object(self, name: str, x: float, y: float, z: float,
+                    rotation_z: float = 0.0, scale: float = 1.0):
+        """
+        Move/rotate/scale an object to absolute world coordinates.
+        Called by adjust_asset() for post-construction refinement.
+        Uses absolute positioning (not delta) — server.py tracks delta logic.
+        """
+        import math
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return {"error": f"Object '{name}' not found in scene"}
+
+        obj.location.x = float(x)
+        obj.location.y = float(y)
+        obj.location.z = float(z)
+        obj.rotation_euler.z = math.radians(float(rotation_z))
+        s = float(scale)
+        obj.scale = (s, s, s)
+
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        return {
+            "status": "moved",
+            "name": name,
+            "location": [obj.location.x, obj.location.y, obj.location.z],
+            "rotation_z_deg": rotation_z,
+            "scale": scale,
+        }
 
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):

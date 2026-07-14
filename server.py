@@ -10385,6 +10385,857 @@ print(json.dumps(result))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONSTRUCTION MODE — Reality-to-Scene Pipeline
+# Bridges reference images → asset manifest → Blender placement
+#
+# Token strategy:
+#   - Master manifest (ERYNDOR_master_manifest.json) lives on disk, never sent raw
+#   - Per-session compressed vocabulary = 1 line per asset ≈ 15 tokens each
+#   - Claude only sees the compressed lines + image, not the full JSON
+#   - Total vocab cost stays flat regardless of master manifest size
+#
+# Flow:
+#   construction_mode() → get_asset_library (addon) → filter manifest →
+#   compress vocab → analyze_reference_scene (Claude vision) →
+#   calculate_world_coordinates → construction_preview → execute_construction (addon)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONSTRUCTION_STATE: dict = {}   # live scene state: {instance_name: {asset, x, y, z, rx, ry, rz, sx}}
+_MANIFEST_CACHE: dict = {}       # loaded manifest, invalidated when manifest file changes
+
+
+def _load_manifest(manifest_path: str) -> dict:
+    """Load and cache the master manifest JSON. Re-reads if file is newer than cache."""
+    global _MANIFEST_CACHE
+    p = Path(manifest_path)
+    if not p.exists():
+        return {}
+    mtime = p.stat().st_mtime
+    if _MANIFEST_CACHE.get("_path") == manifest_path and _MANIFEST_CACHE.get("_mtime") == mtime:
+        return _MANIFEST_CACHE
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["_path"] = manifest_path
+    data["_mtime"] = mtime
+    _MANIFEST_CACHE = data
+    return data
+
+
+def _compress_manifest_vocab(manifest: dict, scene_asset_names: list[str]) -> str:
+    """
+    Convert manifest to token-efficient one-line-per-asset summary.
+    Only includes assets present in the current Blender scene.
+    Format: NAME | category | placement_rules | WxDxHm | description
+    ~15 tokens per asset. Safe to send to Claude in every construction call.
+    """
+    assets = manifest.get("assets", {})
+    lines = []
+    for name in scene_asset_names:
+        if name not in assets:
+            # Asset in scene but not in manifest — include with minimal info
+            lines.append(f"{name} | unknown | GROUND_PLACED | ?x?x?m | not yet in manifest")
+            continue
+        a = assets[name]
+        d = a.get("dimensions_meters", {})
+        dim = f"{d.get('x','?')}x{d.get('y','?')}x{d.get('z','?')}m"
+        rules = ",".join(a.get("placement_rules", []))
+        cat = a.get("category", "unknown")
+        desc = a.get("description", "")[:60]
+        notes = a.get("notes", "")[:60]
+        lines.append(f"{name} | {cat} | {rules} | {dim} | {desc} | {notes}")
+    return "\n".join(lines)
+
+
+def _find_manifest(hint_path: str = "") -> str:
+    """
+    Locate ERYNDOR_master_manifest.json. Search order:
+    1. hint_path if provided
+    2. Same directory as server.py
+    3. Current working directory
+    Returns empty string if not found.
+    """
+    candidates = []
+    if hint_path:
+        candidates.append(Path(hint_path))
+    candidates.append(Path(__file__).parent / "ERYNDOR_master_manifest.json")
+    candidates.append(Path.cwd() / "ERYNDOR_master_manifest.json")
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return ""
+
+
+@mcp.tool()
+def load_manifest(manifest_path: str = "") -> str:
+    """
+    Load the ERYNDOR master asset manifest and report what's in it.
+    Auto-discovers manifest next to server.py if no path given.
+    Call this first in any construction session to confirm manifest is readable.
+    Returns: asset count, world name, scale reference, list of all known assets.
+    """
+    path = _find_manifest(manifest_path)
+    if not path:
+        return json.dumps({
+            "error": "ERYNDOR_master_manifest.json not found",
+            "searched": [
+                str(Path(__file__).parent / "ERYNDOR_master_manifest.json"),
+                str(Path.cwd() / "ERYNDOR_master_manifest.json"),
+            ],
+            "fix": "Place ERYNDOR_master_manifest.json next to server.py, or pass manifest_path explicitly."
+        }, indent=2)
+    manifest = _load_manifest(path)
+    assets = manifest.get("assets", {})
+    meta = manifest.get("_meta", {})
+    return json.dumps({
+        "status": "ok",
+        "manifest_path": path,
+        "world": meta.get("world", "unknown"),
+        "scale_reference": meta.get("scale_reference_asset"),
+        "scale_reference_height_meters": meta.get("scale_reference_height_meters"),
+        "total_assets": len(assets),
+        "asset_names": sorted(assets.keys()),
+    }, indent=2)
+
+
+@mcp.tool()
+def add_asset_to_manifest(
+    asset_name: str,
+    category: str,
+    subcategory: str,
+    placement_rules: str,
+    width_m: float,
+    depth_m: float,
+    height_m: float,
+    description: str,
+    vision_keywords: str,
+    notes: str = "",
+    can_mirror: bool = True,
+    can_array: bool = False,
+    array_axis: str = "X",
+    manifest_path: str = ""
+) -> str:
+    """
+    Add a new SM_ asset to the ERYNDOR master manifest. Call once per new asset — never again.
+    
+    Args:
+        asset_name: Exact Blender name e.g. SM_Wooden_Door
+        category: building | industrial | prop | ground | overhead | character
+        subcategory: e.g. residential_ruined, pipe_straight, street_light
+        placement_rules: comma-separated from: GROUND_PLACED, WALL_ATTACHED,
+                         CEILING_HUNG, FREESTANDING, TILEABLE, CONNECTOR,
+                         SCATTER, UNIQUE
+        width_m: asset width in meters (X axis)
+        depth_m: asset depth in meters (Y axis)  
+        height_m: asset height in meters (Z axis)
+        description: one sentence description of what the asset looks like
+        vision_keywords: comma-separated words Claude vision might use to describe this asset
+        notes: placement tips, compatible assets, special handling
+        can_mirror: whether the asset can be X-mirrored for variation
+        can_array: whether the asset tiles/arrays cleanly
+        array_axis: X, Y, or Z — which axis arrays along
+        manifest_path: override manifest location (optional)
+    """
+    path = _find_manifest(manifest_path)
+    if not path:
+        # Create next to server.py if it doesn't exist yet
+        path = str(Path(__file__).parent / "ERYNDOR_master_manifest.json")
+
+    if Path(path).exists():
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    else:
+        manifest = {
+            "_meta": {
+                "world": "Eryndor",
+                "version": "1.0",
+                "scale_reference_asset": "SM_Wooden_Door",
+                "scale_reference_height_meters": 2.1,
+            },
+            "assets": {}
+        }
+
+    if asset_name in manifest["assets"]:
+        return json.dumps({
+            "status": "already_exists",
+            "asset": asset_name,
+            "message": f"{asset_name} is already in the manifest. Use update_asset_in_manifest() to modify it.",
+        }, indent=2)
+
+    manifest["assets"][asset_name] = {
+        "category": category,
+        "subcategory": subcategory,
+        "placement_rules": [r.strip() for r in placement_rules.split(",")],
+        "dimensions_meters": {"x": width_m, "y": depth_m, "z": height_m},
+        "description": description,
+        "can_mirror": can_mirror,
+        "can_array": can_array,
+        "array_axis": array_axis,
+        "pivot": "base_center",
+        "vision_keywords": [k.strip() for k in vision_keywords.split(",")],
+        "notes": notes,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    # Invalidate cache
+    global _MANIFEST_CACHE
+    _MANIFEST_CACHE = {}
+
+    return json.dumps({
+        "status": "added",
+        "asset": asset_name,
+        "manifest_path": path,
+        "total_assets_now": len(manifest["assets"]),
+    }, indent=2)
+
+
+@mcp.tool()
+def construction_mode(
+    reference_image_path: str,
+    scene_name: str,
+    scale_anchor_asset: str = "SM_Wooden_Door",
+    scale_anchor_height_meters: float = 2.1,
+    manifest_path: str = "",
+    alley_width_meters: float = 4.5,
+    camera_height_meters: float = 1.7
+) -> str:
+    """
+    CONSTRUCTION MODE — core tool. Analyzes a reference image and places your
+    Eryndor assets in Blender to match the scene. Runs the full pipeline:
+    load manifest → read scene assets → compress vocabulary → vision analysis →
+    coordinate calculation → preview → (on approval) execute placement.
+
+    MetaHuman scale baseline: SM_Wooden_Door = 2.1m tall is the scale anchor.
+    All placements are calculated relative to this reference.
+
+    Args:
+        reference_image_path: absolute path to reference image (JPG/PNG)
+        scene_name: name for this construction e.g. "eryndor_alley_v01"
+        scale_anchor_asset: which asset to use as scale reference
+        scale_anchor_height_meters: real-world height of scale anchor in meters
+        manifest_path: override manifest path (optional — auto-discovers by default)
+        alley_width_meters: approximate width of scene in meters (helps depth calc)
+        camera_height_meters: approximate camera height for coordinate calc
+
+    Returns: construction plan with asset placements. Confirm with
+             execute_construction(scene_name) to place assets in Blender.
+    """
+    try:
+        # ── 1. Load manifest ──────────────────────────────────────────────────
+        mpath = _find_manifest(manifest_path)
+        if not mpath:
+            return json.dumps({"error": "Manifest not found. Run load_manifest() first."}, indent=2)
+        manifest = _load_manifest(mpath)
+
+        # ── 2. Read active scene assets from Blender ──────────────────────────
+        scene_result = _send_json("get_asset_library", {})
+        try:
+            scene_data = json.loads(scene_result) if isinstance(scene_result, str) else scene_result
+        except Exception:
+            scene_data = {}
+
+        scene_assets = scene_data.get("sm_assets", [])
+        if not scene_assets:
+            return json.dumps({
+                "error": "No SM_ assets found in current Blender scene.",
+                "fix": "Open your construction .blend file with SM_ assets before running construction_mode()."
+            }, indent=2)
+
+        # ── 3. Compress vocabulary (token-safe) ───────────────────────────────
+        vocab = _compress_manifest_vocab(manifest, scene_assets)
+        meta = manifest.get("_meta", {})
+        scale_ref = meta.get("scale_reference_asset", scale_anchor_asset)
+        scale_h = meta.get("scale_reference_height_meters", scale_anchor_height_meters)
+
+        # ── 4. Load and encode reference image ────────────────────────────────
+        img_path = Path(reference_image_path)
+        if not img_path.exists():
+            return json.dumps({"error": f"Reference image not found: {reference_image_path}"}, indent=2)
+
+        with open(img_path, "rb") as f:
+            img_bytes = f.read()
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        suffix = img_path.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+
+        # ── 5. Build vision analysis prompt ──────────────────────────────────
+        vision_prompt = f"""You are a 3D scene layout analyst for the Eryndor game world.
+Scale reference: {scale_ref} = {scale_h}m tall. All MetaHuman-scale (1 Blender unit = 1 meter).
+
+AVAILABLE ASSETS (name | category | placement | dimensions | description | notes):
+{vocab}
+
+Analyze this reference image and produce a JSON scene placement plan.
+
+Rules:
+- ONLY use assets from the list above. Never invent asset names.
+- Frame coordinates: x=0.0 is far left, x=1.0 is far right, y=0.0 is top, y=1.0 is bottom
+- Depth: objects lower in frame (higher frame_y) are closer to camera
+- For each asset instance provide a confidence: HIGH | MEDIUM | LOW
+- If something in the image has NO matching asset, add it to "gaps" array
+- If a match is approximate (not exact), set "approximate": true and explain in "match_reason"
+- Buildings: estimate how many instances of each building asset appear left and right walls
+- Pipes: trace the pipe run — list each segment as a separate instance with orientation
+- Scale all dimensions relative to {scale_ref} = {scale_h}m
+
+Return ONLY valid JSON in this exact structure:
+{{
+  "scene_analysis": {{
+    "camera_angle_degrees": <estimated degrees above horizon, 0=eye level, 90=top-down>,
+    "vanishing_point_frame_x": <0.0-1.0, horizontal position of vanishing point>,
+    "scene_width_meters": <estimated real-world width>,
+    "scene_depth_meters": <estimated real-world depth into image>,
+    "dominant_mood": "<brief description>"
+  }},
+  "placements": [
+    {{
+      "instance_id": "<asset_name>_001",
+      "asset": "<exact SM_ name from list>",
+      "frame_x": <0.0-1.0>,
+      "frame_y": <0.0-1.0>,
+      "relative_scale": <1.0=normal, 0.5=half, 2.0=double>,
+      "side": "left|right|center|background",
+      "facing_degrees": <0=facing camera, 90=facing right, 180=facing away, 270=facing left>,
+      "mirrored": <true|false>,
+      "confidence": "HIGH|MEDIUM|LOW",
+      "approximate": <true|false>,
+      "match_reason": "<why this asset was chosen>",
+      "placement_note": "<any special placement instruction>"
+    }}
+  ],
+  "pipe_runs": [
+    {{
+      "description": "<e.g. left wall vertical pipe run>",
+      "segments": [
+        {{"asset": "SM_copper_pipe", "instance_id": "SM_copper_pipe_001",
+          "frame_x": 0.15, "frame_y": 0.5, "orientation": "vertical|horizontal",
+          "side": "left", "confidence": "HIGH"}}
+      ]
+    }}
+  ],
+  "gaps": [
+    {{"description": "<what was seen in image>", "suggested_asset_name": "<SM_name_suggestion>"}}
+  ],
+  "approximate_matches": [
+    {{"instance_id": "<id>", "reason": "<why it's approximate>"}}
+  ]
+}}"""
+
+        # ── 6. Call Claude vision (self-call via MCP context) ─────────────────
+        # We use execute_code_safe in Blender to avoid a second network hop.
+        # The vision analysis is done by embedding the prompt + image into
+        # a structured response request returned to the caller (Claude itself).
+        # Claude reads the prompt and image and responds with the JSON plan.
+
+        # Return the analysis request — Claude will process image + prompt
+        # and the result feeds into calculate_world_coordinates
+        vision_request = {
+            "status": "vision_analysis_required",
+            "scene_name": scene_name,
+            "scene_assets": scene_assets,
+            "manifest_asset_count": len(manifest.get("assets", {})),
+            "scale_anchor": f"{scale_ref} = {scale_h}m",
+            "alley_width_meters": alley_width_meters,
+            "image_mime": mime,
+            "image_b64": img_b64,
+            "vision_prompt": vision_prompt,
+            "instruction": (
+                "Analyze the reference image using the vision_prompt above. "
+                "Then call calculate_world_coordinates(scene_name, vision_json, "
+                f"alley_width_meters={alley_width_meters}) with your JSON response "
+                "to convert frame positions to Blender world coordinates."
+            ),
+        }
+        return json.dumps(vision_request, indent=2)
+
+    except Exception as e:
+        logger.error(f"construction_mode error: {e}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def calculate_world_coordinates(
+    scene_name: str,
+    vision_json: str,
+    alley_width_meters: float = 4.5,
+    scale_anchor_height_meters: float = 2.1,
+    manifest_path: str = ""
+) -> str:
+    """
+    Convert vision analysis frame positions (0.0-1.0) to Blender world XYZ coordinates.
+    Call this immediately after construction_mode() returns the vision analysis result.
+
+    Uses perspective projection math:
+    - X axis: horizontal position across scene width
+    - Y axis: depth into scene (further from camera = larger Y)
+    - Z axis: height above ground plane
+
+    Args:
+        scene_name: same scene_name used in construction_mode()
+        vision_json: the JSON string returned by Claude's vision analysis
+        alley_width_meters: real-world scene width (from construction_mode or scene_analysis)
+        scale_anchor_height_meters: MetaHuman scale reference (SM_Wooden_Door = 2.1m)
+        manifest_path: override manifest path (optional)
+
+    Returns: construction plan with world XYZ coordinates, ready for
+             execute_construction() or user review.
+    """
+    try:
+        try:
+            vision = json.loads(vision_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"Invalid vision JSON: {e}"}, indent=2)
+
+        mpath = _find_manifest(manifest_path)
+        manifest = _load_manifest(mpath) if mpath else {}
+        assets_meta = manifest.get("assets", {})
+
+        scene_analysis = vision.get("scene_analysis", {})
+        vp_x = scene_analysis.get("vanishing_point_frame_x", 0.5)   # horizontal vanish point
+        scene_depth = scene_analysis.get("scene_depth_meters", 20.0)
+        scene_width = scene_analysis.get("scene_width_meters", alley_width_meters)
+        cam_angle = scene_analysis.get("camera_angle_degrees", 5.0)
+
+        placements_out = []
+        all_placements = vision.get("placements", [])
+
+        # Flatten pipe run segments into placements list
+        for run in vision.get("pipe_runs", []):
+            for seg in run.get("segments", []):
+                seg["_from_pipe_run"] = run.get("description", "")
+                all_placements.append(seg)
+
+        for p in all_placements:
+            asset_name = p.get("asset", "")
+            frame_x = float(p.get("frame_x", 0.5))
+            frame_y = float(p.get("frame_y", 0.5))
+            rel_scale = float(p.get("relative_scale", 1.0))
+            facing = float(p.get("facing_degrees", 0.0))
+            mirrored = p.get("mirrored", False)
+            side = p.get("side", "center")
+            orientation = p.get("orientation", "vertical")  # for pipes
+
+            # ── X coordinate: horizontal position ────────────────────────────
+            # frame_x 0=left edge, 1=right edge → world X centered at 0
+            world_x = (frame_x - 0.5) * scene_width
+
+            # ── Y coordinate: depth (distance from camera) ────────────────────
+            # frame_y 0=top(far), 1=bottom(near) — but perspective means
+            # objects cluster near vanishing point at horizon
+            # Linear approximation: frame_y 1.0 = 0m depth, 0.0 = scene_depth
+            # Corrected for vanishing point position
+            horizon_y = 1.0 - (cam_angle / 90.0)   # where horizon sits in frame
+            if frame_y >= horizon_y:
+                # Below horizon = foreground, closer
+                t = (frame_y - horizon_y) / max(1.0 - horizon_y, 0.01)
+                world_y = scene_depth * (1.0 - t) * 0.4   # 0m to 40% of depth
+            else:
+                # Above horizon = background
+                t = (horizon_y - frame_y) / max(horizon_y, 0.01)
+                world_y = scene_depth * (0.4 + t * 0.6)   # 40% to 100% of depth
+
+            # ── Z coordinate: height above ground ────────────────────────────
+            # Most ground-placed assets sit at Z=0
+            # Wall-attached assets need height offset based on their frame_y
+            asset_meta = assets_meta.get(asset_name, {})
+            placement_rules = asset_meta.get("placement_rules", [])
+            asset_h = asset_meta.get("dimensions_meters", {}).get("z", scale_anchor_height_meters)
+
+            world_z = 0.0
+            if "CEILING_HUNG" in placement_rules:
+                # Flags/banners hang from above — estimate ceiling height
+                # Ceiling ≈ building height * 0.8 as attach point
+                world_z = 6.0   # default overhead attach height
+            elif "WALL_ATTACHED" in placement_rules and "GROUND_PLACED" not in placement_rules:
+                # Pure wall-attached: height proportional to frame position
+                world_z = (1.0 - frame_y) * 5.0
+
+            # ── Rotation ─────────────────────────────────────────────────────
+            rot_z = facing   # degrees around Z (yaw)
+            rot_x = 0.0
+            if orientation == "horizontal":
+                rot_x = 90.0   # pipe lying on its side
+
+            # ── Scale ────────────────────────────────────────────────────────
+            scale = rel_scale
+
+            # ── Confidence radius ────────────────────────────────────────────
+            conf = p.get("confidence", "MEDIUM")
+            conf_radius = {"HIGH": 0.5, "MEDIUM": 1.5, "LOW": 3.0}.get(conf, 1.5)
+
+            placements_out.append({
+                "instance_id": p.get("instance_id", f"{asset_name}_auto"),
+                "asset": asset_name,
+                "world_x": round(world_x, 3),
+                "world_y": round(world_y, 3),
+                "world_z": round(world_z, 3),
+                "rotation_x_deg": round(rot_x, 1),
+                "rotation_y_deg": 0.0,
+                "rotation_z_deg": round(rot_z, 1),
+                "scale": round(scale, 3),
+                "mirrored": mirrored,
+                "side": side,
+                "confidence": conf,
+                "confidence_radius_meters": conf_radius,
+                "approximate": p.get("approximate", False),
+                "match_reason": p.get("match_reason", ""),
+                "placement_note": p.get("placement_note", p.get("_from_pipe_run", "")),
+            })
+
+        # Store in construction state for execute step
+        global _CONSTRUCTION_STATE
+        _CONSTRUCTION_STATE[scene_name] = {
+            "placements": placements_out,
+            "gaps": vision.get("gaps", []),
+            "approximate_matches": vision.get("approximate_matches", []),
+            "scene_analysis": scene_analysis,
+        }
+
+        # Build summary for human review
+        high = sum(1 for p in placements_out if p["confidence"] == "HIGH")
+        med  = sum(1 for p in placements_out if p["confidence"] == "MEDIUM")
+        low  = sum(1 for p in placements_out if p["confidence"] == "LOW")
+        approx = sum(1 for p in placements_out if p["approximate"])
+        gaps = vision.get("gaps", [])
+
+        summary_lines = []
+        for p in placements_out:
+            flag = " ⚠ APPROXIMATE" if p["approximate"] else ""
+            summary_lines.append(
+                f"  {p['instance_id']:35s} → ({p['world_x']:6.2f}, {p['world_y']:6.2f}, {p['world_z']:6.2f})  "
+                f"rot_z={p['rotation_z_deg']:6.1f}°  scale={p['scale']:.2f}  "
+                f"[{p['confidence']}±{p['confidence_radius_meters']}m]{flag}"
+            )
+
+        gap_lines = [f"  • {g['description']} → suggested: {g.get('suggested_asset_name','?')}" for g in gaps]
+
+        return json.dumps({
+            "status": "ready_for_review",
+            "scene_name": scene_name,
+            "total_placements": len(placements_out),
+            "confidence_summary": {"HIGH": high, "MEDIUM": med, "LOW": low},
+            "approximate_matches": approx,
+            "gaps_in_image": len(gaps),
+            "placement_summary": "\n".join(summary_lines),
+            "gaps": gap_lines,
+            "next_step": (
+                f"Review the placements above. "
+                f"Call execute_construction(scene_name='{scene_name}') to place all assets in Blender, "
+                f"or call adjust_construction_plan(scene_name, instructions) to modify before placing."
+            ),
+            "placements": placements_out,
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"calculate_world_coordinates error: {e}")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def execute_construction(scene_name: str, collection_name: str = "") -> str:
+    """
+    Execute the construction plan — place all assets in Blender.
+    Call after reviewing the output of calculate_world_coordinates().
+    Assets are grouped into a named collection for easy management.
+
+    Args:
+        scene_name: the scene_name used in construction_mode()
+        collection_name: Blender collection name (default: CONSTRUCTION_<scene_name>)
+
+    Returns: placement results — what succeeded, what failed, total placed.
+    """
+    global _CONSTRUCTION_STATE
+    if scene_name not in _CONSTRUCTION_STATE:
+        return json.dumps({
+            "error": f"No construction plan found for scene '{scene_name}'.",
+            "fix": "Run construction_mode() and calculate_world_coordinates() first."
+        }, indent=2)
+
+    plan = _CONSTRUCTION_STATE[scene_name]
+    placements = plan.get("placements", [])
+    coll_name = collection_name or f"CONSTRUCTION_{scene_name}"
+
+    result = _send_json("execute_construction", {
+        "placements": placements,
+        "collection_name": coll_name,
+        "scene_name": scene_name,
+    })
+
+    try:
+        r = json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        r = {"raw": str(result)}
+
+    placed = r.get("placed", [])
+    failed = r.get("failed", [])
+
+    # Update construction state with confirmed positions
+    for item in placed:
+        iid = item.get("instance_id")
+        if iid:
+            for p in placements:
+                if p["instance_id"] == iid:
+                    p["blender_name"] = item.get("blender_name", iid)
+                    break
+
+    gaps = plan.get("gaps", [])
+    gap_lines = [f"  • {g['description']} → no matching asset in library" for g in gaps]
+
+    return json.dumps({
+        "status": "construction_complete" if not failed else "construction_partial",
+        "scene_name": scene_name,
+        "collection": coll_name,
+        "placed_count": len(placed),
+        "failed_count": len(failed),
+        "placed": placed,
+        "failed": failed,
+        "gaps_not_filled": gap_lines,
+        "next_steps": [
+            "Review the scene in Blender viewport",
+            f"Use adjust_asset(scene_name='{scene_name}', instance_id='...', ...) to refine positions",
+            f"Use add_asset_to_scene(scene_name='{scene_name}', asset_name='SM_...', ...) to fill gaps",
+            "Run sync_construction_state() if you make any manual adjustments in Blender",
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def adjust_asset(
+    scene_name: str,
+    instance_id: str,
+    move_x: float = 0.0,
+    move_y: float = 0.0,
+    move_z: float = 0.0,
+    rotate_z: float = 0.0,
+    scale_delta: float = 0.0
+) -> str:
+    """
+    Move, rotate, or scale a specific placed asset by delta values.
+    All movements are relative to current position (additive, not absolute).
+    The agent tracks state — always use this instead of moving manually in Blender.
+
+    Args:
+        scene_name: active construction scene name
+        instance_id: e.g. SM_Ruined_house_001
+        move_x: meters to move on X axis (negative = left)
+        move_y: meters to move on Y axis (negative = toward camera)
+        move_z: meters to move on Z axis (negative = down)
+        rotate_z: degrees to rotate around Z axis
+        scale_delta: additive scale change (0.1 = 10% larger, -0.1 = 10% smaller)
+
+    Returns: updated position of the asset.
+    """
+    global _CONSTRUCTION_STATE
+    if scene_name not in _CONSTRUCTION_STATE:
+        return json.dumps({"error": f"No active construction scene '{scene_name}'"}, indent=2)
+
+    placements = _CONSTRUCTION_STATE[scene_name].get("placements", [])
+    target = next((p for p in placements if p["instance_id"] == instance_id), None)
+    if not target:
+        return json.dumps({
+            "error": f"Instance '{instance_id}' not found in scene '{scene_name}'",
+            "available": [p["instance_id"] for p in placements]
+        }, indent=2)
+
+    # Apply deltas to state
+    target["world_x"] = round(target["world_x"] + move_x, 3)
+    target["world_y"] = round(target["world_y"] + move_y, 3)
+    target["world_z"] = round(target["world_z"] + move_z, 3)
+    target["rotation_z_deg"] = round(target["rotation_z_deg"] + rotate_z, 1)
+    target["scale"] = round(max(0.01, target["scale"] + scale_delta), 3)
+
+    # Send to Blender
+    blender_name = target.get("blender_name", instance_id)
+    result = _send_json("move_object", {
+        "name": blender_name,
+        "x": target["world_x"],
+        "y": target["world_y"],
+        "z": target["world_z"],
+        "rotation_z": target["rotation_z_deg"],
+        "scale": target["scale"],
+    })
+
+    return json.dumps({
+        "status": "adjusted",
+        "instance_id": instance_id,
+        "blender_name": blender_name,
+        "new_position": {
+            "x": target["world_x"],
+            "y": target["world_y"],
+            "z": target["world_z"],
+        },
+        "new_rotation_z": target["rotation_z_deg"],
+        "new_scale": target["scale"],
+        "blender_result": result,
+    }, indent=2)
+
+
+@mcp.tool()
+def add_asset_to_scene(
+    scene_name: str,
+    asset_name: str,
+    world_x: float,
+    world_y: float,
+    world_z: float = 0.0,
+    rotation_z: float = 0.0,
+    scale: float = 1.0,
+    mirrored: bool = False,
+    instance_id: str = ""
+) -> str:
+    """
+    Add an asset to the active construction scene at an explicit world position.
+    Use this to fill gaps, add extras, or supplement the initial construction pass.
+    Agent tracks this addition in construction state.
+
+    Args:
+        scene_name: active construction scene name
+        asset_name: exact SM_ asset name from your library
+        world_x: X position in Blender world space (meters)
+        world_y: Y position (depth from camera, meters)
+        world_z: Z position (height above ground, meters)
+        rotation_z: rotation around Z axis in degrees
+        scale: uniform scale (1.0 = real-world size)
+        mirrored: mirror on X axis
+        instance_id: custom instance ID (auto-generated if empty)
+    """
+    global _CONSTRUCTION_STATE
+    if scene_name not in _CONSTRUCTION_STATE:
+        _CONSTRUCTION_STATE[scene_name] = {"placements": [], "gaps": [], "approximate_matches": [], "scene_analysis": {}}
+
+    iid = instance_id or f"{asset_name}_{len(_CONSTRUCTION_STATE[scene_name]['placements'])+1:03d}"
+
+    placement = {
+        "instance_id": iid,
+        "asset": asset_name,
+        "world_x": world_x,
+        "world_y": world_y,
+        "world_z": world_z,
+        "rotation_x_deg": 0.0,
+        "rotation_y_deg": 0.0,
+        "rotation_z_deg": rotation_z,
+        "scale": scale,
+        "mirrored": mirrored,
+        "confidence": "HIGH",
+        "confidence_radius_meters": 0.0,
+        "approximate": False,
+        "match_reason": "manually added",
+        "placement_note": "",
+    }
+    _CONSTRUCTION_STATE[scene_name]["placements"].append(placement)
+
+    result = _send_json("execute_construction", {
+        "placements": [placement],
+        "collection_name": f"CONSTRUCTION_{scene_name}",
+        "scene_name": scene_name,
+    })
+
+    return json.dumps({
+        "status": "added",
+        "instance_id": iid,
+        "asset": asset_name,
+        "position": {"x": world_x, "y": world_y, "z": world_z},
+        "blender_result": result,
+    }, indent=2)
+
+
+@mcp.tool()
+def sync_construction_state(scene_name: str) -> str:
+    """
+    Re-read all construction asset positions from Blender and update agent state.
+    Call this if you've made ANY manual adjustments in Blender viewport.
+    Without this, the agent's internal positions will drift from reality.
+
+    Args:
+        scene_name: active construction scene name
+
+    Returns: updated positions for all tracked assets in this scene.
+    """
+    global _CONSTRUCTION_STATE
+    if scene_name not in _CONSTRUCTION_STATE:
+        return json.dumps({"error": f"No construction state for '{scene_name}'"}, indent=2)
+
+    placements = _CONSTRUCTION_STATE[scene_name].get("placements", [])
+    blender_names = [p.get("blender_name", p["instance_id"]) for p in placements]
+
+    result = _send_json("get_construction_positions", {
+        "object_names": blender_names,
+        "collection_name": f"CONSTRUCTION_{scene_name}",
+    })
+
+    try:
+        r = json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        r = {}
+
+    positions = r.get("positions", {})
+    synced = 0
+    for p in placements:
+        bname = p.get("blender_name", p["instance_id"])
+        if bname in positions:
+            pos = positions[bname]
+            p["world_x"] = pos.get("x", p["world_x"])
+            p["world_y"] = pos.get("y", p["world_y"])
+            p["world_z"] = pos.get("z", p["world_z"])
+            p["rotation_z_deg"] = pos.get("rotation_z", p["rotation_z_deg"])
+            p["scale"] = pos.get("scale", p["scale"])
+            synced += 1
+
+    return json.dumps({
+        "status": "synced",
+        "scene_name": scene_name,
+        "synced_count": synced,
+        "total_tracked": len(placements),
+        "message": "Agent state updated from Blender. You can now use adjust_asset() safely."
+    }, indent=2)
+
+
+@mcp.tool()
+def construction_report(scene_name: str) -> str:
+    """
+    Full status report for an active construction scene.
+    Shows all placed assets, their positions, confidence levels,
+    approximate matches, gaps not filled, and suggested next steps.
+
+    Args:
+        scene_name: active construction scene name
+    """
+    global _CONSTRUCTION_STATE
+    if scene_name not in _CONSTRUCTION_STATE:
+        return json.dumps({"error": f"No construction state for scene '{scene_name}'"}, indent=2)
+
+    state = _CONSTRUCTION_STATE[scene_name]
+    placements = state.get("placements", [])
+    gaps = state.get("gaps", [])
+    approx = state.get("approximate_matches", [])
+
+    placed_lines = []
+    for p in placements:
+        flag = " ⚠" if p.get("approximate") else " ✓"
+        placed_lines.append(
+            f"{flag} {p['instance_id']:35s} "
+            f"({p['world_x']:6.2f}, {p['world_y']:6.2f}, {p['world_z']:6.2f})  "
+            f"[{p['confidence']}]  {p.get('match_reason','')}"
+        )
+
+    return json.dumps({
+        "scene_name": scene_name,
+        "total_placed": len(placements),
+        "approximate_matches": len(approx),
+        "unfilled_gaps": len(gaps),
+        "placed_assets": placed_lines,
+        "gaps": [g["description"] for g in gaps],
+        "approximate_details": approx,
+        "commands": {
+            "adjust": "adjust_asset(scene_name, instance_id, move_x, move_y, move_z, rotate_z)",
+            "add": "add_asset_to_scene(scene_name, asset_name, world_x, world_y, world_z)",
+            "sync": "sync_construction_state(scene_name)  ← run after any manual Blender edits",
+            "manifest": "add_asset_to_manifest(asset_name, ...)  ← add new assets to library",
+        }
+    }, indent=2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     try:
