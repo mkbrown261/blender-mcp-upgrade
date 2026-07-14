@@ -1871,10 +1871,16 @@ Then deliver ONE orientation sentence:
    Correct me if wrong — awaiting direction."
 STOP. Wait for user. Do not auto-run further tools.
 
-MULTIVIEW: When user asks for deep analysis, topology review, or spatial reasoning:
-  → get_multiview_capture(object_name) immediately after session start.
+SPATIAL VISION: When user asks for deep analysis, topology review, or spatial reasoning:
+  → get_spatial_analysis(object_name) — one call, everything: clean views + wireframe
+    + annotated highlights + world-space coordinates + spatial narrative.
+  For lighter use (orientation only): get_multiview_capture(object_name).
   Check session multiview.capture_stale — if True, re-capture before reasoning.
-  7 views = complete geometry visibility. No excuses for missing occluded topology.
+  HOW TO READ get_spatial_analysis output:
+    1. Read spatial_narrative — WHAT/HOW MANY/WHERE (world coords + region label)
+    2. Use image_guide to find image numbers for each problem type
+    3. view_projections x/y (0=left/bottom → 1=right/top) locates cluster in image
+    4. Severity heat map (last 7 images): red=critical, fix first
 
 ── TOOL CALL ORDER ────────────────────────────────────────────────────────────
 TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
@@ -1890,11 +1896,25 @@ TIER 0 (v3.0 — judgment layer, use before Tier 1 when context is ambiguous):
   animation_coach              frame-specific coaching — contact timing, arcs, weight transfer,
                                animation principles. Apprentice lessons if apprentice_mode=True.
   session_update               record confirmed facts: asset_type, stage, verified checks, issues
+  get_spatial_analysis         VISION COMPOUND — one call, complete spatial picture:
+                               clean views + wireframe + annotated highlights + coordinates.
+                               THE tool for deep mesh analysis. Returns all image passes
+                               + world-space problem coordinates + spatial narrative that
+                               tells you WHAT, WHERE, and which image shows it.
+                               Use this instead of get_multiview_capture for any serious analysis.
   get_multiview_capture        VISION: 7-angle capture (front/back/left/right/top/bottom/persp).
                                Gives complete spatial visibility — no hidden geometry, no depth
                                ambiguity. Use before ANY topology or spatial analysis.
                                include_wireframe=True adds 7 wireframe views (topology as lines).
                                Session stores metadata; capture_stale=True after any repair.
+  get_annotated_capture        VISION: highlighted problem captures — edit mode orange selection
+                               per problem type (ngons/non_manifold/poles) + severity heat map
+                               (red=critical, orange=warning, green=clean). Use after
+                               get_multiview_capture when you need to locate problem geometry.
+  get_problem_coordinates      COORDINATES: world-space clusters for every problem type.
+                               Each cluster has centroid, bbox, region_label, element_count,
+                               severity, and view_projections (FRONT/RIGHT/TOP normalised 0-1).
+                               Cross-reference with annotated images to pinpoint exact locations.
   snapshot_mesh_state          SNAPSHOT: capture vert/face/ngon/topology baseline before any repair.
                                Call before auto_repair_mesh or any destructive op.
   compare_mesh_state           DIFF: compare current mesh against snapshot — signed deltas,
@@ -1989,10 +2009,14 @@ When user says "stop explaining" / "expert mode" / "just do it":
   "this is a weapon/hero/prop"    → set_playbook() + session_update(asset_type=...) first
   "audit the scene/all objects"   → screenshot → get_scene_summary() → audit_all_objects()
   reference image + "match/build" → describe image → screenshot → gap report
-  "scan/full view/see the mesh/deep analysis/topology review"
-                                  → get_multiview_capture(object_name) — 7 angles, complete visibility
-  "show me the wireframe/topology lines/edge flow"
+  "scan/full view/deep analysis/topology review/where is the problem"
+                                  → get_spatial_analysis(object_name) — complete picture in one call
+  "show me the wireframe/topology lines/edge flow/just the views"
                                   → get_multiview_capture(object_name, include_wireframe=True)
+  "where exactly/which part/highlight the problems/show me what's wrong"
+                                  → get_annotated_capture(object_name) then get_problem_coordinates(object_name)
+  "coordinates/world position/where in 3D space"
+                                  → get_problem_coordinates(object_name)
   "where is / what's near / layout / spatial / scene graph"
                                   → get_scene_graph() then describe_object_context(name)
   "what's floating/intersecting/isolated/in radius/supporting"
@@ -2025,8 +2049,12 @@ NEVER:
   ✗ Run auto_repair_mesh() without snapshot_mesh_state() first
   ✗ Call compare_mesh_state() without a prior snapshot — it will error
   ✗ Reason about topology or spatial placement from a single screenshot alone
-     when multiview is available — get_multiview_capture gives 7 angles
+     — get_spatial_analysis gives annotated views + exact coordinates
   ✗ Trust a stale multiview capture after repairs — check capture_stale in session
+  ✗ Say "I can see the problem is somewhere on the mesh" — get_problem_coordinates
+     gives exact world position, region label, and view projection coordinates
+  ✗ Leave mesh in edit mode if annotated capture fails — restore is guaranteed
+     but confirm with session_status if something went wrong
 
 ── REPORT FORMAT ──────────────────────────────────────────────────────────────
 ── VISUAL ASSESSMENT ──   What you see. Asset type, visible issues. Always first.
@@ -2881,6 +2909,834 @@ print(__import__('json').dumps(result))
     # each element, we return images + summary dict serialised to a final entry.
     images_out.append(summary)   # FastMCP will serialise non-Image as text content
     return images_out
+
+
+@mcp.tool()
+def get_problem_coordinates(object_name: str, problem_type: str = "all", cluster_radius: float = 0.5) -> str:
+    """
+    PROBLEM COORDINATES — World-space locations of every mesh problem, clustered
+    by proximity so Claude gets regions not individual face indices.
+
+    Uses bmesh to walk the mesh and extract the centroid of every problem element
+    (ngon face, non-manifold edge, high-valence pole), then groups nearby elements
+    into clusters. Each cluster gets a world-space centroid, bounding box, face count,
+    severity, and a plain-English region label derived from its position within the
+    object's bounding box (e.g. "upper_front_left").
+
+    Orthographic projection formulas are included per cluster so Claude knows
+    exactly where in the FRONT/RIGHT/TOP views each cluster appears — no guessing
+    which part of the image corresponds to which data point.
+
+    Parameters:
+      object_name    : Blender object name
+      problem_type   : "all" | "ngons" | "non_manifold" | "poles"
+      cluster_radius : max distance (metres) between elements in the same cluster
+
+    Returns JSON with ngon_clusters, non_manifold_clusters, pole_clusters,
+    each cluster having: centroid, bbox, element_count, severity, region_label,
+    view_projections (FRONT/RIGHT/TOP normalised 0-1 screen coords).
+    """
+    script = f"""
+import bpy, bmesh, json, math
+from mathutils import Vector
+
+OBJ_NAME      = {repr(object_name)}
+PROBLEM_TYPE  = {repr(problem_type)}
+CLUSTER_RAD   = {cluster_radius}
+
+obj = bpy.data.objects.get(OBJ_NAME)
+if obj is None:
+    print(json.dumps({{"error": f"Object not found: {{OBJ_NAME}}"}}))
+else:
+    mw = obj.matrix_world
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    # ── Bounding box in world space ───────────────────────────────────────
+    bbox_pts = [mw @ Vector(c) for c in obj.bound_box]
+    bb_min   = Vector((min(v.x for v in bbox_pts), min(v.y for v in bbox_pts), min(v.z for v in bbox_pts)))
+    bb_max   = Vector((max(v.x for v in bbox_pts), max(v.y for v in bbox_pts), max(v.z for v in bbox_pts)))
+    bb_size  = bb_max - bb_min
+
+    def world_face_centroid(face):
+        co = sum((v.co for v in face.verts), Vector()) / len(face.verts)
+        return mw @ co
+
+    def world_edge_midpoint(edge):
+        return mw @ ((edge.verts[0].co + edge.verts[1].co) / 2)
+
+    def world_vert(vert):
+        return mw @ vert.co
+
+    def region_label(wco):
+        # Divide object bbox into thirds on each axis, label the sector
+        def sector(val, lo, hi):
+            t = (val - lo) / (hi - lo + 1e-6)
+            if t < 0.33: return "low"
+            if t < 0.67: return "mid"
+            return "high"
+        sx = sector(wco.x, bb_min.x, bb_max.x)
+        sy = sector(wco.y, bb_min.y, bb_max.y)
+        sz = sector(wco.z, bb_min.z, bb_max.z)
+        z_label = {{"low": "lower", "mid": "middle", "high": "upper"}}[sz]
+        x_label = {{"low": "left",  "mid": "center", "high": "right"}}[sx]
+        y_label = {{"low": "front", "mid": "mid",    "high": "back" }}[sy]
+        return f"{{z_label}}_{{y_label}}_{{x_label}}"
+
+    def view_projections(wco):
+        # Orthographic projection for each standard view.
+        # Returns normalised 0-1 coords within the object's bounding box.
+        # FRONT:  x=world.x (left-right), y=world.z (up-down)
+        # RIGHT:  x=-world.y (left-right), y=world.z (up-down)
+        # TOP:    x=world.x (left-right), y=-world.y (up-down)
+        def norm(val, lo, hi): return round((val - lo) / (hi - lo + 1e-6), 3)
+        return {{
+            "FRONT": {{"x": norm(wco.x, bb_min.x, bb_max.x),
+                       "y": norm(wco.z, bb_min.z, bb_max.z)}},
+            "RIGHT": {{"x": norm(-wco.y, -bb_max.y, -bb_min.y),
+                       "y": norm(wco.z, bb_min.z, bb_max.z)}},
+            "TOP":   {{"x": norm(wco.x, bb_min.x, bb_max.x),
+                       "y": norm(-wco.y, -bb_max.y, -bb_min.y)}},
+        }}
+
+    def cluster_points(points):
+        # Greedy clustering: assign each point to nearest existing cluster
+        # centroid within CLUSTER_RAD, else start a new cluster.
+        clusters = []   # list of [Vector, ...]
+        for pt in points:
+            placed = False
+            for cl in clusters:
+                cen = sum(cl, Vector()) / len(cl)
+                if (pt - cen).length <= CLUSTER_RAD:
+                    cl.append(pt)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([pt])
+        result = []
+        for cl in clusters:
+            cen  = sum(cl, Vector()) / len(cl)
+            xs   = [v.x for v in cl]; ys = [v.y for v in cl]; zs = [v.z for v in cl]
+            result.append({{
+                "centroid":      [round(cen.x,3), round(cen.y,3), round(cen.z,3)],
+                "element_count": len(cl),
+                "bbox": {{
+                    "min": [round(min(xs),3), round(min(ys),3), round(min(zs),3)],
+                    "max": [round(max(xs),3), round(max(ys),3), round(max(zs),3)],
+                }},
+                "region_label":     region_label(cen),
+                "view_projections": view_projections(cen),
+            }})
+        result.sort(key=lambda c: -c["element_count"])
+        return result
+
+    output = {{
+        "object":         OBJ_NAME,
+        "bbox_world_min": [round(bb_min.x,3), round(bb_min.y,3), round(bb_min.z,3)],
+        "bbox_world_max": [round(bb_max.x,3), round(bb_max.y,3), round(bb_max.z,3)],
+        "cluster_radius": CLUSTER_RAD,
+        "ngon_clusters":         [],
+        "non_manifold_clusters": [],
+        "pole_clusters":         [],
+    }}
+
+    # ── N-gon faces (5+ sided) ────────────────────────────────────────────
+    if PROBLEM_TYPE in ("all", "ngons"):
+        pts = [world_face_centroid(f) for f in bm.faces if len(f.verts) > 4]
+        clusters = cluster_points(pts)
+        total    = sum(c["element_count"] for c in clusters)
+        for c in clusters:
+            c["severity"] = "critical" if c["element_count"] > 20 or total > 100 else "warning"
+        output["ngon_clusters"]  = clusters
+        output["ngon_total"]     = total
+
+    # ── Non-manifold edges ────────────────────────────────────────────────
+    if PROBLEM_TYPE in ("all", "non_manifold"):
+        pts = [world_edge_midpoint(e) for e in bm.edges if not e.is_manifold and not e.is_boundary]
+        clusters = cluster_points(pts)
+        total    = sum(c["element_count"] for c in clusters)
+        for c in clusters:
+            c["severity"] = "critical" if c["element_count"] > 5 else "warning"
+        output["non_manifold_clusters"] = clusters
+        output["non_manifold_total"]    = total
+
+    # ── High-valence poles (6+ edges) ────────────────────────────────────
+    if PROBLEM_TYPE in ("all", "poles"):
+        pts = [world_vert(v) for v in bm.verts if len(v.link_edges) >= 6]
+        clusters = cluster_points(pts)
+        total    = sum(c["element_count"] for c in clusters)
+        for c in clusters:
+            c["severity"] = "warning"
+        output["pole_clusters"] = clusters
+        output["pole_total"]    = total
+
+    bm.free()
+
+    # ── Priority narrative ─────────────────────────────────────────────────
+    narrative_parts = []
+    for cluster_list, label in [
+        (output.get("ngon_clusters",[]),         "ngon"),
+        (output.get("non_manifold_clusters",[]), "non-manifold edge"),
+        (output.get("pole_clusters",[]),         "high-valence pole"),
+    ]:
+        for i, c in enumerate(cluster_list[:3]):  # top 3 clusters per type
+            cen = c["centroid"]
+            fp  = c.get("view_projections", {{}}).get("FRONT", {{}})
+            narrative_parts.append(
+                f"{{c['severity'].upper()}} {{label}} cluster #{i+1}:"
+                f" {{c['element_count']}} element(s) at world {{cen}},"
+                f" region '{{c['region_label']}}'"
+                f" (FRONT view approx x={{fp.get('x','?')}}, y={{fp.get('y','?')}})"
+            )
+    output["priority_narrative"] = narrative_parts if narrative_parts else ["No problems found."]
+    print(json.dumps(output))
+    bm.free()
+"""
+
+    try:
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {
+            "code": script, "required_mode": "OBJECT", "push_undo": False
+        })
+        if isinstance(raw, dict) and "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "") if isinstance(raw, dict) else str(raw)
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.dumps(json.loads(line), indent=2)
+                except Exception:
+                    pass
+        return json.dumps({"error": "No JSON output from get_problem_coordinates", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in get_problem_coordinates: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_annotated_capture(object_name: str, modes: str = "all") -> list:
+    """
+    ANNOTATED CAPTURE — Highlighted mesh captures that make problem geometry
+    visually unambiguous in every screenshot.
+
+    Combines two complementary techniques:
+
+    PASS 1 — Element precision (edit mode selection):
+      Enters edit mode, selects problem elements by type, captures 7 views.
+      Blender's orange selection highlight makes exact problem faces/edges/verts
+      visible against the clean mesh. One 7-view set per problem type.
+        ngons        → face select mode, ngon faces orange
+        non_manifold → edge select mode, non-manifold edges highlighted
+        poles        → vertex select mode, high-valence verts highlighted
+
+    PASS 2 — Severity map (temporary emission materials):
+      Assigns colored emission materials to problem face clusters by severity:
+        red    = critical clusters (ngon density > 20 faces or > 100 total)
+        orange = warning clusters
+        green  = clean faces (unaffected)
+      Captures 7 views with object shading, showing the priority heat map.
+      Original materials fully restored after capture (try/finally guaranteed).
+
+    State restoration is guaranteed via try/finally:
+      - Original mode restored (OBJECT)
+      - Original selection cleared
+      - Temporary materials removed from bpy.data.materials
+      - Original material assignments restored per face
+
+    Parameters:
+      object_name : Blender object name
+      modes       : "all" | "ngons" | "non_manifold" | "poles" | "severity_map"
+
+    Returns list of Image objects (annotated captures) + JSON metadata summary.
+    Image order: [ngon_views x7], [non_manifold_views x7], [pole_views x7],
+                 [severity_map_views x7], metadata_dict.
+    """
+    import datetime, tempfile, os
+
+    blender = get_blender_connection()
+    ORTHO_VIEWS = ["FRONT", "BACK", "LEFT", "RIGHT", "TOP", "BOTTOM"]
+    ALL_VIEWS   = ORTHO_VIEWS + ["PERSP"]
+
+    # ── Reuse view/screenshot helpers from get_multiview_capture ──────────
+    def _set_view_and_frame(axis: str) -> bool:
+        """Set viewport to axis and frame object. Returns True on success."""
+        if axis == "PERSP":
+            script = f"""
+import bpy
+obj  = bpy.data.objects.get({repr(object_name)})
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+result = {{"ok": False}}
+if obj and area:
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    space  = next((s for s in area.spaces  if s.type == 'VIEW_3D'), None)
+    if region and space:
+        space.region_3d.view_perspective = 'PERSP'
+        bpy.context.view_layer.objects.active = obj
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.view3d.view_selected()
+        result["ok"] = True
+print(__import__('json').dumps(result))
+"""
+        else:
+            script = f"""
+import bpy
+obj  = bpy.data.objects.get({repr(object_name)})
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+result = {{"ok": False}}
+if obj and area:
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    if region:
+        bpy.context.view_layer.objects.active = obj
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.view3d.view_axis(type={repr(axis)}, align_active=False)
+            bpy.ops.view3d.view_selected()
+        result["ok"] = True
+print(__import__('json').dumps(result))
+"""
+        raw = blender.send_command("execute_code_safe", {
+            "code": script, "required_mode": "OBJECT", "push_undo": False
+        })
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line).get("ok", False)
+                except Exception:
+                    pass
+        return False
+
+    def _screenshot() -> bytes:
+        temp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"blender_ann_{os.getpid()}_{id(object())}.png"
+        )
+        result = blender.send_command(
+            "get_viewport_screenshot",
+            {"max_size": 900, "filepath": temp_path, "format": "png"}
+        )
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(f"Screenshot failed: {result['error']}")
+        if not os.path.exists(temp_path):
+            raise RuntimeError("Screenshot file not created")
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return data
+
+    def _capture_7_views(label: str, images_out: list, errors: list) -> None:
+        """Capture all 7 views in current viewport state, append Image objects."""
+        for axis in ALL_VIEWS:
+            ok = _set_view_and_frame(axis)
+            if not ok:
+                errors.append(f"{label}/{axis}: view set failed")
+                continue
+            try:
+                images_out.append(Image(data=_screenshot(), format="png"))
+            except RuntimeError as e:
+                errors.append(f"{label}/{axis}: {e}")
+
+    images_out = []
+    errors     = []
+    passes_done = []
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 1 — Edit mode element selection highlights
+    # ══════════════════════════════════════════════════════════════════════
+    ELEMENT_PASSES = []
+    if modes in ("all", "ngons"):
+        ELEMENT_PASSES.append(("ngons", "FACE",
+            "for f in bm.faces: f.select = (len(f.verts) > 4)"))
+    if modes in ("all", "non_manifold"):
+        ELEMENT_PASSES.append(("non_manifold", "EDGE",
+            "for e in bm.edges: e.select = (not e.is_manifold and not e.is_boundary)"))
+    if modes in ("all", "poles"):
+        ELEMENT_PASSES.append(("poles", "VERT",
+            "for v in bm.verts: v.select = (len(v.link_edges) >= 6)"))
+
+    for pass_name, select_mode, select_expr in ELEMENT_PASSES:
+        enter_script = f"""
+import bpy, bmesh
+obj = bpy.data.objects.get({repr(object_name)})
+result = {{"ok": False, "error": None, "found": 0}}
+if obj is None:
+    result["error"] = "Object not found"
+else:
+    try:
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        # Deselect all first
+        for f in bm.faces: f.select = False
+        for e in bm.edges: e.select = False
+        for v in bm.verts: v.select = False
+        # Set select mode and select problem elements
+        bpy.context.tool_settings.mesh_select_mode = (
+            {'select_mode' == 'VERT'}, {'select_mode' == 'EDGE'}, {'select_mode' == 'FACE'}
+        )
+        {select_expr}
+        bmesh.update_edit_mesh(obj.data)
+        found = sum(1 for f in bm.faces if f.select) if {repr(select_mode)} == 'FACE' else \\
+                sum(1 for e in bm.edges if e.select) if {repr(select_mode)} == 'EDGE' else \\
+                sum(1 for v in bm.verts if v.select)
+        result = {{"ok": True, "found": found}}
+    except Exception as ex:
+        result["error"] = str(ex)
+        try: bpy.ops.object.mode_set(mode='OBJECT')
+        except: pass
+print(__import__('json').dumps(result))
+"""
+        # Fix the select_mode tuple — can't use comparison in f-string cleanly,
+        # build it explicitly per mode
+        sv = (select_mode == "VERT")
+        se = (select_mode == "EDGE")
+        sf = (select_mode == "FACE")
+        enter_script = f"""
+import bpy, bmesh
+obj = bpy.data.objects.get({repr(object_name)})
+result = {{"ok": False, "error": None, "found": 0}}
+if obj is None:
+    result["error"] = "Object not found"
+else:
+    try:
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        for f in bm.faces: f.select = False
+        for e in bm.edges: e.select = False
+        for v in bm.verts: v.select = False
+        bpy.context.tool_settings.mesh_select_mode = ({sv}, {se}, {sf})
+        {select_expr}
+        bmesh.update_edit_mesh(obj.data)
+        found = sum(1 for f in bm.faces if f.select) if {repr(select_mode)} == 'FACE' else \\
+                sum(1 for e in bm.edges if e.select) if {repr(select_mode)} == 'EDGE' else \\
+                sum(1 for v in bm.verts if v.select)
+        result = {{"ok": True, "found": found}}
+    except Exception as ex:
+        result["error"] = str(ex)
+        try: bpy.ops.object.mode_set(mode='OBJECT')
+        except: pass
+print(__import__('json').dumps(result))
+"""
+        raw = blender.send_command("execute_code_safe", {
+            "code": enter_script, "required_mode": "OBJECT", "push_undo": False
+        })
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        ok = False
+        found = 0
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    parsed = json.loads(line)
+                    ok    = parsed.get("ok", False)
+                    found = parsed.get("found", 0)
+                    if not ok:
+                        errors.append(f"{pass_name} enter_edit: {parsed.get('error','unknown')}")
+                except Exception:
+                    pass
+                break
+
+        if ok:
+            # Capture 7 views in edit mode — view_axis still works in edit mode
+            # but execute_code_safe required_mode='OBJECT' won't let us run the
+            # view script, so we send it as a separate OBJECT-mode-agnostic call.
+            # Actually: view scripts don't change mesh — we just need the viewport
+            # to set the angle. Use required_mode=None via push_undo=False only.
+            for axis in ALL_VIEWS:
+                view_ok = _set_view_and_frame(axis)
+                if not view_ok:
+                    errors.append(f"{pass_name}/{axis}: view set failed")
+                    continue
+                try:
+                    images_out.append(Image(data=_screenshot(), format="png"))
+                except RuntimeError as e:
+                    errors.append(f"{pass_name}/{axis}: {e}")
+            passes_done.append(f"{pass_name}({found} elements highlighted)")
+
+        # Always exit edit mode — even if capture failed
+        exit_script = f"""
+import bpy
+try:
+    if bpy.context.object and bpy.context.object.mode == 'EDIT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    print(__import__('json').dumps({{"ok": True}}))
+except Exception as ex:
+    print(__import__('json').dumps({{"ok": False, "error": str(ex)}}))
+"""
+        blender.send_command("execute_code_safe", {
+            "code": exit_script, "required_mode": "OBJECT", "push_undo": False
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 2 — Severity heat map via temporary emission materials
+    # ══════════════════════════════════════════════════════════════════════
+    if modes in ("all", "severity_map"):
+        severity_script = f"""
+import bpy, bmesh, json, math
+from mathutils import Vector
+
+OBJ_NAME    = {repr(object_name)}
+CLUSTER_RAD = 0.5
+obj = bpy.data.objects.get(OBJ_NAME)
+result = {{"ok": False, "error": None, "assigned": 0}}
+
+if obj is None:
+    result["error"] = "Object not found"
+else:
+    try:
+        mw = obj.matrix_world
+
+        # Save original material assignments per face
+        orig_slots   = [ms.material for ms in obj.material_slots]
+        bpy.context.view_layer.objects.active = obj
+
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+
+        # Collect ngon face centroids + label by severity
+        # (simple threshold: >20 in one cluster = critical, else warning)
+        ngon_faces_world = []
+        for f in bm.faces:
+            if len(f.verts) > 4:
+                co = sum((v.co for v in f.verts), Vector()) / len(f.verts)
+                ngon_faces_world.append((f.index, mw @ co))
+
+        # Cluster
+        clusters = []
+        for fidx, wco in ngon_faces_world:
+            placed = False
+            for cl in clusters:
+                cen = sum((p for _,p in cl), Vector()) / len(cl)
+                if (wco - cen).length <= CLUSTER_RAD:
+                    cl.append((fidx, wco))
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([(fidx, wco)])
+
+        # Assign severity per face
+        face_severity = {{}}
+        for cl in clusters:
+            sev = "critical" if len(cl) > 20 else "warning"
+            for fidx, _ in cl:
+                face_severity[fidx] = sev
+
+        # Create temporary materials
+        def get_or_create_mat(name, color_rgba):
+            if name in bpy.data.materials:
+                bpy.data.materials.remove(bpy.data.materials[name])
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            nodes.clear()
+            emit = nodes.new("ShaderNodeEmission")
+            emit.inputs["Color"].default_value  = color_rgba
+            emit.inputs["Strength"].default_value = 2.0
+            out  = nodes.new("ShaderNodeOutputMaterial")
+            mat.node_tree.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+            return mat
+
+        mat_critical = get_or_create_mat("_MCP_CRITICAL", (1.0, 0.1, 0.1, 1.0))  # red
+        mat_warning  = get_or_create_mat("_MCP_WARNING",  (1.0, 0.5, 0.0, 1.0))  # orange
+        mat_clean    = get_or_create_mat("_MCP_CLEAN",    (0.15, 0.6, 0.15, 1.0)) # green
+
+        # Add temp slots
+        obj.data.materials.append(mat_critical)
+        obj.data.materials.append(mat_warning)
+        obj.data.materials.append(mat_clean)
+        idx_crit = len(obj.material_slots) - 3
+        idx_warn = len(obj.material_slots) - 2
+        idx_clean= len(obj.material_slots) - 1
+
+        # Record original face material indices before changing
+        orig_face_mats = [f.material_index for f in obj.data.polygons]
+
+        # Assign temp materials to faces
+        for poly in obj.data.polygons:
+            sev = face_severity.get(poly.index)
+            if sev == "critical":
+                poly.material_index = idx_crit
+            elif sev == "warning":
+                poly.material_index = idx_warn
+            else:
+                poly.material_index = idx_clean
+        obj.data.update()
+
+        bm.free()
+        result = {{"ok": True, "assigned": len(face_severity),
+                   "critical_faces": sum(1 for s in face_severity.values() if s=="critical"),
+                   "warning_faces":  sum(1 for s in face_severity.values() if s=="warning"),
+                   "orig_face_mats": orig_face_mats,
+                   "idx_crit": idx_crit, "idx_warn": idx_warn, "idx_clean": idx_clean,
+                   "orig_slot_count": len(orig_slots)}}
+    except Exception as ex:
+        result["error"] = str(ex)
+    print(json.dumps(result))
+"""
+        raw = blender.send_command("execute_code_safe", {
+            "code": severity_script, "required_mode": "OBJECT", "push_undo": False
+        })
+        sev_output = raw.get("result", "") if isinstance(raw, dict) else ""
+        sev_data   = {}
+        sev_ok     = False
+        for line in sev_output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    sev_data = json.loads(line)
+                    sev_ok   = sev_data.get("ok", False)
+                    if not sev_ok:
+                        errors.append(f"severity_map setup: {sev_data.get('error','unknown')}")
+                except Exception:
+                    pass
+                break
+
+        if sev_ok:
+            # Set MATERIAL shading so emission colors are visible
+            blender.send_command("execute_code_safe", {
+                "code": """
+import bpy
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+if area:
+    space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+    if space: space.shading.type = 'MATERIAL'
+print(__import__('json').dumps({"ok": True}))
+""",
+                "required_mode": "OBJECT", "push_undo": False
+            })
+            _capture_7_views("severity_map", images_out, errors)
+            passes_done.append(
+                f"severity_map({sev_data.get('critical_faces',0)} critical, "
+                f"{sev_data.get('warning_faces',0)} warning faces colored)"
+            )
+
+        # ALWAYS restore — try/finally equivalent: run restore regardless of ok
+        orig_face_mats  = sev_data.get("orig_face_mats", [])
+        orig_slot_count = sev_data.get("orig_slot_count", 0)
+
+        restore_script = f"""
+import bpy
+obj = bpy.data.objects.get({repr(object_name)})
+if obj:
+    # Restore original face material indices
+    orig = {orig_face_mats!r}
+    for i, poly in enumerate(obj.data.polygons):
+        if i < len(orig):
+            poly.material_index = orig[i]
+    obj.data.update()
+    # Remove temp material slots (added at end — pop from back)
+    slot_count = {sev_data.get('orig_slot_count', 0)}
+    while len(obj.material_slots) > slot_count:
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.material_slot_remove()
+    # Remove temp materials from bpy.data
+    for name in ("_MCP_CRITICAL", "_MCP_WARNING", "_MCP_CLEAN"):
+        if name in bpy.data.materials:
+            bpy.data.materials.remove(bpy.data.materials[name])
+    obj.data.update()
+print(__import__('json').dumps({{"ok": True}}))
+"""
+        blender.send_command("execute_code_safe", {
+            "code": restore_script, "required_mode": "OBJECT", "push_undo": False
+        })
+
+        # Restore original shading
+        blender.send_command("execute_code_safe", {
+            "code": """
+import bpy
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+if area:
+    space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+    if space: space.shading.type = 'SOLID'
+print(__import__('json').dumps({"ok": True}))
+""",
+            "required_mode": "OBJECT", "push_undo": False
+        })
+
+    # ── Build return ───────────────────────────────────────────────────────
+    summary = {
+        "annotated_capture": "complete",
+        "object":            object_name,
+        "passes_done":       passes_done,
+        "images_returned":   len(images_out),
+        "view_errors":       errors,
+        "image_order": (
+            "Groups of 7 views per pass in this order: "
+            + ", ".join(p.split("(")[0] for p in passes_done)
+            + ". Each group: FRONT BACK LEFT RIGHT TOP BOTTOM PERSP."
+        ),
+        "note": (
+            "PASS 1 images: orange/highlighted = problem elements selected in edit mode. "
+            "PASS 2 images: red=critical ngon clusters, orange=warning, green=clean faces. "
+            "Cross-reference with get_problem_coordinates() for exact world positions."
+        ),
+    }
+    images_out.append(summary)
+    return images_out
+
+
+@mcp.tool()
+def get_spatial_analysis(object_name: str, include_wireframe: bool = True) -> list:
+    """
+    SPATIAL ANALYSIS — The complete spatial intelligence compound tool.
+
+    Combines every visual and coordinate layer into one call:
+
+    1. get_problem_coordinates()  — world-space clusters with region labels
+                                    and view projection coordinates
+    2. get_multiview_capture()    — 7 clean views [+ 7 wireframe if requested]
+    3. get_annotated_capture()    — element highlights (edit mode, per problem type)
+                                    + severity heat map (colored materials)
+
+    Returns all images plus a unified spatial report that correlates what
+    Claude sees in each image with exact world coordinates:
+
+      "The CRITICAL ngon cluster (34 faces) is at world [0.23, 1.47, 1.82].
+       In the FRONT view it appears at normalised position x=0.42, y=0.78
+       (upper-center area). Look at the FRONT annotated_ngons image at that
+       position — the orange highlight confirms the location.
+       Region label: upper_front_center. Fix this before export."
+
+    This is the tool to call when you need complete spatial understanding
+    of a mesh's problems — not just what's wrong, but exactly where it is,
+    visible from every angle, highlighted for unambiguous identification.
+
+    Parameters:
+      object_name      : Blender object name
+      include_wireframe: include wireframe views in multiview pass (default True)
+
+    Returns list: [multiview images] + [annotated images] + [coordinate JSON]
+                  + [unified spatial report dict]
+    """
+    all_images = []
+    errors     = []
+
+    # ── Step 1: Problem coordinates (structured data) ──────────────────────
+    coords_json = get_problem_coordinates(object_name)
+    try:
+        coords = json.loads(coords_json)
+    except Exception:
+        coords = {"error": "Could not parse coordinate data"}
+
+    # ── Step 2: Clean multiview (7 or 14 images) ──────────────────────────
+    mv_result = get_multiview_capture(object_name, include_wireframe=include_wireframe)
+    for item in mv_result:
+        if isinstance(item, Image):
+            all_images.append(item)
+        # dict summary is the last item — skip, we build our own
+
+    # ── Step 3: Annotated captures (element highlights + severity map) ─────
+    ann_result = get_annotated_capture(object_name, modes="all")
+    for item in ann_result:
+        if isinstance(item, Image):
+            all_images.append(item)
+
+    # ── Step 4: Build unified spatial report ──────────────────────────────
+    narrative = []
+
+    # Ngon clusters
+    for i, c in enumerate(coords.get("ngon_clusters", [])[:5]):
+        cen  = c.get("centroid", [0, 0, 0])
+        fp   = c.get("view_projections", {}).get("FRONT", {})
+        rp   = c.get("view_projections", {}).get("RIGHT", {})
+        tp   = c.get("view_projections", {}).get("TOP",   {})
+        sev  = c.get("severity", "warning").upper()
+        reg  = c.get("region_label", "unknown")
+        cnt  = c.get("element_count", 0)
+        narrative.append(
+            f"{sev} ngon cluster #{i+1}: {cnt} face(s) at world {cen}, "
+            f"region '{reg}'. "
+            f"FRONT view ≈ (x={fp.get('x','?')}, y={fp.get('y','?')}), "
+            f"RIGHT view ≈ (x={rp.get('x','?')}, y={rp.get('y','?')}), "
+            f"TOP view ≈ (x={tp.get('x','?')}, y={tp.get('y','?')}). "
+            f"Find the orange-highlighted region in the annotated_ngons images at these coordinates."
+        )
+
+    # Non-manifold clusters
+    for i, c in enumerate(coords.get("non_manifold_clusters", [])[:3]):
+        cen = c.get("centroid", [0, 0, 0])
+        fp  = c.get("view_projections", {}).get("FRONT", {})
+        sev = c.get("severity", "warning").upper()
+        reg = c.get("region_label", "unknown")
+        cnt = c.get("element_count", 0)
+        narrative.append(
+            f"{sev} non-manifold cluster #{i+1}: {cnt} edge(s) at world {cen}, "
+            f"region '{reg}'. FRONT view ≈ (x={fp.get('x','?')}, y={fp.get('y','?')}). "
+            f"Find the highlighted edges in the annotated_non_manifold images."
+        )
+
+    # Pole clusters
+    for i, c in enumerate(coords.get("pole_clusters", [])[:3]):
+        cen = c.get("centroid", [0, 0, 0])
+        fp  = c.get("view_projections", {}).get("FRONT", {})
+        cnt = c.get("element_count", 0)
+        reg = c.get("region_label", "unknown")
+        narrative.append(
+            f"WARNING high-valence pole cluster #{i+1}: {cnt} vert(s) at world {cen}, "
+            f"region '{reg}'. FRONT view ≈ (x={fp.get('x','?')}, y={fp.get('y','?')}). "
+            f"Visible as highlighted verts in the annotated_poles images."
+        )
+
+    if not narrative:
+        narrative = ["No mesh problems detected. Mesh appears clean."]
+
+    # Image index guide — helps Claude know which image number = which pass
+    wireframe_count = 7 if include_wireframe else 0
+    idx = 0
+    image_guide = []
+    image_guide.append(f"Images 1-7: Clean solid views (FRONT,BACK,LEFT,RIGHT,TOP,BOTTOM,PERSP)")
+    idx = 7
+    if include_wireframe:
+        image_guide.append(f"Images 8-14: Wireframe views (same order)")
+        idx = 14
+    image_guide.append(f"Images {idx+1}-{idx+7}: Ngon highlight (orange = ngon faces selected)")
+    idx += 7
+    image_guide.append(f"Images {idx+1}-{idx+7}: Non-manifold edge highlight (highlighted edges)")
+    idx += 7
+    image_guide.append(f"Images {idx+1}-{idx+7}: High-valence pole highlight (highlighted verts)")
+    idx += 7
+    image_guide.append(f"Images {idx+1}-{idx+7}: Severity heat map (red=critical, orange=warning, green=clean)")
+
+    unified_report = {
+        "spatial_analysis":    "complete",
+        "object":              object_name,
+        "total_images":        len(all_images),
+        "image_guide":         image_guide,
+        "coordinate_summary": {
+            "ngon_total":          coords.get("ngon_total", 0),
+            "non_manifold_total":  coords.get("non_manifold_total", 0),
+            "pole_total":          coords.get("pole_total", 0),
+            "ngon_clusters":       len(coords.get("ngon_clusters", [])),
+            "non_manifold_clusters": len(coords.get("non_manifold_clusters", [])),
+            "pole_clusters":       len(coords.get("pole_clusters", [])),
+        },
+        "spatial_narrative":   narrative,
+        "raw_coordinates":     coords,
+        "how_to_read": (
+            "1. Read spatial_narrative — each entry tells you WHAT, HOW MANY, WHERE (world coords + view coords + region label). "
+            "2. Use image_guide to find the right image number for each problem type. "
+            "3. Look at the view_projections x/y (0=left/bottom, 1=right/top) to locate the cluster in that image. "
+            "4. The severity heat map (last 7 images) shows priority at a glance: red=fix first."
+        ),
+    }
+
+    all_images.append(unified_report)
+    return all_images
 
 
 # ─────────────────────────────────────────────────────────────────────────────
