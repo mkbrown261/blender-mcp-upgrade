@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp[cli]"]
+# dependencies = ["mcp[cli]", "pillow"]
 # ///
 """
 Custom MCP server for blender-mcp-upgrade — v2.2 AI Technical Director Edition.
@@ -3756,6 +3756,62 @@ def _annotate_image_with_clusters(
         return img_bytes   # always return original bytes on any failure
 
 
+def _capture_single_front_view(object_name: str) -> Optional[bytes]:
+    """
+    Capture just the FRONT view of an object — for callers (like auto_repair_mesh's
+    before/after diff) that need exactly one screenshot, not all 7 that
+    get_multiview_capture always renders. Avoids paying for 6 unused viewport
+    round-trips per call.
+    """
+    blender = get_blender_connection()
+    view_script = f"""
+import bpy
+obj  = bpy.data.objects.get({repr(object_name)})
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+result = {{"ok": False}}
+if obj and area:
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+    if region:
+        bpy.context.view_layer.objects.active = obj
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.view3d.view_axis(type='FRONT', align_active=False)
+            bpy.ops.view3d.view_selected()
+        result["ok"] = True
+print(__import__('json').dumps(result))
+"""
+    raw = blender.send_command("execute_code_safe", {
+        "code": view_script, "required_mode": "OBJECT", "push_undo": False
+    })
+    output = raw.get("result", "") if isinstance(raw, dict) else ""
+    ok = False
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                ok = json.loads(line).get("ok", False)
+            except Exception:
+                pass
+            break
+    if not ok:
+        return None
+
+    temp_path = os.path.join(tempfile.gettempdir(), f"blender_arm_{os.getpid()}_{id(object())}.png")
+    result = blender.send_command(
+        "get_viewport_screenshot", {"max_size": 900, "filepath": temp_path, "format": "png"}
+    )
+    if isinstance(result, dict) and "error" in result:
+        return None
+    if not os.path.exists(temp_path):
+        return None
+    with open(temp_path, "rb") as f:
+        data = f.read()
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+    return data
+
+
 @mcp.tool()
 def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     """
@@ -4029,45 +4085,49 @@ zs = [v.z for v in bbox_corners]
 diag = math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2 + (max(zs)-min(zs))**2)
 thresh = max(diag * 0.08, 0.001)   # 8% of diagonal, minimum 1mm
 
-# Enter edit mode and deselect all
+# Enter edit mode and deselect all. try/finally guarantees we exit back to
+# OBJECT mode even if selection or view_selected raises mid-way — a bare
+# sequential mode_set('OBJECT') after this block would get skipped by that
+# exception, leaving the mesh stuck in EDIT mode.
 bpy.ops.object.mode_set(mode='EDIT')
-bm = bmesh.from_edit_mesh(obj.data)
+try:
+    bm = bmesh.from_edit_mesh(obj.data)
 
-# Centroid in world space
-import mathutils
-world_centroid = mathutils.Vector(({cx}, {cy}, {cz}))
-# Transform to local object space for bmesh comparison
-local_centroid = obj.matrix_world.inverted() @ world_centroid
-local_thresh   = thresh / max(obj.scale)   # rough local-space threshold
+    # Centroid in world space
+    import mathutils
+    world_centroid = mathutils.Vector(({cx}, {cy}, {cz}))
+    # Transform to local object space for bmesh comparison
+    local_centroid = obj.matrix_world.inverted() @ world_centroid
+    local_thresh   = thresh / max(obj.scale)   # rough local-space threshold
 
-# Select elements within threshold of centroid
-elem_type = "{best_elem_type}"
-if elem_type == "face":
-    bm.faces.ensure_lookup_table()
-    for f in bm.faces:
-        f.select = (f.calc_center_median() - local_centroid).length < local_thresh
-elif elem_type == "edge":
-    bm.edges.ensure_lookup_table()
-    for e in bm.edges:
-        mid = (e.verts[0].co + e.verts[1].co) / 2
-        e.select = (mid - local_centroid).length < local_thresh
-else:  # vert
-    bm.verts.ensure_lookup_table()
-    for v in bm.verts:
-        v.select = (v.co - local_centroid).length < local_thresh
+    # Select elements within threshold of centroid
+    elem_type = "{best_elem_type}"
+    if elem_type == "face":
+        bm.faces.ensure_lookup_table()
+        for f in bm.faces:
+            f.select = (f.calc_center_median() - local_centroid).length < local_thresh
+    elif elem_type == "edge":
+        bm.edges.ensure_lookup_table()
+        for e in bm.edges:
+            mid = (e.verts[0].co + e.verts[1].co) / 2
+            e.select = (mid - local_centroid).length < local_thresh
+    else:  # vert
+        bm.verts.ensure_lookup_table()
+        for v in bm.verts:
+            v.select = (v.co - local_centroid).length < local_thresh
 
-bmesh.update_edit_mesh(obj.data)
+    bmesh.update_edit_mesh(obj.data)
 
-# Find 3D viewport area and region for context override
-area   = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
-region = next((r for r in area.regions if r.type == 'WINDOW'), None) if area else None
+    # Find 3D viewport area and region for context override
+    area   = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+    region = next((r for r in area.regions if r.type == 'WINDOW'), None) if area else None
 
-# Zoom viewport to selection using view_selected
-if area and region:
-    with bpy.context.temp_override(area=area, region=region):
-        bpy.ops.view3d.view_selected(use_all_regions=False)
-
-bpy.ops.object.mode_set(mode='OBJECT')
+    # Zoom viewport to selection using view_selected
+    if area and region:
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.view3d.view_selected(use_all_regions=False)
+finally:
+    bpy.ops.object.mode_set(mode='OBJECT')
 print("detail:ready")
 """
         result = blender.send_command(
@@ -5040,10 +5100,8 @@ print("active:set")
         _pre_screenshot_bytes = None
         _pre_screenshot_image = None
         try:
-            _pre_mv = get_multiview_capture(name, include_wireframe=False)
-            _pre_front_images = [item for item in _pre_mv if isinstance(item, Image)]
-            if _pre_front_images:
-                _pre_screenshot_bytes = _pre_front_images[0].data  # FRONT view PNG bytes
+            _pre_screenshot_bytes = _capture_single_front_view(name)
+            if _pre_screenshot_bytes:
                 try:
                     _pre_coords = json.loads(get_problem_coordinates(name))
                 except Exception:
@@ -5099,10 +5157,8 @@ if obj:
         _post_screenshot_bytes = None
         _post_screenshot_image = None
         try:
-            _post_mv = get_multiview_capture(name, include_wireframe=False)
-            _post_front_images = [item for item in _post_mv if isinstance(item, Image)]
-            if _post_front_images:
-                _post_screenshot_bytes = _post_front_images[0].data
+            _post_screenshot_bytes = _capture_single_front_view(name)
+            if _post_screenshot_bytes:
                 try:
                     _post_coords = json.loads(get_problem_coordinates(name))
                 except Exception:
