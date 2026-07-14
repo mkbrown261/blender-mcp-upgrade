@@ -2537,6 +2537,7 @@ else:
         face_count_before = len(obj.data.polygons)
 
         bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
         bpy.ops.mesh.select_all(action='DESELECT')
         bpy.ops.mesh.select_non_manifold(extend=False, use_wire=False, use_boundary=True,
                                            use_multi_face=False, use_non_contiguous=False, use_verts=False)
