@@ -10448,20 +10448,44 @@ def _compress_manifest_vocab(manifest: dict, scene_asset_names: list[str]) -> st
 
 def _find_manifest(hint_path: str = "") -> str:
     """
-    Locate ERYNDOR_master_manifest.json. Search order:
-    1. hint_path if provided
-    2. Same directory as server.py
+    Locate the user's world manifest JSON. Search order:
+    1. hint_path if explicitly provided
+    2. Directory of the currently open .blend file (via Blender query)
     3. Current working directory
+    The manifest is NEVER shipped with or stored next to server.py —
+    it belongs to the user's project folder alongside their .blend files.
     Returns empty string if not found.
     """
     candidates = []
+
+    # 1. Explicit override
     if hint_path:
         candidates.append(Path(hint_path))
-    candidates.append(Path(__file__).parent / "ERYNDOR_master_manifest.json")
+
+    # 2. Directory of the open .blend file — ask Blender via TCP
+    try:
+        result = _send_json("get_scene_info", {})
+        data = json.loads(result) if isinstance(result, str) else result
+        blend_path = (data.get("result") or data).get("filepath", "")
+        if blend_path and blend_path != "//":
+            blend_dir = Path(blend_path).parent
+            candidates.append(blend_dir / "ERYNDOR_master_manifest.json")
+            # Also support any *_master_manifest.json in that dir
+            for p in blend_dir.glob("*_master_manifest.json"):
+                candidates.append(p)
+    except Exception:
+        pass  # Blender not connected yet — fall through
+
+    # 3. Current working directory
     candidates.append(Path.cwd() / "ERYNDOR_master_manifest.json")
+    for p in Path.cwd().glob("*_master_manifest.json"):
+        candidates.append(p)
+
+    seen = set()
     for c in candidates:
-        if c.exists():
+        if c not in seen and c.exists():
             return str(c)
+        seen.add(c)
     return ""
 
 

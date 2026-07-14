@@ -35,3 +35,8 @@ lerna-debug.log*
 # blender-mcp local session state (machine-specific, not shared)
 .blender_mcp_session.json
 studio_profile.json
+
+# World asset manifests — these belong next to the user's .blend files,
+# NOT in this repo. Every user has their own world/assets.
+*_master_manifest.json
+*_manifest.json
