@@ -34,3 +34,4 @@ lerna-debug.log*
 
 # blender-mcp local session state (machine-specific, not shared)
 .blender_mcp_session.json
+studio_profile.json

@@ -9744,6 +9744,24 @@ def synthesize_session(object_name: str = "") -> str:
     # PATH A — Fix critical blockers first (always valid if any exist)
     if critical_open:
         top_crit = critical_open[0]
+        # Remediation advice per issue_type — auto_repair_mesh only fixes
+        # geometry issues; giving that advice for e.g. deformation_risk is
+        # actively misleading (auto_repair_mesh never touches poles).
+        _HOW_BY_TYPE = {
+            "non_manifold_edges": "auto_repair_mesh() — automatic geometry repair.",
+            "zero_area_faces":    "auto_repair_mesh() — automatic geometry repair.",
+            "isolated_verts":     "auto_repair_mesh() — automatic geometry repair.",
+            "duplicate_faces":    "auto_repair_mesh() — automatic geometry repair.",
+            "ngons":              "Manual edit mode topology cleanup — requires artist judgment on edge flow.",
+            "deformation_risk":   "Manually re-route topology at the flagged joints — auto_repair_mesh does NOT fix poles/deformation. Use get_problem_detail_view() to see the exact location.",
+            "production_blocker": "Review the specific blocker detail — remediation varies by blocker type.",
+            "uv_missing":         "Unwrap UVs via Smart UV Project or manual seam placement.",
+        }
+        present_types = dict.fromkeys(i.get("issue_type", "") for i in critical_open)
+        how_lines = [
+            _HOW_BY_TYPE.get(t, f"Review '{t}' issue detail and use get_problem_detail_view() to inspect visually.")
+            for t in present_types
+        ]
         paths.append({
             "path": "A",
             "label": "Fix critical blockers first",
@@ -9753,11 +9771,7 @@ def synthesize_session(object_name: str = "") -> str:
                 f"'{top_crit['issue_type']}' on {top_crit['object']}: {top_crit['detail'][:120]}"
             ),
             "tradeoff": "Safest path. Nothing else is valid until critical issues are resolved.",
-            "how": (
-                "auto_repair_mesh() for non_manifold/geometry issues. "
-                "Manual edit mode for ngons. "
-                "get_problem_detail_view() for a zoomed close-up of the exact location."
-            ),
+            "how": " ".join(dict.fromkeys(how_lines)),
             "estimated_effort": "Low–Medium depending on issue count",
         })
 
@@ -10039,10 +10053,10 @@ if bone_sites:
             findings.append(f"{{stats['ngon_count']}} n-gon(s) in deforming area — will auto-triangulate unpredictably")
         if not stats["has_support_loops"]:
             risk_score += 20
-            findings.append(f"Insufficient edge loops ({stats['edge_loop_estimate']}) — smooth bending requires ≥3")
+            findings.append(f"Insufficient edge loops ({{stats['edge_loop_estimate']}}) — smooth bending requires ≥3")
         if stats["avg_valence"] > 5.5:
             risk_score += 10
-            findings.append(f"High average valence ({stats['avg_valence']:.1f}) — dense topology may cause pinching")
+            findings.append(f"High average valence ({{stats['avg_valence']:.1f}}) — dense topology may cause pinching")
         if stats["vert_count"] < 4:
             risk_score += 15
             findings.append("Very sparse geometry at joint — may collapse under extreme pose")
@@ -10092,7 +10106,7 @@ else:
             findings.append(f"{{stats['ngon_count']}} n-gon(s) in deforming area")
         if not stats["has_support_loops"]:
             risk_score += 20
-            findings.append(f"Insufficient edge loops ({stats['edge_loop_estimate']}) for clean bend")
+            findings.append(f"Insufficient edge loops ({{stats['edge_loop_estimate']}}) for clean bend")
 
         severity = "critical" if risk_score >= 50 else ("warning" if risk_score >= 20 else "ok")
         zones.append({{
