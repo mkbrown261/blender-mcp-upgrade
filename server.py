@@ -10462,11 +10462,23 @@ def _find_manifest(hint_path: str = "") -> str:
     if hint_path:
         candidates.append(Path(hint_path))
 
-    # 2. Directory of the open .blend file — ask Blender via TCP
+    # 2. Directory of the open .blend file — ask Blender directly.
+    # get_scene_info's real schema has no "filepath" key (it's name/object_count/
+    # objects/materials_count only) — query bpy.data.filepath directly instead.
     try:
-        result = _send_json("get_scene_info", {})
-        data = json.loads(result) if isinstance(result, str) else result
-        blend_path = (data.get("result") or data).get("filepath", "")
+        raw = _send_raw(
+            "execute_code_safe",
+            code="import bpy, json\nprint(json.dumps({'filepath': bpy.data.filepath}))",
+            required_mode=None,
+            push_undo=False,
+        )
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        blend_path = ""
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                blend_path = json.loads(line).get("filepath", "")
+                break
         if blend_path and blend_path != "//":
             blend_dir = Path(blend_path).parent
             candidates.append(blend_dir / "ERYNDOR_master_manifest.json")
