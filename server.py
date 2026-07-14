@@ -1761,12 +1761,14 @@ bpy.ops.mesh.remove_doubles(threshold=0.0001)
 
 # Pass 2: delete interior faces — faces fully enclosed by other faces
 # cause non-manifold edges because an edge ends up shared by 3+ faces.
+bpy.ops.mesh.select_mode(type='FACE')
 bpy.ops.mesh.select_all(action='DESELECT')
 bpy.ops.mesh.select_interior_faces()
 bpy.ops.mesh.delete(type='FACE')
 
 # Pass 3: limited dissolve of remaining wire edges — stray edges with
 # no face on either side leave non-manifold verts.
+bpy.ops.mesh.select_mode(type='EDGE')
 bpy.ops.mesh.select_all(action='DESELECT')
 for e in bm.edges:
     e.select = (len(e.link_faces) == 0)
@@ -1782,6 +1784,7 @@ print(f"non_manifold_edges:done:before={nm_before}:after={nm_after}")
 import bpy
 obj = bpy.context.active_object
 bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_mode(type='VERT')
 bpy.ops.mesh.select_all(action='DESELECT')
 bpy.ops.mesh.select_loose()
 bpy.ops.mesh.delete(type='VERT')
@@ -1827,9 +1830,11 @@ print("scale_not_applied:done")
 # so we check both names in the repair loop below.
 _REPAIR_ORDER = [
     "non_manifold_edges",  # first: merge coincident verts + delete interior faces
-    "loose_vertices",      # addon key: "isolated_verts" — after non-manifold cleanup
     "duplicate_faces",     # merge by distance (also helps non-manifold but scoped here)
     "zero_area_faces",
+    "loose_vertices",      # addon key: "isolated_verts" — LAST geometry pass: the
+                            # non-manifold/dissolve passes above can themselves strand
+                            # new loose verts (observed live), so clean up after them
     "inverted_normals",    # last: recalc normals after all geometry changes
 ]
 
@@ -3436,7 +3441,9 @@ print("active:set")
             }, indent=2)
 
         # ── STEP 3: Execute repairs in safe order ──────────────────────────
-        repairs_executed = []
+        before_counts = {p.get("type", ""): p.get("count", 0) for p in raw_before.get("problems", [])}
+
+        attempted = []
         repair_errors = []
 
         for repair_key in _REPAIR_ORDER:
@@ -3464,37 +3471,58 @@ if obj:
                 result = blender.send_command(
                     "execute_code_safe", {"code": full_script, "required_mode": "OBJECT", "push_undo": True}
                 )
-                if result.get("result", "").find("done") >= 0 or "error" not in result:
-                    repairs_executed.append(repair_key)
-                else:
+                if "error" in result:
                     repair_errors.append(f"{repair_key}: {result.get('error', 'unknown error')}")
+                    continue
             except Exception as e:
                 repair_errors.append(f"{repair_key}: {e}")
+                continue
+            attempted.append(repair_key)
 
-        # ── STEP 4: Verify — re-scan after repairs ─────────────────────────
+        # ── STEP 4: Verify — re-scan after repairs and confirm each attempted
+        # repair actually reduced its problem count. A script can run without
+        # raising an error and still change nothing (e.g. dissolve_degenerate
+        # on a fully isolated face with no neighboring geometry to fold into) —
+        # "no exception" is not evidence of a real fix, so don't trust it alone.
         raw_after = _send_raw("detect_mesh_problems", name=name)
         if "error" in raw_after:
             reasoned_after = {"error": raw_after["error"]}
+            after_counts = {}
         else:
             reasoned_after = _reason_mesh_problems(raw_after).get("_reasoning", {})
+            after_counts = {p.get("type", ""): p.get("count", 0) for p in raw_after.get("problems", [])}
+
+        repairs_executed = []
+        repairs_no_effect = []
+        for repair_key in attempted:
+            problem_type = "isolated_verts" if repair_key == "loose_vertices" else repair_key
+            before_n = before_counts.get(problem_type, 0)
+            after_n = after_counts.get(problem_type, 0)
+            if after_n < before_n:
+                repairs_executed.append(f"{repair_key} ({before_n}→{after_n})")
+            else:
+                repairs_no_effect.append(repair_key)
 
         # ── STEP 5: Build result report ────────────────────────────────────
         before_summary = reasoned_before.get("_reasoning", {})
         remaining_issues = reasoned_after.get("findings", []) if isinstance(reasoned_after, dict) else []
         remaining_critical = [f for f in remaining_issues if f.get("severity") == "critical"]
 
-        status = "success" if not remaining_critical and not repair_errors else (
-            "partial" if repairs_executed else "failed"
+        status = "success" if repairs_executed and not repair_errors and not repairs_no_effect and not remaining_critical else (
+            "partial" if (repairs_executed or repairs_no_effect) else "failed"
         )
 
         return json.dumps({
             "object": name,
             "status": status,
             "repairs_executed": repairs_executed,
+            "repairs_attempted_no_effect": repairs_no_effect,
             "repair_errors": repair_errors,
             "issues_that_need_artist_review": needs_artist,
             "summary": (
                 f"Repaired {len(repairs_executed)} issue(s): {', '.join(repairs_executed) or 'none'}. "
+                f"{len(repairs_no_effect)} repair(s) ran but had no measurable effect "
+                f"(needs manual review): {', '.join(repairs_no_effect) or 'none'}. "
                 f"{len(repair_errors)} repair error(s). "
                 f"{len(remaining_issues)} issue(s) remaining after repair "
                 f"({len(remaining_critical)} critical). "
