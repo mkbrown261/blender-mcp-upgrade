@@ -249,7 +249,23 @@ def _journal_entry(tool: str, object_name: str, outcome: str, detail: str = "") 
 # Analysis tools open issues; repair/QA tools close them.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ISSUE_COUNTER = 0   # monotonic ID — never resets within a process lifetime
+def _next_issue_id() -> str:
+    """
+    Derive the next issue ID from the max ID already in the persisted tracker,
+    rather than a separate in-memory counter — a plain counter resets to 0 on
+    every MCP restart while the loaded tracker can already contain higher IDs,
+    causing new issues to collide with existing ones.
+    """
+    tracker = _SESSION.get("issue_tracker", []) or []
+    max_n = 0
+    for entry in tracker:
+        eid = entry.get("id", "")
+        if eid.startswith("ISS-"):
+            try:
+                max_n = max(max_n, int(eid[4:]))
+            except ValueError:
+                pass
+    return f"ISS-{max_n + 1:03d}"
 
 
 def _open_issue(
@@ -265,10 +281,8 @@ def _open_issue(
     severity: 'critical' | 'warning' | 'info'
     issue_type: e.g. 'non_manifold' | 'ngon' | 'deformation_risk' | 'uv_missing' | ...
     """
-    global _ISSUE_COUNTER
     import datetime as _dt
-    _ISSUE_COUNTER += 1
-    issue_id = f"ISS-{_ISSUE_COUNTER:03d}"
+    issue_id = _next_issue_id()
     entry = {
         "id":        issue_id,
         "ts_opened": _dt.datetime.now().strftime("%H:%M:%S"),
@@ -4096,11 +4110,14 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
         "get_spatial_analysis", object_name, "ok",
         f"ngons={ngon_n} non_manifold={nm_n} poles={pole_n} deep={deep}"
     )
+    # issue_type uses the same canonical strings as detect_mesh_problems /
+    # auto_repair_mesh's repair keys ("non_manifold_edges", "ngons") so
+    # _close_issues_for() can actually match and auto-close these after repair.
     if nm_n > 0:
-        _open_issue("get_spatial_analysis", object_name, "non_manifold", "critical",
+        _open_issue("get_spatial_analysis", object_name, "non_manifold_edges", "critical",
                     f"{nm_n} non-manifold element(s) detected in spatial analysis.")
     if ngon_n > 0:
-        _open_issue("get_spatial_analysis", object_name, "ngon", "warning",
+        _open_issue("get_spatial_analysis", object_name, "ngons", "warning",
                     f"{ngon_n} n-gon face(s) detected in spatial analysis.")
 
     return all_images
@@ -9694,7 +9711,7 @@ def synthesize_session(object_name: str = "") -> str:
     # Rank open issues: critical first, then by element type priority
     _SEV_RANK = {"critical": 0, "warning": 1, "info": 2}
     _TYPE_RANK = {
-        "non_manifold": 0, "production_blocker": 1, "ngon": 2,
+        "non_manifold_edges": 0, "production_blocker": 1, "ngons": 2,
         "deformation_risk": 3, "uv_missing": 4, "pole": 5,
     }
     open_issues.sort(key=lambda i: (
@@ -10279,9 +10296,12 @@ def simulate_production_readiness(object_name: str, asset_type: str = "") -> str
             "No materials assigned — asset will appear grey in engine.",
             f"{len(mat_list)} material(s) — multiple materials mean multiple draw calls. Merge if possible.",
         )
+        # run_unreal_readiness_check's "checks" dict holds nested {"pass": bool, ...}
+        # per check, not a bare bool — comparing the dict itself to False is always
+        # False regardless of actual state. Read the nested "pass" key instead.
         scorecard["ENGINE"] = _grade(
-            ue5_checks.get("scale_applied") == False,
-            ue5_checks.get("pivot_at_origin") == False,
+            not ue5_checks.get("scale_applied", {}).get("pass", True),
+            not ue5_checks.get("pivot_at_origin", {}).get("pass", True),
             "Scale applied, pivot at origin — UE5 conventions met.",
             "Scale NOT applied — mesh will import at wrong size in UE5. Apply scale before export.",
             "Pivot not at origin — asset will rotate/translate incorrectly in UE5.",
@@ -10413,7 +10433,11 @@ def review_board(object_name: str, asset_type: str = "") -> str:
         budget     = (pb_budgets.get(eff_type) or
                       {"hero_character": 80000, "weapon": 15000, "env_prop": 5000
                        }.get(eff_type, 50000))
-        ue5_ok     = not isinstance(raw_ue5, dict) or not raw_ue5.get("issues")
+        # run_unreal_readiness_check's real schema has no "issues" key — the
+        # actual readiness flag is "ue5_ready" (bool). The old "issues" lookup
+        # always returned None (falsy), so this was always True regardless of
+        # actual UE5 readiness.
+        ue5_ok     = raw_ue5.get("ue5_ready", True) if isinstance(raw_ue5, dict) else True
 
         def _score_to_grade(s):
             if s >= 90: return "A"
