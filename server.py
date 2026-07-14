@@ -10599,7 +10599,7 @@ def construction_mode(
     manifest_path: str = "",
     alley_width_meters: float = 4.5,
     camera_height_meters: float = 1.7
-) -> str:
+) -> list:
     """
     CONSTRUCTION MODE — core tool. Analyzes a reference image and places your
     Eryndor assets in Blender to match the scene. Runs the full pipeline:
@@ -10625,11 +10625,11 @@ def construction_mode(
         # ── 1. Load manifest ──────────────────────────────────────────────────
         mpath = _find_manifest(manifest_path)
         if not mpath:
-            return json.dumps({"error": "Manifest not found. Run load_manifest() first."}, indent=2)
+            return [{"error": "Manifest not found. Run load_manifest() first."}]
         manifest = _load_manifest(mpath)
 
         # ── 2. Read active scene assets from Blender ──────────────────────────
-        scene_result = _send_json("get_asset_library", {})
+        scene_result = _send_json("get_asset_library")
         try:
             scene_data = json.loads(scene_result) if isinstance(scene_result, str) else scene_result
         except Exception:
@@ -10637,10 +10637,10 @@ def construction_mode(
 
         scene_assets = scene_data.get("sm_assets", [])
         if not scene_assets:
-            return json.dumps({
+            return [{
                 "error": "No SM_ assets found in current Blender scene.",
                 "fix": "Open your construction .blend file with SM_ assets before running construction_mode()."
-            }, indent=2)
+            }]
 
         # ── 3. Compress vocabulary (token-safe) ───────────────────────────────
         vocab = _compress_manifest_vocab(manifest, scene_assets)
@@ -10648,16 +10648,17 @@ def construction_mode(
         scale_ref = meta.get("scale_reference_asset", scale_anchor_asset)
         scale_h = meta.get("scale_reference_height_meters", scale_anchor_height_meters)
 
-        # ── 4. Load and encode reference image ────────────────────────────────
+        # ── 4. Load reference image — returned as a real Image content block,
+        # NOT base64-embedded in the JSON text (that inflated responses past
+        # any reasonable size — a modest reference image blew past 2.8M chars).
         img_path = Path(reference_image_path)
         if not img_path.exists():
-            return json.dumps({"error": f"Reference image not found: {reference_image_path}"}, indent=2)
+            return [{"error": f"Reference image not found: {reference_image_path}"}]
 
         with open(img_path, "rb") as f:
             img_bytes = f.read()
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
         suffix = img_path.suffix.lower().lstrip(".")
-        mime = "image/jpeg" if suffix in ("jpg", "jpeg") else "image/png"
+        img_format = "jpeg" if suffix in ("jpg", "jpeg") else "png"
 
         # ── 5. Build vision analysis prompt ──────────────────────────────────
         vision_prompt = f"""You are a 3D scene layout analyst for the Eryndor game world.
@@ -10722,14 +10723,11 @@ Return ONLY valid JSON in this exact structure:
   ]
 }}"""
 
-        # ── 6. Call Claude vision (self-call via MCP context) ─────────────────
-        # We use execute_code_safe in Blender to avoid a second network hop.
-        # The vision analysis is done by embedding the prompt + image into
-        # a structured response request returned to the caller (Claude itself).
-        # Claude reads the prompt and image and responds with the JSON plan.
-
-        # Return the analysis request — Claude will process image + prompt
-        # and the result feeds into calculate_world_coordinates
+        # ── 6. Return the reference image as a real Image content block +
+        # the vision prompt as a metadata dict. Claude reads the image
+        # directly (vision is native, no base64 JSON round-trip needed) and
+        # responds with the JSON plan per vision_prompt's instructions, then
+        # feeds that into calculate_world_coordinates().
         vision_request = {
             "status": "vision_analysis_required",
             "scene_name": scene_name,
@@ -10737,21 +10735,19 @@ Return ONLY valid JSON in this exact structure:
             "manifest_asset_count": len(manifest.get("assets", {})),
             "scale_anchor": f"{scale_ref} = {scale_h}m",
             "alley_width_meters": alley_width_meters,
-            "image_mime": mime,
-            "image_b64": img_b64,
             "vision_prompt": vision_prompt,
             "instruction": (
-                "Analyze the reference image using the vision_prompt above. "
+                "Analyze the reference image above using the vision_prompt field. "
                 "Then call calculate_world_coordinates(scene_name, vision_json, "
                 f"alley_width_meters={alley_width_meters}) with your JSON response "
                 "to convert frame positions to Blender world coordinates."
             ),
         }
-        return json.dumps(vision_request, indent=2)
+        return [Image(data=img_bytes, format=img_format), vision_request]
 
     except Exception as e:
         logger.error(f"construction_mode error: {e}")
-        return json.dumps({"error": str(e)}, indent=2)
+        return [{"error": str(e)}]
 
 
 @mcp.tool()
@@ -10922,7 +10918,8 @@ def calculate_world_coordinates(
             "next_step": (
                 f"Review the placements above. "
                 f"Call execute_construction(scene_name='{scene_name}') to place all assets in Blender, "
-                f"or call adjust_construction_plan(scene_name, instructions) to modify before placing."
+                f"or call adjust_asset(scene_name, instance_id, move_x/y/z, rotate_z, scale_delta) "
+                f"to nudge individual placements before placing."
             ),
             "placements": placements_out,
         }, indent=2)
@@ -10956,11 +10953,12 @@ def execute_construction(scene_name: str, collection_name: str = "") -> str:
     placements = plan.get("placements", [])
     coll_name = collection_name or f"CONSTRUCTION_{scene_name}"
 
-    result = _send_json("execute_construction", {
-        "placements": placements,
-        "collection_name": coll_name,
-        "scene_name": scene_name,
-    })
+    result = _send_json(
+        "execute_construction",
+        placements=placements,
+        collection_name=coll_name,
+        scene_name=scene_name,
+    )
 
     try:
         r = json.loads(result) if isinstance(result, str) else result
@@ -11047,14 +11045,15 @@ def adjust_asset(
 
     # Send to Blender
     blender_name = target.get("blender_name", instance_id)
-    result = _send_json("move_object", {
-        "name": blender_name,
-        "x": target["world_x"],
-        "y": target["world_y"],
-        "z": target["world_z"],
-        "rotation_z": target["rotation_z_deg"],
-        "scale": target["scale"],
-    })
+    result = _send_json(
+        "move_object",
+        name=blender_name,
+        x=target["world_x"],
+        y=target["world_y"],
+        z=target["world_z"],
+        rotation_z=target["rotation_z_deg"],
+        scale=target["scale"],
+    )
 
     return json.dumps({
         "status": "adjusted",
@@ -11124,11 +11123,12 @@ def add_asset_to_scene(
     }
     _CONSTRUCTION_STATE[scene_name]["placements"].append(placement)
 
-    result = _send_json("execute_construction", {
-        "placements": [placement],
-        "collection_name": f"CONSTRUCTION_{scene_name}",
-        "scene_name": scene_name,
-    })
+    result = _send_json(
+        "execute_construction",
+        placements=[placement],
+        collection_name=f"CONSTRUCTION_{scene_name}",
+        scene_name=scene_name,
+    )
 
     return json.dumps({
         "status": "added",
@@ -11158,10 +11158,11 @@ def sync_construction_state(scene_name: str) -> str:
     placements = _CONSTRUCTION_STATE[scene_name].get("placements", [])
     blender_names = [p.get("blender_name", p["instance_id"]) for p in placements]
 
-    result = _send_json("get_construction_positions", {
-        "object_names": blender_names,
-        "collection_name": f"CONSTRUCTION_{scene_name}",
-    })
+    result = _send_json(
+        "get_construction_positions",
+        object_names=blender_names,
+        collection_name=f"CONSTRUCTION_{scene_name}",
+    )
 
     try:
         r = json.loads(result) if isinstance(result, str) else result

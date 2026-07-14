@@ -3919,7 +3919,7 @@ class BlenderMCPServer:
                 for obj in bpy.data.objects:
                     import re
                     base = re.sub(r'\.\d{3}$', '', obj.name)
-                    if base == asset_name:
+                    if base.lower() == asset_name.lower():
                         source_obj = obj
                         break
 
