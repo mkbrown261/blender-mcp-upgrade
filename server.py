@@ -2245,29 +2245,12 @@ def session_update(
     td_mode: bool = None,
 ) -> str:
     """
-    SESSION CONTEXT — Update what Claude knows about the current work session.
-
-    Call this whenever the user confirms or corrects something important:
-    the asset type, active playbook, pipeline stage, or when a tool run is
-    verified and complete.
-
-    This persists for the lifetime of the MCP session so subsequent tool calls
-    can reference confirmed facts without re-inferring from scratch.
-
-    Parameters (all optional — only pass what changed):
-      asset_type         : confirmed asset type — "hero_character" | "weapon" |
-                           "environment_prop" | "creature" | "vehicle" | "npc" |
-                           "background_character" | "crowd_character" | etc.
-      active_playbook    : set the active playbook — "hero_char" | "weapon" |
-                           "env_prop" | "creature" | "vehicle"
-      confirmed_stage    : 1–6 — pipeline stage confirmed by user or strong evidence
-      active_object      : Blender object name currently being worked on
-      add_verified_check : tool name to mark as completed this session
-                           e.g. "analyze_rig_weights"
-      add_open_issue     : issue to track e.g. "shoulder_deformation"
-      add_user_correction: record a user override e.g. "user said weapon not prop"
-      apprentice_mode    : True/False — enable/disable teaching annotations
-      td_mode            : True/False — enable/disable TD planning mode
+    SESSION CONTEXT — record confirmed facts (asset type, playbook, pipeline
+    stage, verified checks) so later tool calls don't re-infer from scratch.
+    Persists for the MCP session lifetime. All params optional — pass only
+    what changed. asset_type/active_playbook are free-form strings (e.g.
+    "hero_character"/"hero_char", "weapon", "creature", "environment_prop").
+    confirmed_stage: 1-6.
     """
     if asset_type:
         _session_set(asset_type=asset_type)
@@ -2295,15 +2278,10 @@ def session_update(
 @mcp.tool()
 def session_status() -> str:
     """
-    SESSION STATUS — Read the current session context.
-
-    Returns everything Claude knows about this session: confirmed asset type,
-    active playbook, pipeline stage, which checks have been run, open issues,
-    and any user corrections or overrides recorded this session.
-
-    Call this at the start of a new conversation turn to orient yourself
-    before reaching for Blender tools. If session is empty, fall back to
-    the normal session-start sequence (screenshot → scene_info → object_info).
+    SESSION STATUS — everything known this session: asset type, playbook,
+    stage, verified checks, open issues, user corrections. Call at the start
+    of a turn to orient before reaching for other tools; if empty, fall back
+    to screenshot → scene_info → object_info.
     """
     has_context = any([
         _SESSION.get("asset_type"),
@@ -2348,28 +2326,12 @@ def session_status() -> str:
 @mcp.tool()
 def set_playbook(playbook: str) -> str:
     """
-    PRODUCTION PLAYBOOK — Activate a named workflow for this asset.
-
-    Sets the active playbook so what_next, production_review, and
-    plan_production_path all evaluate this asset against the right
-    standards, vertex budgets, mandatory checks, and known gotchas.
-
-    Available playbooks:
-      hero_char   — Main playable/cinematic character (80k vert limit, 2 UV channels,
-                    full rig QA, 3-material max, LODs required)
-      creature    — Non-human characters, animals, monsters (60k, creature rig notes)
-      weapon      — Hand-held weapons, hard surface, no rig (15k, 2-material max)
-      env_prop    — Background/environment prop (20k, single material, lightmap UV)
-      vehicle     — Driveable or cinematic vehicle (60k, wheel bone alignment notes)
-
-    After setting a playbook, what_next and production_review will:
-      - Apply this playbook's vertex budget in conflict checks
-      - Show playbook-specific gotchas relevant to the current stage
-      - Mark playbook-mandatory checks as required
-      - Skip checks that don't apply (e.g. rig QA on weapons)
-
-    Parameters:
-      playbook : one of "hero_char" | "creature" | "weapon" | "env_prop" | "vehicle"
+    PRODUCTION PLAYBOOK — activates a named workflow so what_next,
+    production_review, and plan_production_path evaluate against the right
+    vertex budget, mandatory checks, and gotchas.
+    playbook: "hero_char" (80k, 2 UV channels, full rig QA, LODs required) |
+    "creature" (60k) | "weapon" (15k, no rig) | "env_prop" (20k, lightmap UV) |
+    "vehicle" (60k, wheel bone notes).
     """
     if playbook not in _PLAYBOOKS:
         available = ", ".join(_PLAYBOOKS.keys())
@@ -2439,17 +2401,9 @@ def list_playbooks() -> str:
 @mcp.tool()
 def snapshot_mesh_state(object_name: str) -> str:
     """
-    SNAPSHOT — Capture current mesh stats for an object as a baseline.
-
-    Stores vert count, face count, ngon count, non-manifold edges, topology
-    score, UV state, and problem counts in memory. Call before a repair pass
-    or any destructive operation so compare_mesh_state() can show the delta.
-
-    Snapshots are per-MCP-session only (not persisted to disk — mesh state
-    can change between Blender sessions and stale snapshots mislead).
-
-    Parameters:
-      object_name : Blender object name to snapshot
+    SNAPSHOT — captures vert/face/ngon/non-manifold/topology/UV stats as a
+    baseline. Call before any repair or destructive op so compare_mesh_state()
+    can show the delta. Per-MCP-session only, not persisted to disk.
     """
     import datetime
 
@@ -2521,16 +2475,9 @@ def snapshot_mesh_state(object_name: str) -> str:
 @mcp.tool()
 def compare_mesh_state(object_name: str) -> str:
     """
-    COMPARE — Diff current mesh state against the stored snapshot.
-
-    Runs a fresh analysis and shows the delta for every tracked stat:
-    vert count, face count, ngon count, non-manifold edges, topology score,
-    UV state. Each delta is signed (+/-) and tagged IMPROVED / REGRESSED / UNCHANGED.
-
-    Requires snapshot_mesh_state(object_name) to have been called first this session.
-
-    Parameters:
-      object_name : Blender object name to compare (must have a snapshot)
+    COMPARE — diffs current mesh state against the stored snapshot: signed
+    deltas per stat, each tagged IMPROVED/REGRESSED/UNCHANGED. Requires
+    snapshot_mesh_state(object_name) called first this session.
     """
     if object_name not in _SNAPSHOTS:
         return json.dumps({
@@ -2646,28 +2593,11 @@ def compare_mesh_state(object_name: str) -> str:
 @mcp.tool()
 def close_boundary_holes(object_name: str, dry_run: bool = True) -> str:
     """
-    CLOSE BOUNDARY HOLES — properly cap open/non-watertight edges without leaving ngons.
-
-    auto_repair_mesh() deliberately never touches boundary edges — closing an
-    open mesh is a judgment call (intentional open-shell geometry, like exposed
-    ribs, vs. a genuine hole?), not something to auto-decide. This is the
-    explicit, opt-in tool for when you've decided closure is the right call.
-
-    A naive single fill_holes() call caps each open loop with one face spanning
-    the whole loop — for any loop bigger than a triangle, that's an ngon,
-    trading one problem for another. This tool fills the holes AND triangulates
-    just the newly-created cap faces (not the rest of the mesh), so the mesh
-    closes without introducing new ngons.
-
-    dry_run=True (default): reports what would be closed — loop count and
-    edge/vert count per loop — without touching the mesh.
-    dry_run=False: actually closes the holes and triangulates the caps, then
-    attaches a fresh non-manifold/boundary/ngon/topology scan so you don't need
-    a separate call to see the real result.
-
-    Parameters:
-      object_name : Blender mesh object to repair
-      dry_run     : True (default, preview only) | False (execute)
+    CLOSE BOUNDARY HOLES — caps open/non-watertight edges WITHOUT leaving
+    ngons (triangulates only the new cap faces, not the whole mesh). Opt-in —
+    auto_repair_mesh() deliberately skips boundary edges since closing a hole
+    is a judgment call (genuine hole vs. intentional open-shell geometry).
+    dry_run=True (default): preview only. dry_run=False: executes + re-scans.
     """
     script = r"""
 import bpy, bmesh, json
@@ -2787,28 +2717,10 @@ else:
 @mcp.tool()
 def get_multiview_capture(object_name: str, include_wireframe: bool = False) -> list:
     """
-    MULTIVIEW CAPTURE — Render 7 viewport shots of an object (front, back, left,
-    right, top, bottom, perspective) and return them all as images.
-
-    This gives Claude complete spatial visibility: every face, every silhouette,
-    every occluded surface. No geometry is hidden. Use this before any analysis
-    that depends on understanding the object's 3D shape — topology review,
-    spatial reasoning, deformation assessment.
-
-    If include_wireframe=True, captures a second set of 7 views in wireframe
-    shading mode so topology (edge loops, poles, ngons) is directly visible
-    as lines rather than inferred from stats.
-
-    Saves view metadata to session (object, timestamp, stale flag). Images are
-    NOT persisted to disk — they live in Claude's context window for this turn.
-    Call again if the mesh has been repaired or modified (session will show
-    capture_stale=True when that happens).
-
-    Parameters:
-      object_name      : Blender object name to frame and capture
-      include_wireframe: also capture 7 wireframe views (topology visible as lines)
-
-    Returns list of Image objects: 7 solid views [+ 7 wireframe views if requested].
+    MULTIVIEW CAPTURE — 7 viewport shots (front/back/left/right/top/bottom/
+    persp) as images, no geometry hidden. include_wireframe=True adds 7 more
+    in wireframe shading (topology as lines). Not persisted to disk. Session
+    tracks capture_stale — re-capture after any mesh repair.
     """
     import datetime, tempfile, os
 
@@ -3055,27 +2967,11 @@ print(__import__('json').dumps(result))
 @mcp.tool()
 def get_problem_coordinates(object_name: str, problem_type: str = "all", cluster_radius: float = 0.5) -> str:
     """
-    PROBLEM COORDINATES — World-space locations of every mesh problem, clustered
-    by proximity so Claude gets regions not individual face indices.
-
-    Uses bmesh to walk the mesh and extract the centroid of every problem element
-    (ngon face, non-manifold edge, high-valence pole), then groups nearby elements
-    into clusters. Each cluster gets a world-space centroid, bounding box, face count,
-    severity, and a plain-English region label derived from its position within the
-    object's bounding box (e.g. "upper_front_left").
-
-    Orthographic projection formulas are included per cluster so Claude knows
-    exactly where in the FRONT/RIGHT/TOP views each cluster appears — no guessing
-    which part of the image corresponds to which data point.
-
-    Parameters:
-      object_name    : Blender object name
-      problem_type   : "all" | "ngons" | "non_manifold" | "poles"
-      cluster_radius : max distance (metres) between elements in the same cluster
-
-    Returns JSON with ngon_clusters, non_manifold_clusters, pole_clusters,
-    each cluster having: centroid, bbox, element_count, severity, region_label,
-    view_projections (FRONT/RIGHT/TOP normalised 0-1 screen coords).
+    PROBLEM COORDINATES — world-space locations of every mesh problem
+    (ngons, non-manifold edges, high-valence poles), clustered by proximity
+    into regions with centroid, bbox, severity, region_label, and
+    FRONT/RIGHT/TOP normalized view_projections for locating them in a
+    screenshot. problem_type: "all" | "ngons" | "non_manifold" | "poles".
     """
     script = f"""
 import bpy, bmesh, json, math
@@ -3261,40 +3157,11 @@ else:
 @mcp.tool()
 def get_annotated_capture(object_name: str, modes: str = "all") -> list:
     """
-    ANNOTATED CAPTURE — Highlighted mesh captures that make problem geometry
-    visually unambiguous in every screenshot.
-
-    Combines two complementary techniques:
-
-    PASS 1 — Element precision (edit mode selection):
-      Enters edit mode, selects problem elements by type, captures 7 views.
-      Blender's orange selection highlight makes exact problem faces/edges/verts
-      visible against the clean mesh. One 7-view set per problem type.
-        ngons        → face select mode, ngon faces orange
-        non_manifold → edge select mode, non-manifold edges highlighted
-        poles        → vertex select mode, high-valence verts highlighted
-
-    PASS 2 — Severity map (temporary emission materials):
-      Assigns colored emission materials to problem face clusters by severity:
-        red    = critical clusters (ngon density > 20 faces or > 100 total)
-        orange = warning clusters
-        green  = clean faces (unaffected)
-      Captures 7 views with object shading, showing the priority heat map.
-      Original materials fully restored after capture (try/finally guaranteed).
-
-    State restoration is guaranteed via try/finally:
-      - Original mode restored (OBJECT)
-      - Original selection cleared
-      - Temporary materials removed from bpy.data.materials
-      - Original material assignments restored per face
-
-    Parameters:
-      object_name : Blender object name
-      modes       : "all" | "ngons" | "non_manifold" | "poles" | "severity_map"
-
-    Returns list of Image objects (annotated captures) + JSON metadata summary.
-    Image order: [ngon_views x7], [non_manifold_views x7], [pole_views x7],
-                 [severity_map_views x7], metadata_dict.
+    ANNOTATED CAPTURE — 7-view edit-mode highlights per problem type (ngons/
+    non_manifold/poles orange-selected) + a red/orange/green severity heat map
+    pass. Expensive: up to 28 images (4 passes x 7 views). modes: "all" |
+    "ngons" | "non_manifold" | "poles" | "severity_map". Mode/material/selection
+    state is guaranteed restored via try/finally even if capture fails partway.
     """
     import datetime, tempfile, os
 
@@ -3948,29 +3815,12 @@ print(__import__('json').dumps(result))
 @mcp.tool()
 def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     """
-    SPATIAL ANALYSIS — Initial-inspection spatial intelligence: 7 clean views
-    (FRONT/BACK/LEFT/RIGHT/TOP/BOTTOM/PERSP) plus world-space problem
-    coordinates in one call. This is the default entry point for "look at
-    this mesh from every angle" — 7 images total, same cost as a single
-    get_multiview_capture() call.
-
-    deep=False (default): 7 solid views + get_problem_coordinates() data,
-      folded into a spatial narrative (world coords, region label, view
-      projection coords per problem cluster). No wireframe, no annotated
-      highlight passes, no heat map — just the 7 angles plus text.
-
-    deep=True: adds wireframe (+7), per-problem-type edit-mode highlights
-      (+21), and a severity heat map (+7) — up to 42 images total. Only use
-      this when you already know there's a specific problem and need to
-      visually pinpoint it after get_problem_coordinates/the 7-view pass
-      wasn't enough — it is expensive, don't reach for it by default.
-
-    Parameters:
-      object_name : Blender object name
-      deep        : False (default) = 7 images + coordinates.
-                    True = full 42-image annotated/heatmap breakdown.
-
-    Returns list: [images] + [unified spatial report dict]
+    SPATIAL ANALYSIS — default entry point for "look at this mesh from every
+    angle": 7 clean views (FRONT/BACK/LEFT/RIGHT/TOP/BOTTOM/PERSP) + world-space
+    problem coordinates, markers burned onto each image. Same cost as
+    get_multiview_capture(). deep=True adds wireframe + per-type edit-mode
+    highlights + severity heat map — up to 42 images, expensive, only use
+    when the 7-view pass can't pinpoint a known problem.
     """
     all_images = []
     errors     = []
@@ -4126,35 +3976,10 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
 @mcp.tool()
 def get_problem_detail_view(object_name: str, problem_type: str = "worst") -> list:
     """
-    PROBLEM DETAIL VIEW — Zooms Blender's viewport to the single worst problem
-    cluster and captures a high-res close-up of JUST that region.
-
-    Complements get_spatial_analysis() which gives the full 7-view overview.
-    Use this when you already know a problem exists and need to see exactly what
-    the geometry looks like up close at the problem site — without wading through
-    42 deep-mode images.
-
-    How it works
-    ------------
-    1. Calls get_problem_coordinates() to find all clusters.
-    2. Picks the worst cluster (critical > warning; highest element_count within tier).
-       problem_type lets you target a specific class:
-         "worst"        — auto-pick the single worst cluster across all types (default)
-         "ngon"         — worst ngon cluster
-         "non_manifold" — worst non-manifold cluster
-         "pole"         — worst pole cluster
-    3. Sends a Blender script that: sets active object → enters edit mode → selects
-       only those problem elements (by face/edge/vert index from the cluster centroid
-       proximity search) → calls view.all_selected → exits edit mode → takes screenshot.
-    4. Burns the cluster's marker circle onto the close-up image (same Pillow overlay).
-    5. Returns: [close_up_Image, detail_report_dict]
-
-    Parameters
-    ----------
-    object_name  : Blender object name
-    problem_type : "worst" | "ngon" | "non_manifold" | "pole"
-
-    Returns list: [close_up_image (annotated), detail_report dict]
+    PROBLEM DETAIL VIEW — zooms the viewport to the single worst problem
+    cluster and captures a close-up, instead of wading through 42 deep-mode
+    images. problem_type: "worst" (default) | "ngon" | "non_manifold" | "pole".
+    Returns list: [close_up_image (marker burned in), detail_report].
     """
     try:
         blender = get_blender_connection()
@@ -5027,18 +4852,11 @@ def get_session_log() -> str:
 @mcp.tool()
 def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbose: bool = False) -> str:
     """
-    COMPOUND TOOL — Full pre-export analysis in one call.
-
-    Runs detect_mesh_problems + get_mesh_quality_report + analyze_topology +
-    run_unreal_readiness_check simultaneously, then combines all findings
-    into a single prioritised report with professional fix guidance.
-
-    Use this as the first step before any UE5 export workflow.
-
-    topology_context: 'generic' | 'character_body' | 'face' | 'hand' | 'hard_surface'
-    verbose: False (default) — returns verdict + failing/warning findings only.
-             True — returns full analysis including all passing checks and raw
-             reasoning blocks. Use when you need the complete picture.
+    COMPOUND TOOL — full pre-export analysis: detect_mesh_problems +
+    get_mesh_quality_report + analyze_topology + run_unreal_readiness_check,
+    combined into one prioritised report. First step before any UE5 export.
+    topology_context: "generic"|"character_body"|"face"|"hand"|"hard_surface".
+    verbose=False (default) returns only verdict + failing/warning findings.
     """
     try:
         # Run all four analyses
@@ -5163,38 +4981,16 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbos
 @mcp.tool()
 def auto_repair_mesh(name: str, dry_run: bool = False) -> list:
     """
-    AUTO-REPAIR — Safe mesh cleanup loop: Scan → Diagnose → Repair → Verify.
+    AUTO-REPAIR — safe mesh cleanup: non-manifold edges, loose verts, duplicate
+    faces, zero-area faces, inverted normals. Verifies each repair actually
+    reduced its problem count (doesn't just trust "no exception" as success).
 
-    Automatically fixes the following problems (in safe order):
-      1. Non-manifold edges — three passes:
-           a) merge by distance (0.0001m) — eliminates coincident verts that
-              create T-junctions and overlapping-face non-manifolds
-           b) delete interior faces — faces enclosed by other faces cause edges
-              shared by 3+ faces
-           c) dissolve wire edges — stray edges with no face leave non-manifold verts
-         Reports before/after count. Surviving non-manifolds (complex interior
-         topology) are flagged for artist review.
-      2. Loose vertices — delete isolated verts not connected to any edge
-      3. Duplicate faces — merge by distance removes overlapping geometry
-      4. Zero-area/degenerate faces — dissolve degenerate (threshold 0.0001m)
-      5. Inverted normals — recalculate outside (run last, after all geometry fixed)
+    Does NOT touch: ngons or UV overlaps — those need artist judgment on edge
+    flow, not a mechanical fix.
 
-    Problems NOT auto-repaired (require artist review):
-      - Non-manifold edges that survive all three passes (complex interior topology)
-      - UV overlaps (may be intentional tiling)
-      - N-gons (topology restructuring needed — auto-triangulate would break edge flow)
-
-    dry_run=True: diagnoses and plans repairs without executing them.
-    dry_run=False: executes all safe repairs then re-scans to verify.
-
-    Always sets the named object as active before operating.
-
-    Returns list (Tier 1c visual diff):
-      dry_run=True  → [report_dict]
-      dry_run=False → [before_Image, after_Image, report_dict]
-      before_Image / after_Image are FRONT-view screenshots taken immediately before
-      and after the repair loop, with problem cluster markers burned onto them.
-      Also stored in _VISUAL_SNAPSHOTS[name] for this MCP session.
+    dry_run=True: plans only, no changes. dry_run=False: executes + verifies.
+    Returns list: dry_run=True → [report]; dry_run=False → [before_image,
+    after_image, report] — FRONT-view screenshots with problem markers burned in.
     """
     try:
         blender = get_blender_connection()
@@ -5441,16 +5237,9 @@ if obj:
 @mcp.tool()
 def critique_animation(name: str, frame_start: Optional[int] = None, frame_end: Optional[int] = None) -> str:
     """
-    ANIMATION CRITIC — Senior technical artist review of an animation.
-
-    Runs analyze_animation_quality with full reasoning enrichment, then formats
-    the output as a prioritised critique with:
-      - Animation grade (A through F)
-      - Issues ranked by severity and category
-      - Specific frame-accurate correction guidance
-      - Production readiness verdict
-
-    Use this when you want a plain-English animation review, not raw data.
+    ANIMATION CRITIC — plain-English animation review: grade A-F, issues
+    ranked by severity, frame-accurate correction guidance, production
+    readiness verdict. Wraps analyze_animation_quality with reasoning.
     """
     try:
         raw = _send_raw("analyze_animation_quality", name=name, frame_start=frame_start, frame_end=frame_end)
@@ -5506,36 +5295,12 @@ def animation_coach(
     focus: str = "all",
 ) -> str:
     """
-    AI ANIMATION COACH — Frame-specific motion quality feedback.
-
-    Builds on critique_animation by adding production-principles coaching:
-    contact timing, weight transfer arcs, anticipation, follow-through,
-    and pose-to-pose readability. Each finding includes the production
-    principle being violated, the typical frame range where it shows, and
-    a correction method.
-
-    Different from critique_animation: that tool tells you what's wrong with
-    the data. This tool tells you *why it looks wrong* to an animator's eye,
-    and what principle to apply to fix it.
-
-    In Apprentice Mode (session_update(apprentice_mode=True)), every finding
-    also includes an animation principles lesson so newer artists understand
-    the 'why' behind each correction.
-
-    Parameters:
-      name        : armature or mesh object with animation
-      frame_start : first frame to evaluate (defaults to action start)
-      frame_end   : last frame to evaluate (defaults to action end)
-      focus       : "all" (default) | "timing" | "arcs" | "weight" |
-                    "contact" | "follow_through"
-
-    Returns:
-      coaching_verdict   : overall assessment with animation-principles framing
-      frame_findings     : findings with frame references and principle citations
-      timing_notes       : contact timing and rhythmic issues
-      arc_notes          : arc quality and trajectory smoothness
-      weight_notes       : weight transfer, anticipation, follow-through
-      apprentice_lessons : present if apprentice_mode is True
+    AI ANIMATION COACH — frame-specific coaching on contact timing, weight
+    transfer arcs, anticipation, follow-through. Unlike critique_animation
+    (what's wrong with the data), this explains *why it reads wrong* to an
+    animator's eye and which principle fixes it. focus: "all" | "timing" |
+    "arcs" | "weight" | "contact" | "follow_through". Adds a lesson per
+    finding when apprentice_mode=True (via session_update).
     """
     try:
         # ── Get base animation data ───────────────────────────────────────────
@@ -5735,28 +5500,11 @@ def animation_coach(
 @mcp.tool()
 def classify_pipeline_stage(object_name: str) -> str:
     """
-    PIPELINE STAGE CLASSIFIER — determines where an asset is in the production pipeline.
-
-    Analyses vertex count, topology, UV status, materials, armature, modifiers,
-    and mesh health to infer which of the 6 production stages the asset is in:
-      1 — Concept / Sculpt
-      2 — Retopology / Base Mesh
-      3 — Bake-Ready
-      4 — Texture / Material
-      5 — Rig / Animation
-      6 — Export-Ready / Unreal Prep
-
-    Returns:
-      - stage_number and stage_name
-      - confidence (high/medium/low)
-      - signals_detected: the evidence that drove the classification
-      - standards: QA standards that apply at this stage
-      - next_steps: what should happen next in the pipeline
-      - ambiguous flag + alternate_stage if two stages are equally plausible
-
-    Use this at session start on any unfamiliar asset, or when you need to
-    calibrate your analysis standards to the correct pipeline phase.
-    ALWAYS call get_viewport_screenshot() before this tool.
+    PIPELINE STAGE CLASSIFIER — infers which of 6 stages the asset is in
+    (Sculpt, Retopo, Bake-Ready, Texture/Material, Rig/Animation, Export-Ready)
+    from vertex count, topology, UVs, materials, armature, modifiers. Returns
+    stage + confidence + signals_detected + applicable standards + next_steps.
+    Call get_viewport_screenshot() first.
     """
     try:
         obj_info   = _send_raw("get_object_info",          name=object_name)
@@ -5801,30 +5549,10 @@ def classify_pipeline_stage(object_name: str) -> str:
 @mcp.tool()
 def what_next(object_name: str, context: str = "") -> str:
     """
-    PRIORITY ACTION — answers "what is the single most important thing to do right now?"
-
-    Looks at the asset's current state and returns ONE action: the highest-leverage
-    step that unblocks the most pipeline progress. Not a plan. Not a list. One thing.
-
-    Collects: object info, mesh quality, mesh problems, pipeline stage.
-    Applies a priority decision tree calibrated to the inferred stage.
-    States its assumptions about asset purpose explicitly — correct it if wrong.
-
-    Parameters:
-      object_name : the Blender object to evaluate
-      context     : optional one-line hint about the asset's purpose or target
-                    e.g. "hero character for UE5" or "background prop" or "weapon"
-                    Leave empty and the tool will state its own assumption.
-
-    Returns:
-      - assumed_context : what the tool is assuming about this asset
-      - stage           : inferred pipeline stage
-      - action          : the one thing to do right now
-      - why             : why this is the priority over everything else
-      - how             : which tool or method executes this action
-      - blocking_count  : how many issues this unblocks downstream
-      - after_this      : what becomes the next priority once this is done
-      - correct_me      : prompt for the user to correct any wrong assumption
+    PRIORITY ACTION — answers "what's the single most important thing to do
+    right now?" One action, not a plan or list — the highest-leverage step
+    for the inferred pipeline stage. States its assumption about asset
+    purpose explicitly (context hint optional) so you can correct it if wrong.
     """
     try:
         # ── Gather all data in parallel ────────────────────────────────────────
@@ -6136,32 +5864,11 @@ def what_next(object_name: str, context: str = "") -> str:
 @mcp.tool()
 def analyze_rig_weights(object_name: str, verbose: bool = False) -> str:
     """
-    RIG WEIGHT QA — checks vertex group weights for catastrophic skinning failures.
-
-    Runs three checks on the mesh's vertex groups (deformation weights):
-
-      CRITICAL — Unweighted vertices
-        Vertices assigned to NO group at all. At runtime these snap to the world
-        origin on first pose frame. Even one unweighted vertex is a hard failure.
-
-      CRITICAL — Over-influence vertices (>8 groups)
-        UE5 hard-truncates to 8 influences per vertex. Excess influences are silently
-        discarded, causing unpredictable deformation. Sampled across first 1000 verts.
-
-      WARNING  — Zero-weight assignments
-        Vertex assigned to a group with weight 0.0. These cost memory/CPU in the
-        vertex shader and indicate painting errors. Not a hard failure but should be
-        cleaned before export.
-
-    Parameters:
-      object_name : the MESH object to inspect (not the armature)
-
-    Returns:
-      checks       : list of {check, severity, count, detail}
-      summary      : plain-English verdict
-      verdict      : CRITICAL | WARNING | PASS
-      group_count  : number of vertex groups on the object
-      vertex_count : total vertices inspected
+    RIG WEIGHT QA — checks vertex group weights (pass the MESH, not the
+    armature). CRITICAL: unweighted verts (snap to world origin on first pose)
+    and >8-influence verts (UE5 truncates to 8, discards the rest silently).
+    WARNING: zero-weight assignments (memory/CPU cost, painting errors).
+    verdict: CRITICAL | WARNING | PASS.
     """
     try:
         # Build inspection script to run inside Blender
@@ -6350,39 +6057,11 @@ else:
 @mcp.tool()
 def analyze_rig_skeleton(object_name: str, verbose: bool = False) -> str:
     """
-    RIG SKELETON QA — inspects the armature linked to a mesh object.
-
-    Finds the armature via the object's ARMATURE modifier and runs four checks:
-
-      CRITICAL — Root bone not at world origin
-        The root bone's head must be at or near (0, 0, 0). A mis-placed root means
-        the skeleton is offset from the mesh in engine, causing animation drift.
-        Threshold: 0.01 units in any axis.
-
-      WARNING  — Orphan bones
-        Bones with no corresponding vertex group anywhere in the scene's mesh
-        objects. Orphan bones waste memory and may indicate naming mismatches
-        between rig and weights. Pure control/IK bones are expected orphans —
-        the check names them so you can confirm intentionality.
-
-      INFO     — Bone count
-        Total bone count. UE5 has no hard limit but >256 bones requires special
-        handling. Reported for awareness.
-
-      INFO     — UE5 naming conventions
-        Common UE5 skeleton root names: "root", "Root", "pelvis", "Pelvis",
-        "hips", "Hips". If none of the root-candidate bones match, reported as
-        INFO (not FAIL — custom naming is valid, just requires manual mapping).
-
-    Parameters:
-      object_name : the MESH object to inspect (not the armature directly)
-
-    Returns:
-      armature_name : name of the linked armature object
-      checks        : list of {check, severity, detail}
-      summary       : plain-English verdict
-      verdict       : CRITICAL | WARNING | INFO | PASS
-      bone_count    : total bones in armature
+    RIG SKELETON QA — finds the armature via the object's ARMATURE modifier
+    (pass the MESH object, not the armature) and checks: root bone at world
+    origin (CRITICAL if off by >0.01), orphan bones with no vertex group
+    (WARNING — expected for control/IK bones), bone count and UE5 root-naming
+    convention (INFO). verdict: CRITICAL | WARNING | INFO | PASS.
     """
     try:
         script = r"""
@@ -6626,38 +6305,12 @@ else:
 @mcp.tool()
 def validate_bake_setup(low_poly_name: str, high_poly_name: str, verbose: bool = False) -> str:
     """
-    BAKE PRE-FLIGHT — validates that a bake setup is correct before touching anything.
-
-    Run this BEFORE every bake operation. It will hard-stop on any condition that
-    causes black textures, smeared detail, incorrect normals, or failed exports.
-
-    Checks (in priority order):
-
-      CRITICAL — blocks bake entirely:
-        1. Both objects exist in scene by the given names
-        2. Low poly has a UV map with at least one island
-        3. No overlapping UV islands (uses Blender's select_overlap operator)
-        4. Active material has an Image Texture node in the shader
-        5. That Image Texture node is the active/selected node in the shader
-        6. The bake target image is valid (exists, not zero-size)
-
-      WARNING — bake can proceed but you should know:
-        7. UV island margin (islands packed too tight → bleed at low resolution)
-        8. High poly visibility (hidden objects bake but it's a common confusion)
-        9. Unapplied scale on low poly (distorts normal map results)
-       10. Modifiers on low poly (subdivision etc. affect bake cage unexpectedly)
-
-    Parameters:
-      low_poly_name  : name of the low-poly mesh object (bake target)
-      high_poly_name : name of the high-poly mesh object (bake source)
-      verbose        : False (default) — returns failing/warning checks only.
-                       True — returns all 10 checks including PASSes.
-
-    Returns:
-      safe_to_bake   : bool — True only if zero CRITICAL failures
-      verdict        : PASS | WARN | FAIL
-      checks         : failing/warning checks (verbose=False) or all checks (verbose=True)
-      ready_when_fixed : ordered list of actions needed before baking
+    BAKE PRE-FLIGHT — run BEFORE baking. Hard-stops on conditions that cause
+    black textures, smeared detail, or bad normals: missing UVs, overlapping
+    UV islands, no Image Texture node active in the shader, invalid bake target.
+    Also warns on tight UV margins, hidden high-poly, unapplied scale, modifiers.
+    verbose=False (default) returns only failing/warning checks.
+    safe_to_bake is True only with zero CRITICAL failures.
     """
     try:
         script = r"""
@@ -7087,33 +6740,12 @@ else:
 @mcp.tool()
 def analyze_material_pbr(object_name: str) -> str:
     """
-    MATERIAL / PBR REVIEWER — full senior TA review of an object's materials.
-
-    Uses get_material_summary (object-level slot list) and get_material_graph
-    (per-material node graph) — the two correct addon.py endpoints for material data.
-
-    Real schemas:
-      get_material_summary(name) ->
-        {object, material_count, empty_slots,
-         materials: [{slot, name, use_nodes, node_count}]}
-      get_material_graph(material_name) ->
-        {material, nodes:[{name,type,label,active,inputs,image,colorspace}],
-         links, orphaned_nodes, has_orphaned_nodes}
-
-    Checks every slot for:
-      - PBR workflow compliance (Principled BSDF, node graph present)
-      - Roughness and metallic physical plausibility
-      - Missing or broken texture image paths
-      - Procedural-only materials that won't transfer to Unreal
-      - Normal map direction (OpenGL vs DirectX / UE5 compatibility)
-      - Orphaned nodes in the graph
-      - Multi-material draw call cost
-
-    Use this:
-      - At Stage 4 (Texture/Material) as the primary QA tool
-      - Before any Unreal export to catch material blockers
-      - When the user asks about materials, shaders, or textures
-    ALWAYS call get_viewport_screenshot() before this tool.
+    MATERIAL / PBR REVIEWER — senior TA review of every material slot: PBR
+    workflow compliance, roughness/metallic plausibility, broken texture
+    paths, procedural-only materials that won't transfer to Unreal, normal
+    map direction (OpenGL vs DirectX), orphaned nodes, draw-call cost.
+    Primary QA tool at Stage 4 (Texture/Material) and before UE5 export.
+    Call get_viewport_screenshot() first.
     """
     try:
         # ── Step 1: get slot list via get_material_summary ─────────────────────
@@ -7384,27 +7016,11 @@ def analyze_material_pbr(object_name: str) -> str:
 @mcp.tool()
 def get_scene_summary() -> str:
     """
-    SCENE CLASSIFIER — zero-argument scene inventory and mode detection.
-
-    Scans every object in the scene and returns:
-      - scene_mode: HERO | COLLECTION | ENVIRONMENT
-      - object inventory by type (meshes, armatures, lights, cameras, empties)
-      - dominant asset identification (the hero mesh if HERO mode)
-      - per-object quick health flag (clean/issues/unknown)
-      - total poly count across all meshes
-      - pipeline stage inference for the dominant asset
-      - recommended audit depth
-
-    Scene modes:
-      HERO         — 1 dominant mesh (by poly count), possibly with armature/support objects
-      COLLECTION   — 2–20 mesh objects, no single dominant, prop/batch workflow
-      ENVIRONMENT  — 20+ objects, mix of mesh/light/camera, spatial scene
-
-    This is the mandatory second step after get_viewport_screenshot() on any
-    scene you haven't seen before. It tells you what you're working with before
-    you commit to any analysis strategy.
-
-    Never run audit_all_objects() without running get_scene_summary() first.
+    SCENE CLASSIFIER — zero-arg scene inventory: scene_mode (HERO = 1 dominant
+    mesh | COLLECTION = 2-20 meshes | ENVIRONMENT = 20+), object inventory by
+    type, dominant asset, per-object health flag, total poly count, recommended
+    audit depth. Mandatory second step after get_viewport_screenshot() on any
+    unseen scene — never run audit_all_objects() without this first.
     """
     try:
         scene_raw = _send_raw("get_scene_info")
@@ -7573,32 +7189,12 @@ def get_scene_summary() -> str:
 @mcp.tool()
 def audit_all_objects(mode: str = "auto", max_deep_dive: int = 5) -> str:
     """
-    SCENE AUDIT — calibrated multi-object analysis across the entire scene.
-
-    Automatically detects scene type and adjusts analysis depth:
-
-      HERO mode (1 dominant mesh):
-        Full analyze_mesh_for_unreal + classify_pipeline_stage on the hero.
-        Support objects (armature, lights, cameras) noted but not deep-analysed.
-
-      COLLECTION mode (2–20 mesh objects):
-        detect_mesh_problems + classify_pipeline_stage on each mesh.
-        Returns a ranked table — worst first.
-        Deep-dive (analyze_mesh_for_unreal) on objects with CRITICAL/FAIL verdict,
-        capped at max_deep_dive to prevent timeout.
-
-      ENVIRONMENT mode (20+ objects):
-        Triage by severity — surfaces critical issues only.
-        Categorises objects (hero prop / background / light / camera).
-        Full table if <=20 objects, severity summary if >20.
-        Top 5 critical issues surfaced explicitly.
-
-    Parameters:
-      mode          : "auto" (recommended) | "hero" | "collection" | "environment"
-      max_deep_dive : max objects to run full analysis on (default 5, cap 10)
-
-    Always run get_scene_summary() before this tool.
-    Always take a get_viewport_screenshot() before reporting results.
+    SCENE AUDIT — multi-object analysis, depth auto-calibrated to scene size.
+    HERO (1 dominant mesh): full analysis on it. COLLECTION (2-20 meshes):
+    ranked table, deep-dive only on CRITICAL/FAIL verdicts (capped at
+    max_deep_dive, hard cap 10). ENVIRONMENT (20+): severity triage, top 5
+    critical issues only. mode: "auto" (recommended) | "hero" | "collection"
+    | "environment". Run get_scene_summary() first.
     """
     try:
         max_deep_dive = min(max_deep_dive, 10)  # hard cap
@@ -7872,27 +7468,11 @@ def plan_production_path(
     goal: str = "export_ready",
 ) -> str:
     """
-    AI TECHNICAL DIRECTOR — Build a 5-step production plan for this asset.
-
-    Reads the current scene state + session context + active playbook, then
-    proposes a concrete, ordered 5-step plan to reach the stated goal.
-    Each step includes: what to do, which tool executes it, what success looks
-    like, and which gate/check confirms it's done.
-
-    After you present the plan to the user, wait for explicit approval before
-    executing any step. After each step, re-read state before proceeding.
-
-    Parameters:
-      object_name : Blender object to plan for
-      goal        : "export_ready" (default) | "bake_ready" | "rig_ready" |
-                    "texture_ready" | "review_only"
-
-    Returns:
-      plan         : ordered list of 5 steps, each with tool, success_criteria, gate
-      assumptions  : what the TD is assuming about this asset
-      active_playbook_name : playbook in use (or "none")
-      session_context_used : True if session data informed the plan
-      approval_required    : always True — present plan, wait for "yes/go ahead"
+    AI TECHNICAL DIRECTOR — builds an ordered 5-step production plan (tool,
+    success criteria, gate per step) toward goal: "export_ready" (default) |
+    "bake_ready" | "rig_ready" | "texture_ready" | "review_only".
+    ALWAYS present the plan and wait for explicit approval before executing
+    any step — never run steps automatically.
     """
     try:
         # ── Gather state ──────────────────────────────────────────────────────
@@ -8104,28 +7684,11 @@ def critique_mesh(
     verbose: bool = False,
 ) -> str:
     """
-    AI MESH CRITIC — Senior technical artist review of topology and mesh decisions.
-
-    Goes beyond pass/fail counts to give you the *why* behind each finding:
-    why this topology decision creates problems, which production scenarios
-    will expose the failure, and what a senior artist would actually do to fix it.
-
-    Different from analyze_mesh_for_unreal: that tool tells you what's wrong.
-    This tool tells you why it matters, in the context of the active playbook
-    and production stage, with the depth of a senior TA code review.
-
-    Parameters:
-      object_name : Blender object to critique
-      focus       : "all" (default) | "topology" | "uvs" | "geometry" | "deformation"
-      verbose     : True → include passing observations (what's done well)
-
-    Returns:
-      critique_verdict   : overall assessment with senior framing
-      priority_findings  : ordered by production impact, not just severity
-      compounding_issues : pairs of issues that are worse together than separately
-      deformation_risk   : specific risks in deforming areas (if rig detected)
-      what_i_would_do    : concrete senior-TA recommendation for each major finding
-      playbook_context   : how findings relate to active playbook standards
+    AI MESH CRITIC — senior TA review of topology: why each finding matters,
+    which production scenarios expose it, what a senior artist would actually
+    do. Unlike analyze_mesh_for_unreal (what's wrong), this explains why, in
+    context of the active playbook. focus: "all"|"topology"|"uvs"|"geometry"|
+    "deformation". verbose=True includes what's done well, not just problems.
     """
     try:
         # ── Gather data ───────────────────────────────────────────────────────
@@ -8351,40 +7914,14 @@ def production_review(
     include_animation: bool = False,
 ) -> str:
     """
-    PRODUCTION REVIEW — One command. Full picture. Senior TA verdict.
+    PRODUCTION REVIEW — full QA sweep in one call: score 0-100, grade, strengths,
+    critical_blockers, warnings, time_estimate. The "show me everything" command.
 
-    Conducts every relevant QA tool in sequence, aggregates findings, scores
-    the asset 0–100, extracts strengths, lists critical blockers in priority
-    order, and estimates how long to production-ready. Surfaces any conflicts
-    between the stated asset_type and what the data shows — states the
-    conflict and asks for confirmation rather than silently resolving it.
+    Surfaces conflicts between stated asset_type and what the data shows —
+    states the conflict and asks for confirmation, never silently resolves it.
 
-    This is the "show me everything" command. Use it at the start of a review
-    session or any time you need a comprehensive status report.
-
-    Parameters:
-      object_name     : Blender object to review
-      asset_type      : What kind of asset this is — "hero_character" | "weapon" |
-                        "environment_prop" | "creature" | "vehicle" | "npc" |
-                        "background_character" | "crowd_character"
-                        Leave blank and the tool will state its inference.
-      include_rig     : True → also run analyze_rig_weights + analyze_rig_skeleton
-                        (requires Armature modifier on the object)
-      include_animation : True → also run critique_animation
-
-    Returns:
-      production_score  : 0–100. 100 = fully production-ready.
-      score_grade       : A / B / C / D / F
-      assumed_asset_type: what the tool inferred (or used from asset_type param)
-      conflicts         : list of conflicts between stated type and data findings —
-                          each includes the conflict, what the data shows, and a
-                          confirmation question for the user
-      strengths         : list of things this asset does well
-      critical_blockers : ordered list of things that must be fixed before export
-      warnings          : non-blocking issues that should be addressed
-      recommendations   : prioritised action list
-      time_estimate     : plain-English estimate of work remaining
-      session_updated   : True — session context updated with this review's findings
+    asset_type left blank → tool states its inference instead of guessing silently.
+    include_rig requires an Armature modifier on the object.
     """
     try:
         # ── Step 1: Gather baseline data ──────────────────────────────────────
@@ -8717,34 +8254,11 @@ def get_scene_graph(
     include_collections: bool = True,
 ) -> str:
     """
-    SPATIAL INTELLIGENCE — Build a relationship graph of every object in the scene.
-
-    Instead of describing objects individually, this tool returns HOW objects
-    relate to each other spatially: what's above what, what's beside what,
-    what's intersecting, what's touching the floor, what's inside what collection.
-
-    The LLM can reason "Lamp is 0.4m above Table, Chair is 0.7m left of Table"
-    far better than it can reason over raw position coordinates. This is the
-    foundation of spatial judgment.
-
-    Parameters:
-      max_objects         : cap for full per-object detail (default 50).
-                            Scenes above this cap get a collection-summary view.
-      relationship_radius : only compute relationships between objects closer
-                            than this distance in meters (default 10.0).
-                            Prevents O(n²) explosion on large scenes.
-      include_collections : include collection hierarchy in output (default True)
-
-    Returns:
-      mode              : "full" | "focused" | "summary"
-      object_count      : total mesh objects in scene
-      objects           : per-object spatial data (position, dimensions, nearest,
-                          floor_contact, collection, parent, children)
-      relationships     : list of {subject, predicate, object, distance} triples
-                          predicates: above | below | beside | inside | intersecting
-                                      | touching | contains | near
-      collection_tree   : nested collection hierarchy (if include_collections)
-      spatial_summary   : plain-English summary of what the scene looks like
+    SPATIAL INTELLIGENCE — relationship graph of every object in the scene:
+    above/below/beside/inside/intersecting/touching/near triples with distances,
+    plus a plain-English spatial_summary. Scenes over max_objects get a
+    collection-summary view instead of full per-object detail.
+    relationship_radius caps the pairwise search distance to avoid O(n^2) blowup.
     """
     script = r"""
 import bpy
@@ -9015,33 +8529,13 @@ def query_spatial(
     count: int = 5,
 ) -> str:
     """
-    SPATIAL QUERY ENGINE — Ask precise spatial questions about the scene.
+    SPATIAL QUERY ENGINE — targeted spatial questions instead of the whole scene graph.
 
-    Instead of reading the whole scene graph, use this to answer targeted
-    spatial questions: what's nearest to this object, what's in this radius,
-    what does a ray hit, what is this object sitting on.
-
-    query_type options:
-      "nearest"      → find the N closest objects to object_name
-                        params: object_name, count (default 5)
-      "in_radius"    → find all objects within radius of object_name's center
-                        params: object_name, radius (default 5.0m)
-      "intersecting" → find all objects whose geometry overlaps object_name
-                        params: object_name
-      "supporting"   → find what object_name is resting on (raycast downward)
-                        params: object_name
-      "above"        → find all objects directly above object_name
-                        params: object_name, radius (search cone radius)
-      "below"        → find all objects directly below object_name
-                        params: object_name, radius
-      "raycast"      → cast a ray from origin in direction, return first hit
-                        params: origin [x,y,z], direction [x,y,z]
-      "floating"     → find all objects with no floor contact and nothing below them
-                        (no params needed — scene-wide check)
-      "isolated"     → find all objects with no neighbors within radius
-                        params: radius (default 5.0m)
-
-    Returns targeted spatial answer with object names, distances, directions.
+    query_type (required params in parens):
+      nearest(object_name, count) | in_radius(object_name, radius) |
+      intersecting(object_name) | supporting(object_name) |
+      above(object_name, radius) | below(object_name, radius) |
+      raycast(origin, direction) | floating() | isolated(radius)
     """
     script_map = {
 
@@ -9349,38 +8843,10 @@ print(json.dumps({"query": "isolated", "radius": radius, "isolated_count": len(i
 @mcp.tool()
 def describe_object_context(object_name: str) -> str:
     """
-    SPATIAL CONTEXT — Rich semantic description of a single object and its surroundings.
-
-    Instead of "Cube.004 — 12,840 vertices", returns:
-      "Cube.004 — likely a seat or platform (dimensions suggest furniture scale).
-       Sits 0.03m above Floor.001. 0.7m left of Table.003. 1.3m from Lamp.002
-       (above-left). Inside collection 'LivingRoom'. No parent. 2 children.
-       No intersections detected."
-
-    This is what the LLM should read before making any spatial decision about
-    an object — it gives relationship context, not just geometry stats.
-
-    Uses a combination of:
-    - Exact world-space position and dimensions from matrix_world
-    - BVH intersection check against nearby objects
-    - Raycast downward for floor/support detection
-    - Name-based semantic inference (chair, table, lamp, wall, floor, etc.)
-    - Nearest neighbor relationships with direction labels
-
-    Returns:
-      object_name      : confirmed object name
-      semantic_role    : inferred role from name + geometry signals
-      position         : world center [x, y, z]
-      dimensions       : [w, d, h] in meters
-      collections      : which collections this object belongs to
-      parent           : parent object name or null
-      children         : list of child object names
-      floor_contact    : True if resting on/near z=0 plane
-      supported_by     : name of object directly below (from raycast), or null
-      nearest          : top 5 nearest objects with distance + direction
-      intersecting     : list of objects whose geometry overlaps this one
-      spatial_sentence : one plain-English sentence summarising the object's
-                         spatial context — ready to paste into a prompt
+    SPATIAL CONTEXT — semantic description of an object and its surroundings:
+    inferred role, position/dimensions, floor contact, nearest neighbors with
+    direction, intersections, and a ready-to-use plain-English spatial_sentence.
+    Read this before any spatial decision — richer than raw geometry stats.
     """
     script = r"""
 import bpy, json, math, re
@@ -9551,22 +9017,9 @@ else:
 @mcp.tool()
 def get_production_journal(last_n: int = 50, object_name: str = "") -> str:
     """
-    PRODUCTION JOURNAL — Timestamped log of everything that has happened this session.
-
-    Shows every significant tool call, its outcome, and what it found.
-    Use this to understand what has already been checked, what was repaired,
-    what was generated, and in what order — without re-running any analysis.
-
-    Parameters
-    ----------
-    last_n      : How many entries to return (default 50, max 200)
-    object_name : Filter to a specific object (empty = show all)
-
-    Returns
-    -------
-    journal     : list of {ts, tool, object, outcome, detail}
-    open_issues : all currently open issues (optionally filtered by object_name)
-    summary     : plain-English session narrative
+    PRODUCTION JOURNAL — timestamped log of every significant tool call this
+    session (what was checked/repaired/generated, in order) plus open/closed
+    issues, without re-running analysis. last_n caps entries (max 200).
     """
     journal = _SESSION.get("journal", [])
     tracker = _SESSION.get("issue_tracker", [])
@@ -9629,21 +9082,9 @@ def get_production_journal(last_n: int = 50, object_name: str = "") -> str:
 @mcp.tool()
 def close_issue(issue_id: str, reason: str = "") -> str:
     """
-    ISSUE TRACKER — Manually close an open issue by its ID.
-
-    Issues are opened automatically by analysis tools (get_spatial_analysis,
-    production_review, auto_repair_mesh, etc.) and closed automatically when
-    repair tools fix them. Use this to manually close an issue that was resolved
-    outside the MCP — e.g. you fixed an n-gon by hand in the viewport.
-
-    Parameters
-    ----------
-    issue_id : The issue ID to close (e.g. 'ISS-003') — from get_production_journal
-    reason   : Optional plain-English reason for manual closure
-
-    Returns
-    -------
-    status, closed_issue details
+    ISSUE TRACKER — manually close an open issue by ID (e.g. "ISS-003", from
+    get_production_journal). Issues normally auto-close when a repair tool
+    fixes them; use this for fixes made by hand outside the MCP.
     """
     import datetime as _dt
     tracker = _SESSION.get("issue_tracker", [])
@@ -9665,31 +9106,10 @@ def close_issue(issue_id: str, reason: str = "") -> str:
 @mcp.tool()
 def synthesize_session(object_name: str = "") -> str:
     """
-    SESSION SYNTHESIS — Cross-tool intelligence. Reads the full session state,
-    journal, and open issues, then produces a ranked decision tree with three
-    paths — not one recommendation.
-
-    This is the 'brain' that connects all the siloed tool outputs. Instead of
-    asking 'what does topology say?' and 'what does the repair say?' separately,
-    this synthesises everything that has happened this session into a coherent
-    picture with explicit tradeoff reasoning.
-
-    Think of it as a senior Technical Director who has watched everything you've
-    done this session and now gives you a structured debrief.
-
-    Parameters
-    ----------
-    object_name : Focus on a specific object (empty = synthesise whole session)
-
-    Returns
-    -------
-    session_picture  : plain-English summary of the session so far
-    open_issues      : ranked list of unresolved issues with severity
-    resolved_issues  : what has been fixed
-    decision_paths   : THREE ranked options for what to do next, with tradeoffs
-    recommendation   : which path the TD recommends and WHY
-    confidence       : how confident the synthesis is given available data
-    data_gaps        : what analyses haven't been run yet that would improve confidence
+    SESSION SYNTHESIS — reads the full session journal + open issues and
+    produces THREE ranked decision paths with tradeoffs (not one answer),
+    plus a recommendation, confidence level, and data_gaps (analyses not
+    yet run that would sharpen the picture). object_name empty = whole session.
     """
     journal  = _SESSION.get("journal", [])
     tracker  = _SESSION.get("issue_tracker", [])
@@ -9900,37 +9320,11 @@ def synthesize_session(object_name: str = "") -> str:
 @mcp.tool()
 def analyze_deformation_zones(object_name: str) -> str:
     """
-    DEFORMATION INTELLIGENCE — Checks whether the mesh topology can support clean
-    deformation at anatomical/mechanical bending zones.
-
-    This is the capability your mate identified as the biggest real gap: you can
-    find poles and ngons, but you can't yet say "this pole is AT the elbow crease
-    and WILL cause a shading artefact under deformation." This tool closes that gap.
-
-    What it checks at each deformation zone:
-      - Edge loop density (are there enough loops to support smooth bending?)
-      - Pole placement (is a pole sitting directly on a bend axis?)
-      - N-gon presence in deforming area (will auto-triangulate during skinning)
-      - Support loops (loops on BOTH sides of a crease for clean deformation)
-      - Geometry density relative to joint complexity
-
-    How it identifies zones:
-      - If an Armature modifier exists: reads bone positions and maps them to
-        surface regions to identify deformation-critical areas
-      - If no armature: uses mesh geometry + region labels to identify likely
-        bending zones (shoulder mass, elbow/knee proportions, waist, wrist/ankle)
-
-    Parameters
-    ----------
-    object_name : Blender object name (mesh)
-
-    Returns
-    -------
-    zones           : list of deformation zones with risk score and findings
-    overall_risk    : 'low' | 'medium' | 'high' | 'critical'
-    critical_zones  : zones rated critical (will definitely cause deformation artefacts)
-    recommendations : per-zone fix instructions
-    deformation_ready : bool — True if the mesh can deform cleanly
+    DEFORMATION INTELLIGENCE — checks if topology can bend cleanly at joints:
+    edge loop density, pole placement on bend axes, ngons in deforming areas,
+    support loops on both sides of a crease. With an Armature modifier, zones
+    come from real bone positions; without one, estimated from mesh proportions
+    (shoulder/elbow/wrist/hip/knee/ankle). Returns overall_risk + deformation_ready.
     """
     blender_script = f"""
 import bpy, bmesh, math, json
@@ -10201,37 +9595,10 @@ print(json.dumps(result))
 @mcp.tool()
 def simulate_production_readiness(object_name: str, asset_type: str = "") -> str:
     """
-    PRODUCTION SIMULATION — "If this ships..." go/no-go scorecard.
-
-    Wraps the existing analysis tools and formats results as a production
-    simulation — not a problem list, but a structured pass/fail prediction
-    across every pipeline dimension. Presented as a studio QA gate.
-
-    Think: "What happens if we ship this asset right now?"
-
-    Dimensions scored
-    -----------------
-    GEOMETRY      non-manifold, loose verts, degenerate faces
-    TOPOLOGY      quad ratio, n-gon density, pole distribution
-    UV            UV presence, non-overlapping, lightmap channel
-    MATERIALS     PBR validity, texture paths, node graph
-    RIG           weight coverage, influence count, root bone
-    ENGINE        scale, pivot, triangle count, UE5 conventions
-    DEFORMATION   edge loop density at joints, pole placement
-    PERFORMANCE   tri count vs budget, LOD readiness, draw calls
-
-    Parameters
-    ----------
-    object_name : Blender object to simulate
-    asset_type  : hint for budget thresholds ('hero_character'|'weapon'|'env_prop'|...)
-
-    Returns
-    -------
-    scorecard    : per-dimension PASS/WARN/FAIL + reason
-    overall      : PASS | WARN | FAIL
-    ship_verdict : plain-English "ready to ship" / "do not ship" / "ship with known risks"
-    blockers     : dimensions that are FAIL — must be resolved before shipping
-    risks        : dimensions that are WARN — known risks if shipped now
+    PRODUCTION SIMULATION — "if this ships now" go/no-go scorecard across
+    GEOMETRY, TOPOLOGY, UV, MATERIALS, RIG, ENGINE, DEFORMATION, PERFORMANCE.
+    asset_type hints vert-budget thresholds. Returns overall PASS|WARN|FAIL,
+    ship_verdict, blockers (FAIL dims), risks (WARN dims).
     """
     try:
         # Gather data from existing tools
@@ -10386,31 +9753,10 @@ def simulate_production_readiness(object_name: str, asset_type: str = "") -> str
 @mcp.tool()
 def review_board(object_name: str, asset_type: str = "") -> str:
     """
-    REVIEW BOARD — Five specialist reviewers examine the asset simultaneously
-    and each give an independent verdict. Their scores are combined into a
-    consensus. Exactly like a AAA studio review panel.
-
-    The five specialists
-    --------------------
-    TECHNICAL_ARTIST  Geometry, topology, UV, export readiness
-    CHARACTER_ARTIST  Proportions, edge flow, deformation zones, artistic quality
-    ANIMATOR          Rig quality, joint placement, deformation support loops
-    RENDERING         Material quality, UV density, lightmap, shading
-    ENGINE            Triangle budget, LODs, naming, UE5 conventions
-
-    Each specialist gives: score (0–100), grade (A–F), verdict, top_concerns, praise.
-    Combined into a consensus score with a majority verdict.
-
-    Parameters
-    ----------
-    object_name : Blender object to review
-    asset_type  : hint for budget thresholds
-
-    Returns
-    -------
-    panel        : each specialist's full verdict
-    consensus    : combined score, grade, and majority verdict
-    chair_summary: plain-English summary as if from the review chair
+    REVIEW BOARD — 5 specialist verdicts (TECHNICAL_ARTIST, CHARACTER_ARTIST,
+    ANIMATOR, RENDERING, ENGINE), each scored 0-100/grade A-F with
+    top_concerns + praise, combined into a consensus score and majority
+    verdict. asset_type hints budget thresholds.
     """
     try:
         # Gather all data once
@@ -10614,29 +9960,10 @@ def review_board(object_name: str, asset_type: str = "") -> str:
 @mcp.tool()
 def critique_artistic(object_name: str, context: str = "") -> list:
     """
-    ARTISTIC CRITIQUE — Senior artist visual review of silhouette, proportion,
-    shape language, balance, and readability.
-
-    This is a vision-based critique — NOT topology. It captures the 7-view
-    multiview screenshots and asks Claude to review them as an artist would:
-    silhouette clarity, visual balance, focal points, shape language, negative
-    space, proportions at gameplay/cinematic distance.
-
-    NOT what this tool covers (use other tools for these):
-      - N-gons, non-manifold geometry → get_spatial_analysis()
-      - UV, materials → analyze_material_pbr()
-      - Rig quality → analyze_rig_weights()
-
-    Parameters
-    ----------
-    object_name : Blender object to critique
-    context     : optional — "hero character viewed at 3m gameplay distance",
-                  "weapon in first-person view", "cinematic close-up", etc.
-
-    Returns list
-    ------------
-    [image_0 … image_6] — the 7 annotated view screenshots
-    [artistic_critique_dict] — structured critique with per-view and overall notes
+    ARTISTIC CRITIQUE — vision-based review of silhouette, proportion, shape
+    language, balance, readability. NOT topology/UV/rig — use get_spatial_analysis(),
+    analyze_material_pbr(), analyze_rig_weights() for those. context: optional
+    viewing-distance/scenario hint. Returns [7 view images, critique_dict].
     """
     try:
         # Capture 7 views (no wireframe — we want clean artistic views)
@@ -10698,24 +10025,10 @@ def critique_artistic(object_name: str, context: str = "") -> list:
 @mcp.tool()
 def load_studio_profile(show_current: bool = False) -> str:
     """
-    STUDIO PROFILE — Load and display the per-studio QA baseline configuration.
-
-    The studio profile (studio_profile.json, next to server.py) lets you define
-    YOUR studio's specific standards — triangle budgets, texel density, naming
-    conventions, UV channel requirements, export settings — so the MCP evaluates
-    assets against your studio's bar, not generic industry defaults.
-
-    If no studio_profile.json exists, returns the default profile with instructions
-    for customising it.
-
-    show_current=True: also shows the currently loaded profile values in use.
-
-    Returns
-    -------
-    profile_path  : where the file is / should be
-    profile       : the loaded profile (or defaults if file not found)
-    how_to_use    : instructions for customising the profile
-    active_in_tools : which tools read the studio profile
+    STUDIO PROFILE — loads studio_profile.json (next to server.py): vert
+    budgets, texel density, naming conventions, UV/export settings, used by
+    simulate_production_readiness/review_board/production_review instead of
+    generic defaults. Creates the file with defaults if missing.
     """
     profile_path = Path(__file__).parent / "studio_profile.json"
 
@@ -10813,32 +10126,11 @@ def load_studio_profile(show_current: bool = False) -> str:
 @mcp.tool()
 def map_asset_dependencies(object_name: str) -> str:
     """
-    ASSET DEPENDENCY MAP — Surfaces all of Blender's existing relationship data
-    for a given object. Tells you what this asset IS connected to and what IS
-    connected to it — without touching any external files.
-
-    This moves the MCP from mesh-aware to project-aware reasoning.
-
-    What it maps
-    ------------
-    SHARED_MATERIALS   Other objects in the scene that share any material with this object
-    SHARED_ARMATURE    Other objects driven by the same armature (skeleton reuse)
-    COLLECTION_SIBLINGS Objects in the same collection(s) as this object
-    MODIFIER_REFERENCES Objects referenced BY modifiers on this object (mirror, boolean targets, etc.)
-    REFERENCED_BY      Objects whose modifiers point TO this object (e.g. this is a boolean target)
-    SHAPE_KEY_BASIS    If this object has shape keys: how many, what drivers reference them
-    PARENT_CHILDREN    Parent and children objects in the hierarchy
-    DATA_USERS         How many objects share this object's mesh data (linked duplicates)
-
-    Parameters
-    ----------
-    object_name : Blender object name
-
-    Returns
-    -------
-    dependency_map  : structured dict of all relationships
-    impact_summary  : plain-English — "changing this object affects X other assets"
-    change_warning  : if dependencies are high, warns that changes cascade
+    ASSET DEPENDENCY MAP — what this object is connected to and what's
+    connected to it: shared materials, shared armature, collection siblings,
+    modifier references (both directions), shape keys, parent/children, and
+    linked-duplicate mesh-data users. impact_summary + change_warning flag
+    when edits here would cascade to other objects.
     """
     blender_script = f"""
 import bpy, json
