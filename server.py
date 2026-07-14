@@ -2423,14 +2423,21 @@ def compare_mesh_state(object_name: str) -> str:
         }
 
     # Overall verdict
-    if overall_regressed == 0 and overall_improved > 0:
-        verdict = "PASS — mesh improved across the board"
-    elif overall_regressed > 0 and overall_improved > overall_regressed:
-        verdict = f"MIXED — {overall_improved} stat(s) improved, {overall_regressed} regressed"
-    elif overall_regressed > 0 and overall_improved == 0:
-        verdict = f"REGRESSED — {overall_regressed} stat(s) got worse, none improved"
-    else:
+    # FIX: the old 4-branch chain had a gap — "regressed > 0 and improved > 0 but
+    # improved <= regressed" (e.g. 1 improved, 3 regressed) matched none of the
+    # first three conditions and silently fell into the "else: UNCHANGED" branch,
+    # even though real regressions occurred. Split "truly 0/0" out explicitly and
+    # give the tied/net-regression case its own MIXED label instead of a fallthrough.
+    if overall_regressed == 0 and overall_improved == 0:
         verdict = "UNCHANGED — no measurable difference"
+    elif overall_regressed == 0:
+        verdict = f"PASS — {overall_improved} stat(s) improved, mesh improved across the board"
+    elif overall_improved == 0:
+        verdict = f"REGRESSED — {overall_regressed} stat(s) got worse, none improved"
+    elif overall_improved > overall_regressed:
+        verdict = f"MIXED (net improvement) — {overall_improved} stat(s) improved, {overall_regressed} regressed"
+    else:
+        verdict = f"MIXED (net regression) — {overall_improved} stat(s) improved, {overall_regressed} regressed"
 
     return json.dumps({
         "object":           object_name,
@@ -2443,6 +2450,146 @@ def compare_mesh_state(object_name: str) -> str:
             "Positive delta on topology_score = IMPROVED."
         ),
     }, indent=2)
+
+
+@mcp.tool()
+def close_boundary_holes(object_name: str, dry_run: bool = True) -> str:
+    """
+    CLOSE BOUNDARY HOLES — properly cap open/non-watertight edges without leaving ngons.
+
+    auto_repair_mesh() deliberately never touches boundary edges — closing an
+    open mesh is a judgment call (intentional open-shell geometry, like exposed
+    ribs, vs. a genuine hole?), not something to auto-decide. This is the
+    explicit, opt-in tool for when you've decided closure is the right call.
+
+    A naive single fill_holes() call caps each open loop with one face spanning
+    the whole loop — for any loop bigger than a triangle, that's an ngon,
+    trading one problem for another. This tool fills the holes AND triangulates
+    just the newly-created cap faces (not the rest of the mesh), so the mesh
+    closes without introducing new ngons.
+
+    dry_run=True (default): reports what would be closed — loop count and
+    edge/vert count per loop — without touching the mesh.
+    dry_run=False: actually closes the holes and triangulates the caps, then
+    attaches a fresh non-manifold/boundary/ngon/topology scan so you don't need
+    a separate call to see the real result.
+
+    Parameters:
+      object_name : Blender mesh object to repair
+      dry_run     : True (default, preview only) | False (execute)
+    """
+    script = r"""
+import bpy, bmesh, json
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+else:
+    bpy.context.view_layer.objects.active = obj
+    if obj.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+
+    boundary_edges = set(e for e in bm.edges if e.is_boundary)
+
+    visited = set()
+    loops = []
+    for e in boundary_edges:
+        if e in visited:
+            continue
+        stack = [e]
+        group = []
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            group.append(cur)
+            for v in cur.verts:
+                for e2 in v.link_edges:
+                    if e2 in boundary_edges and e2 not in visited:
+                        stack.append(e2)
+        loops.append(group)
+
+    loop_summary = [{"edges": len(l), "verts": len(set(v for e in l for v in e.verts))} for l in loops]
+    bm.free()
+
+    DRY_RUN = {DRY_RUN}
+
+    if not boundary_edges:
+        print(json.dumps({
+            "object": "{OBJ}", "boundary_edge_count": 0, "loop_count": 0,
+            "note": "No boundary edges found — mesh is already watertight.",
+        }))
+    elif DRY_RUN:
+        print(json.dumps({
+            "dry_run": True,
+            "object": "{OBJ}",
+            "boundary_edge_count": len(boundary_edges),
+            "loop_count": len(loops),
+            "loops": loop_summary,
+            "note": "Re-run with dry_run=False to close these and triangulate the caps.",
+        }))
+    else:
+        face_count_before = len(obj.data.polygons)
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_non_manifold(extend=False, use_wire=False, use_boundary=True,
+                                           use_multi_face=False, use_non_contiguous=False, use_verts=False)
+        bpy.ops.mesh.fill_holes(sides=0)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Select ONLY the newly-created cap faces (appended after the original
+        # face count) and triangulate just those — not the whole mesh.
+        for i, p in enumerate(obj.data.polygons):
+            p.select = (i >= face_count_before)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='FACE')
+        bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        print(json.dumps({
+            "dry_run": False,
+            "object": "{OBJ}",
+            "loops_closed": len(loops),
+            "boundary_edges_before": len(boundary_edges),
+            "faces_added": len(obj.data.polygons) - face_count_before,
+            "note": "Cap faces triangulated to avoid leaving ngons.",
+        }))
+""".replace("{OBJ}", object_name.replace("'", "\\'")).replace("{DRY_RUN}", "True" if dry_run else "False")
+
+    try:
+        blender = get_blender_connection()
+        raw = blender.send_command("execute_code_safe", {"code": script, "required_mode": "OBJECT", "push_undo": True})
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                result = json.loads(line)
+                if not dry_run and "error" not in result:
+                    fresh_problems = _send_raw("detect_mesh_problems", name=object_name)
+                    fresh_topo     = _send_raw("analyze_topology",     name=object_name)
+                    prob_list = fresh_problems.get("problems", []) if "error" not in fresh_problems else []
+                    prob_map  = {p.get("type", ""): p.get("count", 0) for p in prob_list}
+                    result["after_scan"] = {
+                        "non_manifold_edges": prob_map.get("non_manifold_edges", 0),
+                        "boundary_edges":     prob_map.get("boundary_edges", 0),
+                        "ngons":              fresh_topo.get("stats", {}).get("ngons", 0) if "error" not in fresh_topo else None,
+                        "topology_score":     fresh_topo.get("topology_score", 0) if "error" not in fresh_topo else None,
+                        "topology_rating":    fresh_topo.get("rating", "unknown") if "error" not in fresh_topo else None,
+                    }
+                _session_append("verified_checks", "close_boundary_holes")
+                return json.dumps(result, indent=2, default=str)
+        return json.dumps({"error": "No JSON output from close_boundary_holes script", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in close_boundary_holes: {e}")
+        return json.dumps({"error": str(e)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
