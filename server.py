@@ -4069,6 +4069,7 @@ def get_problem_detail_view(object_name: str, problem_type: str = "worst") -> li
         # the entire mesh.  After the zoom we immediately exit edit mode.
         close_up_script = f"""
 import bpy, bmesh, math
+from mathutils import Vector
 
 obj = bpy.data.objects.get("{object_name}")
 if obj is None:
@@ -4077,8 +4078,10 @@ if obj is None:
 bpy.context.view_layer.objects.active = obj
 obj.select_set(True)
 
-# Compute proximity threshold from bbox diagonal
-bbox_corners = [obj.matrix_world @ v for v in [obj.bound_box[i] for i in range(8)]]
+# Compute proximity threshold from bbox diagonal.  obj.bound_box[i] is a raw
+# bpy_prop_array, not a Vector — Matrix @ bpy_prop_array isn't supported,
+# needs explicit Vector() wrapping first.
+bbox_corners = [obj.matrix_world @ Vector(obj.bound_box[i]) for i in range(8)]
 xs = [v.x for v in bbox_corners]
 ys = [v.y for v in bbox_corners]
 zs = [v.z for v in bbox_corners]
@@ -4094,8 +4097,7 @@ try:
     bm = bmesh.from_edit_mesh(obj.data)
 
     # Centroid in world space
-    import mathutils
-    world_centroid = mathutils.Vector(({cx}, {cy}, {cz}))
+    world_centroid = Vector(({cx}, {cy}, {cz}))
     # Transform to local object space for bmesh comparison
     local_centroid = obj.matrix_world.inverted() @ world_centroid
     local_thresh   = thresh / max(obj.scale)   # rough local-space threshold
