@@ -1992,9 +1992,14 @@ Ambiguous stage → assume the MORE DEMANDING one.
 
 ── SESSION START — ALWAYS execute this sequence first, no exceptions ───────────
 0. session_status()            ← check if session context exists from a prior turn
-   If session has_context=True: orient from session, skip to screenshot only.
-   If session empty: run full sequence below.
-1. get_viewport_screenshot()   ← look before anything else
+   If session has_context=True AND session.multiview.object == the active object:
+     baseline already exists this session — skip to a single get_viewport_screenshot().
+   Otherwise (empty session, OR active object differs from session.multiview.object —
+   i.e. this mesh hasn't been spatially baselined yet): run the full sequence below.
+1. get_spatial_analysis(object_name) ← FIRST LOOK at any new/not-yet-baselined mesh.
+   7 angles + world-space problem coordinates in one call, same cost as a single
+   get_multiview_capture(). A single screenshot only shows one angle and gives no
+   coordinate data — this is the real baseline everything else builds on.
 2. get_scene_info()            ← object count, types
 3. get_object_info(active)     ← verts/faces at mesh.vertices/polygons, materials list
 Then deliver ONE orientation sentence:
@@ -4252,11 +4257,11 @@ def get_object_info(object_name: str) -> str:
 
 @mcp.tool()
 def get_viewport_screenshot(max_size: int = 1000) -> Image:
-    """ALWAYS call this first before any other tool, and again after every scene change.
-    Captures the live Blender 3D viewport so you can SEE what you are working on.
-    Never describe, analyze, or report on a mesh without looking at it first.
-    Call after: imports, repairs, transforms, deletions, generation — any operation
-    that modifies the scene. Describe what you see in your response."""
+    """Quick single-angle look — call after every scene change (imports, repairs,
+    transforms, deletions, generation). Never describe/analyze a mesh without
+    looking first. For the FIRST look at a mesh not yet spatially baselined
+    this session, use get_spatial_analysis() instead — same image cost, but
+    7 angles + world-space coordinates instead of one angle and no data."""
     blender = get_blender_connection()
     temp_path = os.path.join(tempfile.gettempdir(), f"blender_screenshot_{os.getpid()}.png")
     try:
