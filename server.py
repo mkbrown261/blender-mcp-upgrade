@@ -37,6 +37,13 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+# Pillow — used to burn problem coordinates onto screenshot PNGs (Tier 1a)
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 from mcp.server.fastmcp import FastMCP, Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -254,6 +261,11 @@ _load_session()
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SNAPSHOTS: dict = {}   # { object_name: { ...mesh stats... , "_timestamp": str } }
+
+# Visual before/after snapshots for auto_repair_mesh (Tier 1c).
+# { object_name: { "before": <PNG bytes>, "after": <PNG bytes>, "timestamp": str } }
+# NOT persisted — per-session only.
+_VISUAL_SNAPSHOTS: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3568,6 +3580,182 @@ print(__import__('json').dumps({"ok": True}))
     return images_out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TIER 1A — Coordinate overlay helper
+# Burns problem cluster locations directly onto screenshot PNG bytes using Pillow.
+# Called by get_spatial_analysis() after multiview capture, before returning images.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Color map: severity → (R, G, B) fill, (R, G, B) outline
+_OVERLAY_COLORS = {
+    "critical":    ((231, 76,  60),  (180, 40,  20)),   # red
+    "warning":     ((230, 126, 34),  (180, 90,   0)),   # orange
+    "pole":        ((52,  152, 219), (20,  100, 180)),  # blue
+}
+_OVERLAY_RADIUS  = 14   # circle radius in pixels (scales with typical 1280px wide screenshot)
+_OVERLAY_OUTLINE = 3    # outline thickness
+
+
+def _annotate_image_with_clusters(
+    img_bytes: bytes,
+    coords: dict,
+    view_name: str,
+) -> bytes:
+    """
+    Draw severity-colored circles + labels at every problem cluster's view_projection
+    position onto the given PNG bytes, then return the annotated PNG bytes.
+
+    Arguments
+    ---------
+    img_bytes  : raw PNG bytes from _take_screenshot()
+    coords     : parsed dict from get_problem_coordinates() — contains ngon_clusters,
+                 non_manifold_clusters, pole_clusters lists, each with view_projections
+    view_name  : one of FRONT / BACK / LEFT / RIGHT / TOP / BOTTOM / PERSP.
+                 PERSP gets ALL clusters from all orthographic projections overlaid;
+                 BACK/BOTTOM/LEFT clusters use whatever view_projections key is available,
+                 falling back to the closest available projection.
+
+    Returns annotated PNG bytes, or original bytes if Pillow unavailable / any error.
+    """
+    if not _PIL_AVAILABLE or not img_bytes:
+        return img_bytes
+
+    try:
+        import io
+        pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGBA")
+        W, H = pil_img.size
+
+        # Create a transparent overlay layer so circles don't fully obscure the mesh
+        overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+
+        # Try to load a simple font; fall back to default if not available
+        try:
+            font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        except Exception:
+            font_label = ImageFont.load_default()
+            font_small = font_label
+
+        # Which projection key to look up for this view.
+        # BACK mirrors FRONT horizontally (x_proj = 1 - x_front) — we use FRONT projection
+        # and note the flip.  BOTTOM mirrors TOP.  LEFT uses RIGHT (mirrored similarly).
+        # For views that share a projection plane we still draw — the cluster will appear
+        # at the mirrored position which is correct (same screen plane, opposite camera).
+        VIEW_PROJ_KEY = {
+            "FRONT":  "FRONT",
+            "BACK":   "FRONT",   # same X-Z plane; x coord is mirrored for BACK camera
+            "LEFT":   "RIGHT",   # same Y-Z plane; x coord is mirrored
+            "RIGHT":  "RIGHT",
+            "TOP":    "TOP",
+            "BOTTOM": "TOP",     # same X-Y plane; y coord is mirrored
+            "PERSP":  None,      # PERSP: overlay FRONT+RIGHT+TOP all at once
+        }
+        mirror_x = view_name in ("BACK", "LEFT")
+        mirror_y = view_name == "BOTTOM"
+
+        # Cluster type definitions: (list_key, severity_override_or_None, label_prefix)
+        cluster_defs = [
+            ("ngon_clusters",          None,       "N"),
+            ("non_manifold_clusters",  None,       "M"),
+            ("pole_clusters",          "pole",     "P"),
+        ]
+
+        drawn = 0
+        for list_key, sev_override, label_prefix in cluster_defs:
+            for idx, cluster in enumerate(coords.get(list_key, [])):
+                sev  = sev_override or cluster.get("severity", "warning")
+                fill_rgb, outline_rgb = _OVERLAY_COLORS.get(sev, _OVERLAY_COLORS["warning"])
+                fill_color    = fill_rgb    + (170,)   # ~67% opacity fill
+                outline_color = outline_rgb + (255,)   # full opacity outline
+                label_color   = (255, 255, 255, 255)
+
+                vp = cluster.get("view_projections", {})
+                cnt = cluster.get("element_count", 1)
+
+                # Decide which (x,y) normalized coords to use
+                if view_name == "PERSP":
+                    # For perspective view: draw ALL available projections with view labels
+                    proj_items = [(k, v) for k, v in vp.items() if "x" in v and "y" in v]
+                else:
+                    proj_key = VIEW_PROJ_KEY.get(view_name, view_name)
+                    proj = vp.get(proj_key) or vp.get("FRONT") or next(iter(vp.values()), None)
+                    proj_items = [(proj_key, proj)] if proj and "x" in proj else []
+
+                for proj_key_used, proj in proj_items:
+                    xn = proj.get("x", 0.5)
+                    yn = proj.get("y", 0.5)
+
+                    # view_projections: x=0 is left, x=1 is right; y=0 is bottom, y=1 is top
+                    # PIL: y=0 is top, y=H is bottom — so we flip Y
+                    if mirror_x:
+                        xn = 1.0 - xn
+                    if mirror_y:
+                        yn = 1.0 - yn
+
+                    px = int(xn * W)
+                    py = int((1.0 - yn) * H)  # flip Y for PIL coords
+
+                    r = _OVERLAY_RADIUS
+                    # Draw filled circle with outline
+                    draw.ellipse(
+                        [px - r, py - r, px + r, py + r],
+                        fill=fill_color,
+                        outline=outline_color,
+                        width=_OVERLAY_OUTLINE,
+                    )
+                    # Draw crosshair lines
+                    cross = r + 6
+                    draw.line([(px - cross, py), (px - r - 1, py)], fill=outline_color, width=2)
+                    draw.line([(px + r + 1, py), (px + cross, py)], fill=outline_color, width=2)
+                    draw.line([(px, py - cross), (px, py - r - 1)], fill=outline_color, width=2)
+                    draw.line([(px, py + r + 1), (px, py + cross)], fill=outline_color, width=2)
+
+                    # Label: "N1×12" means "ngon cluster 1, 12 elements"
+                    label_text = f"{label_prefix}{idx+1}×{cnt}"
+                    if view_name == "PERSP":
+                        label_text += f" [{proj_key_used[0]}]"  # e.g. "[F]" "[R]" "[T]"
+
+                    # Draw label with dark shadow for legibility
+                    tx, ty = px + r + 4, py - 8
+                    draw.text((tx + 1, ty + 1), label_text, font=font_label, fill=(0, 0, 0, 220))
+                    draw.text((tx,     ty    ), label_text, font=font_label, fill=label_color)
+
+                    drawn += 1
+
+        # Composite the overlay onto the original image
+        pil_img = PILImage.alpha_composite(pil_img, overlay)
+
+        # Add a small legend strip at the top-left corner if anything was drawn
+        if drawn > 0:
+            legend_draw = ImageDraw.Draw(pil_img)
+            legend_items = [
+                ("N = ngon",        _OVERLAY_COLORS["critical"][0]),
+                ("M = non-manifold",_OVERLAY_COLORS["warning"][0]),
+                ("P = pole",        _OVERLAY_COLORS["pole"][0]),
+                ("red=critical, orange=warning, blue=pole", None),
+            ]
+            ly = 6
+            for legend_text, color in legend_items:
+                if color:
+                    legend_draw.rectangle([6, ly, 18, ly + 10], fill=color + (220,), outline=(255,255,255,255))
+                    legend_draw.text((22, ly - 1), legend_text, font=font_small, fill=(255, 255, 255, 255))
+                    legend_draw.text((23, ly),     legend_text, font=font_small, fill=(30,  30,  30, 200))
+                    legend_draw.text((22, ly - 1), legend_text, font=font_small, fill=(255, 255, 255, 255))
+                else:
+                    legend_draw.text((6, ly), legend_text, font=font_small, fill=(220, 220, 220, 255))
+                ly += 14
+
+        # Convert back to RGB PNG bytes
+        out = io.BytesIO()
+        pil_img.convert("RGB").save(out, format="PNG", optimize=False)
+        return out.getvalue()
+
+    except Exception as e:
+        logger.warning(f"_annotate_image_with_clusters: overlay failed for {view_name}: {e}")
+        return img_bytes   # always return original bytes on any failure
+
+
 @mcp.tool()
 def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     """
@@ -3606,10 +3794,17 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
         coords = {"error": "Could not parse coordinate data"}
 
     # ── Step 2: Clean multiview — 7 images, no wireframe by default ─────────
+    # View order from get_multiview_capture: FRONT=0 BACK=1 LEFT=2 RIGHT=3 TOP=4 BOTTOM=5 PERSP=6
+    _VIEW_ORDER = ["FRONT", "BACK", "LEFT", "RIGHT", "TOP", "BOTTOM", "PERSP"]
     mv_result = get_multiview_capture(object_name, include_wireframe=deep)
+    _view_idx = 0
     for item in mv_result:
         if isinstance(item, Image):
-            all_images.append(item)
+            # Tier 1a: burn cluster coordinates onto the PNG before handing to Claude
+            view_label = _VIEW_ORDER[_view_idx] if _view_idx < len(_VIEW_ORDER) else "PERSP"
+            annotated_bytes = _annotate_image_with_clusters(item.data, coords, view_label)
+            all_images.append(Image(data=annotated_bytes, format="png"))
+            _view_idx += 1
         # dict summary is the last item — skip, we build our own
 
     # ── Step 3 (deep only): annotated highlights + severity heat map ───────
@@ -3671,7 +3866,7 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     # Image index guide — helps Claude know which image number = which pass
     idx = 0
     image_guide = []
-    image_guide.append(f"Images 1-7: Clean solid views (FRONT,BACK,LEFT,RIGHT,TOP,BOTTOM,PERSP)")
+    image_guide.append(f"Images 1-7: Solid views with problem cluster overlays burned in (FRONT,BACK,LEFT,RIGHT,TOP,BOTTOM,PERSP). Colored circles = N:ngon/M:non-manifold/P:pole. RED=critical ORANGE=warning BLUE=pole.")
     idx = 7
     if deep:
         image_guide.append(f"Images 8-14: Wireframe views (same order)")
@@ -3701,18 +3896,294 @@ def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
         "spatial_narrative":   narrative,
         "raw_coordinates":     coords,
         "how_to_read": (
-            "1. Read spatial_narrative — each entry tells you WHAT, HOW MANY, WHERE (world coords + view coords + region label). "
-            "2. view_projections x/y (0=left/bottom, 1=right/top) locates the cluster within any of the 7 images. "
-            + ("3. Use image_guide to find the right image number for each problem type. "
-               "4. The severity heat map (last 7 images) shows priority at a glance: red=fix first."
+            "1. The 7 screenshots already have cluster markers burned directly onto them — "
+            "colored circles with crosshairs: RED=critical, ORANGE=warning, BLUE=pole. "
+            "Label format: 'N1×12' = ngon cluster 1 with 12 faces; 'M2×3' = non-manifold cluster 2 with 3 edges; "
+            "'P1×5' = pole cluster 1 with 5 verts. PERSP view shows all clusters from all projections with [F]/[R]/[T] tags. "
+            "2. spatial_narrative gives the same data as text (world coords + region label) for reasoning. "
+            "3. raw_coordinates has the full JSON from get_problem_coordinates() if you need exact values. "
+            + ("4. Use image_guide to find the right image number for each problem type. "
+               "5. The severity heat map (last 7 images) shows priority at a glance: red=fix first."
                if deep else
-               "3. Need a visual pinpoint beyond coordinates? Call get_spatial_analysis(object_name, deep=True) "
-               "for annotated highlights + severity heat map (42 images — expensive, use only when needed).")
+               "4. For a close-up of the worst cluster only, call get_problem_detail_view(object_name). "
+               "5. Need full annotated highlights? Call get_spatial_analysis(object_name, deep=True) "
+               "(42 images — expensive, use only when the 7 views aren't enough).")
         ),
     }
 
     all_images.append(unified_report)
     return all_images
+
+
+@mcp.tool()
+def get_problem_detail_view(object_name: str, problem_type: str = "worst") -> list:
+    """
+    PROBLEM DETAIL VIEW — Zooms Blender's viewport to the single worst problem
+    cluster and captures a high-res close-up of JUST that region.
+
+    Complements get_spatial_analysis() which gives the full 7-view overview.
+    Use this when you already know a problem exists and need to see exactly what
+    the geometry looks like up close at the problem site — without wading through
+    42 deep-mode images.
+
+    How it works
+    ------------
+    1. Calls get_problem_coordinates() to find all clusters.
+    2. Picks the worst cluster (critical > warning; highest element_count within tier).
+       problem_type lets you target a specific class:
+         "worst"        — auto-pick the single worst cluster across all types (default)
+         "ngon"         — worst ngon cluster
+         "non_manifold" — worst non-manifold cluster
+         "pole"         — worst pole cluster
+    3. Sends a Blender script that: sets active object → enters edit mode → selects
+       only those problem elements (by face/edge/vert index from the cluster centroid
+       proximity search) → calls view.all_selected → exits edit mode → takes screenshot.
+    4. Burns the cluster's marker circle onto the close-up image (same Pillow overlay).
+    5. Returns: [close_up_Image, detail_report_dict]
+
+    Parameters
+    ----------
+    object_name  : Blender object name
+    problem_type : "worst" | "ngon" | "non_manifold" | "pole"
+
+    Returns list: [close_up_image (annotated), detail_report dict]
+    """
+    try:
+        blender = get_blender_connection()
+
+        # ── Step 1: Get problem coordinates ──────────────────────────────────
+        coords_json = get_problem_coordinates(object_name)
+        try:
+            coords = json.loads(coords_json)
+        except Exception:
+            return [{"error": "get_problem_detail_view: could not parse coordinates", "object": object_name}]
+
+        if "error" in coords:
+            return [{"error": coords["error"], "object": object_name}]
+
+        # ── Step 2: Pick the worst cluster matching problem_type ─────────────
+        def _sev_score(cluster):
+            """Higher score = worse. critical > warning, then element_count."""
+            sev   = cluster.get("severity", "warning")
+            count = cluster.get("element_count", 0)
+            return (1 if sev == "critical" else 0, count)
+
+        candidate_lists = []
+        if problem_type in ("worst", "ngon"):
+            candidate_lists.append(("ngon",          "face",  coords.get("ngon_clusters", [])))
+        if problem_type in ("worst", "non_manifold"):
+            candidate_lists.append(("non_manifold",  "edge",  coords.get("non_manifold_clusters", [])))
+        if problem_type in ("worst", "pole"):
+            candidate_lists.append(("pole",          "vert",  coords.get("pole_clusters", [])))
+
+        best_cluster     = None
+        best_cluster_type = None
+        best_elem_type   = None
+        best_score       = (-1, -1)
+
+        for ctype, etype, clist in candidate_lists:
+            for cluster in clist:
+                score = _sev_score(cluster)
+                if score > best_score:
+                    best_score       = score
+                    best_cluster     = cluster
+                    best_cluster_type = ctype
+                    best_elem_type   = etype
+
+        if best_cluster is None:
+            return [{
+                "status":  "no_problems_found",
+                "object":  object_name,
+                "message": f"No clusters found for problem_type='{problem_type}'. Mesh may be clean.",
+            }]
+
+        centroid = best_cluster.get("centroid", [0.0, 0.0, 0.0])
+        sev      = best_cluster.get("severity", "warning")
+        cnt      = best_cluster.get("element_count", 0)
+        region   = best_cluster.get("region_label", "unknown")
+        cx, cy, cz = centroid[0], centroid[1], centroid[2]
+
+        # ── Step 3: Blender close-up script ──────────────────────────────────
+        # Strategy: select elements near the centroid in edit mode, then use
+        # view_selected (zoom-to-fit-selection) via a context override so the
+        # viewport frames JUST that cluster, then screenshot.
+        #
+        # We use a proximity threshold of 10% of the object's longest bbox axis
+        # to select a generous region around the centroid without selecting
+        # the entire mesh.  After the zoom we immediately exit edit mode.
+        close_up_script = f"""
+import bpy, bmesh, math
+
+obj = bpy.data.objects.get("{object_name}")
+if obj is None:
+    raise ValueError("Object '{object_name}' not found")
+
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+
+# Compute proximity threshold from bbox diagonal
+bbox_corners = [obj.matrix_world @ v for v in [obj.bound_box[i] for i in range(8)]]
+xs = [v.x for v in bbox_corners]
+ys = [v.y for v in bbox_corners]
+zs = [v.z for v in bbox_corners]
+diag = math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2 + (max(zs)-min(zs))**2)
+thresh = max(diag * 0.08, 0.001)   # 8% of diagonal, minimum 1mm
+
+# Enter edit mode and deselect all
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(obj.data)
+
+# Centroid in world space
+import mathutils
+world_centroid = mathutils.Vector(({cx}, {cy}, {cz}))
+# Transform to local object space for bmesh comparison
+local_centroid = obj.matrix_world.inverted() @ world_centroid
+local_thresh   = thresh / max(obj.scale)   # rough local-space threshold
+
+# Select elements within threshold of centroid
+elem_type = "{best_elem_type}"
+if elem_type == "face":
+    bm.faces.ensure_lookup_table()
+    for f in bm.faces:
+        f.select = (f.calc_center_median() - local_centroid).length < local_thresh
+elif elem_type == "edge":
+    bm.edges.ensure_lookup_table()
+    for e in bm.edges:
+        mid = (e.verts[0].co + e.verts[1].co) / 2
+        e.select = (mid - local_centroid).length < local_thresh
+else:  # vert
+    bm.verts.ensure_lookup_table()
+    for v in bm.verts:
+        v.select = (v.co - local_centroid).length < local_thresh
+
+bmesh.update_edit_mesh(obj.data)
+
+# Find 3D viewport area and region for context override
+area   = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+region = next((r for r in area.regions if r.type == 'WINDOW'), None) if area else None
+
+# Zoom viewport to selection using view_selected
+if area and region:
+    with bpy.context.temp_override(area=area, region=region):
+        bpy.ops.view3d.view_selected(use_all_regions=False)
+
+bpy.ops.object.mode_set(mode='OBJECT')
+print("detail:ready")
+"""
+        result = blender.send_command(
+            "execute_code_safe",
+            {"code": close_up_script, "required_mode": "OBJECT", "push_undo": True}
+        )
+        if "error" in result:
+            return [{
+                "error": f"get_problem_detail_view: Blender script failed: {result.get('error')}",
+                "object": object_name,
+            }]
+
+        # ── Step 4: Capture the close-up (uses current viewport framing) ─────
+        # Re-use the _take_screenshot mechanism via get_multiview_capture FRONT only
+        # Actually: execute a targeted screenshot via execute_code_safe
+        screenshot_script = f"""
+import bpy, os, tempfile, base64
+
+area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+if area is None:
+    print("no_3d_area")
+else:
+    # Save current shading, switch to SOLID for clean close-up
+    space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+    prev_shading = space.shading.type if space else 'SOLID'
+    if space: space.shading.type = 'SOLID'
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+
+    scene = bpy.context.scene
+    orig_filepath = scene.render.filepath
+    orig_x = scene.render.resolution_x
+    orig_y = scene.render.resolution_y
+    orig_film_transparent = scene.render.film_transparent
+
+    scene.render.resolution_x = 1280
+    scene.render.resolution_y = 960
+    scene.render.filepath = tmp.name
+    scene.render.film_transparent = False
+
+    with bpy.context.temp_override(area=area):
+        bpy.ops.render.opengl(write_still=True, view_context=True)
+
+    scene.render.filepath = orig_filepath
+    scene.render.resolution_x = orig_x
+    scene.render.resolution_y = orig_y
+    scene.render.film_transparent = orig_film_transparent
+    if space: space.shading.type = prev_shading
+
+    with open(tmp.name, "rb") as fh:
+        encoded = base64.b64encode(fh.read()).decode()
+    os.unlink(tmp.name)
+    print("IMG:" + encoded)
+"""
+        ss_result = blender.send_command(
+            "execute_code_safe",
+            {"code": screenshot_script, "required_mode": "OBJECT", "push_undo": False}
+        )
+
+        close_up_image = None
+        raw_out = (ss_result.get("result") or ss_result.get("output") or "")
+        for line in str(raw_out).splitlines():
+            if line.startswith("IMG:"):
+                img_bytes = base64.b64decode(line[4:])
+                # Burn the cluster marker onto the close-up image
+                # Use a minimal coords dict with just this one cluster so we
+                # only draw one circle (at whatever view_projections it has)
+                single_coords = {
+                    f"{best_cluster_type}_clusters": [best_cluster],
+                    "ngon_clusters":         [best_cluster] if best_cluster_type == "ngon"          else [],
+                    "non_manifold_clusters": [best_cluster] if best_cluster_type == "non_manifold"  else [],
+                    "pole_clusters":         [best_cluster] if best_cluster_type == "pole"          else [],
+                }
+                annotated = _annotate_image_with_clusters(img_bytes, single_coords, "FRONT")
+                close_up_image = Image(data=annotated, format="png")
+                break
+
+        # ── Step 5: Build detail report ──────────────────────────────────────
+        vp = best_cluster.get("view_projections", {})
+        detail_report = {
+            "detail_view":    "complete",
+            "object":         object_name,
+            "problem_type":   best_cluster_type,
+            "element_type":   best_elem_type,
+            "severity":       sev,
+            "element_count":  cnt,
+            "region":         region,
+            "centroid_world": centroid,
+            "view_projections": vp,
+            "note": (
+                f"Viewport zoomed to {best_cluster_type} cluster in '{region}' region "
+                f"({sev}, {cnt} {best_elem_type}(s)). "
+                f"The close-up image shows the problem site up close. "
+                f"Cluster marker is burned onto the image. "
+                f"World centroid: {centroid}. "
+                f"To repair: call auto_repair_mesh('{object_name}') for safe auto-repair, "
+                f"or use manual sculpt/retopo for n-gon restructuring."
+            ),
+        }
+
+        out = []
+        if close_up_image:
+            out.append(close_up_image)
+        else:
+            detail_report["screenshot_warning"] = (
+                "Close-up screenshot could not be decoded. "
+                "Blender viewport was zoomed to the cluster — try get_multiview_capture() "
+                "after this call to see the framed view."
+            )
+        out.append(detail_report)
+        return out
+
+    except Exception as e:
+        logger.error(f"Error in get_problem_detail_view: {e}")
+        return [{"error": str(e), "object": object_name}]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4476,7 +4947,7 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbos
 
 
 @mcp.tool()
-def auto_repair_mesh(name: str, dry_run: bool = False) -> str:
+def auto_repair_mesh(name: str, dry_run: bool = False) -> list:
     """
     AUTO-REPAIR — Safe mesh cleanup loop: Scan → Diagnose → Repair → Verify.
 
@@ -4503,6 +4974,13 @@ def auto_repair_mesh(name: str, dry_run: bool = False) -> str:
     dry_run=False: executes all safe repairs then re-scans to verify.
 
     Always sets the named object as active before operating.
+
+    Returns list (Tier 1c visual diff):
+      dry_run=True  → [report_dict]
+      dry_run=False → [before_Image, after_Image, report_dict]
+      before_Image / after_Image are FRONT-view screenshots taken immediately before
+      and after the repair loop, with problem cluster markers burned onto them.
+      Also stored in _VISUAL_SNAPSHOTS[name] for this MCP session.
     """
     try:
         blender = get_blender_connection()
@@ -4533,7 +5011,7 @@ print("active:set")
         needs_artist    = reasoned_before.get("_reasoning", {}).get("needs_artist_review", [])
 
         if not auto_repairable:
-            return json.dumps({
+            return [{
                 "object": name,
                 "status": "no_auto_repairs_needed",
                 "message": (
@@ -4541,10 +5019,10 @@ print("active:set")
                     f"Issues requiring artist review: {needs_artist or 'none'}."
                 ),
                 "before": reasoned_before.get("_reasoning", {}),
-            }, indent=2)
+            }]
 
         if dry_run:
-            return json.dumps({
+            return [{
                 "object": name,
                 "status": "dry_run",
                 "would_repair": auto_repairable,
@@ -4555,7 +5033,27 @@ print("active:set")
                     f"Re-run with dry_run=False to apply."
                 ),
                 "before": reasoned_before.get("_reasoning", {}),
-            }, indent=2)
+            }]
+
+        # ── STEP 2b: Pre-repair screenshot (Tier 1c) ─────────────────────────
+        # Taken now: scan confirmed there IS work to do, but no repairs have run yet.
+        _pre_screenshot_bytes = None
+        _pre_screenshot_image = None
+        try:
+            _pre_mv = get_multiview_capture(name, include_wireframe=False)
+            _pre_front_images = [item for item in _pre_mv if isinstance(item, Image)]
+            if _pre_front_images:
+                _pre_screenshot_bytes = _pre_front_images[0].data  # FRONT view PNG bytes
+                try:
+                    _pre_coords = json.loads(get_problem_coordinates(name))
+                except Exception:
+                    _pre_coords = {}
+                _pre_annotated = _annotate_image_with_clusters(
+                    _pre_screenshot_bytes, _pre_coords, "FRONT"
+                )
+                _pre_screenshot_image = Image(data=_pre_annotated, format="png")
+        except Exception as _pre_err:
+            logger.warning(f"auto_repair_mesh: pre-repair screenshot failed: {_pre_err}")
 
         # ── STEP 3: Execute repairs in safe order ──────────────────────────
         before_counts = {p.get("type", ""): p.get("count", 0) for p in raw_before.get("problems", [])}
@@ -4595,6 +5093,26 @@ if obj:
                 repair_errors.append(f"{repair_key}: {e}")
                 continue
             attempted.append(repair_key)
+
+        # ── STEP 3b: Post-repair screenshot (Tier 1c) ────────────────────────
+        # Taken immediately after all repair scripts have run, before verify scan.
+        _post_screenshot_bytes = None
+        _post_screenshot_image = None
+        try:
+            _post_mv = get_multiview_capture(name, include_wireframe=False)
+            _post_front_images = [item for item in _post_mv if isinstance(item, Image)]
+            if _post_front_images:
+                _post_screenshot_bytes = _post_front_images[0].data
+                try:
+                    _post_coords = json.loads(get_problem_coordinates(name))
+                except Exception:
+                    _post_coords = {}
+                _post_annotated = _annotate_image_with_clusters(
+                    _post_screenshot_bytes, _post_coords, "FRONT"
+                )
+                _post_screenshot_image = Image(data=_post_annotated, format="png")
+        except Exception as _post_err:
+            logger.warning(f"auto_repair_mesh: post-repair screenshot failed: {_post_err}")
 
         # ── STEP 4: Verify — re-scan after repairs and confirm each attempted
         # repair actually reduced its problem count. A script can run without
@@ -4637,7 +5155,16 @@ if obj:
                 _session_set(multiview=mv)
                 _save_session()
 
-        return json.dumps({
+        # Store pre/post bytes in _VISUAL_SNAPSHOTS (Tier 1c)
+        import datetime as _dt
+        _VISUAL_SNAPSHOTS[name] = {
+            "before":    _pre_screenshot_bytes,
+            "after":     _post_screenshot_bytes,
+            "timestamp": _dt.datetime.now().isoformat(),
+            "status":    status,
+        }
+
+        report_dict = {
             "object": name,
             "status": status,
             "repairs_executed": repairs_executed,
@@ -4659,11 +5186,32 @@ if obj:
             },
             "after": reasoned_after if isinstance(reasoned_after, dict) else {"error": str(reasoned_after)},
             "production_ready": status == "success" and not remaining_critical,
-        }, indent=2, default=str)
+            "visual_diff": {
+                "before_image": "image[0] — FRONT view before repair with problem markers",
+                "after_image":  "image[1] — FRONT view after repair with any remaining markers",
+                "how_to_read": (
+                    "Compare image[0] (before) vs image[1] (after). "
+                    "Colored circles = problem clusters: RED=critical, ORANGE=warning, BLUE=pole. "
+                    "Fewer/no circles in image[1] = repair succeeded. "
+                    "Same circles in both = issue survived, needs artist review."
+                ),
+            } if (_pre_screenshot_image and _post_screenshot_image) else {
+                "note": "Visual screenshots could not be captured — check Blender connection.",
+            },
+        }
+
+        # Return [before_image, after_image, report_dict] (Tier 1c)
+        out = []
+        if _pre_screenshot_image:
+            out.append(_pre_screenshot_image)
+        if _post_screenshot_image:
+            out.append(_post_screenshot_image)
+        out.append(report_dict)
+        return out
 
     except Exception as e:
         logger.error(f"Error in auto_repair_mesh: {e}")
-        return json.dumps({"error": str(e)})
+        return [{"error": str(e), "object": name}]
 
 
 @mcp.tool()
