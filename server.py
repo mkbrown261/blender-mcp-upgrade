@@ -5395,8 +5395,7 @@ def export_material_as_materialx(material_name: str, write_file: bool = False, o
     Default (False) returns a compact structured summary only, no XML.
 
     This tool reads and represents. It does not modify the Blender material —
-    that's a separate, later "apply a weathering recipe" tool that doesn't
-    exist yet.
+    see apply_weathering_recipe() for the generative counterpart.
     """
     try:
         graph = _send_raw("get_material_graph", material_name=material_name)
@@ -5457,11 +5456,57 @@ def export_material_as_materialx(material_name: str, write_file: bool = False, o
         return json.dumps({"error": str(e)})
 
 
+_SEVERITY_TO_WEAR_SCALAR = [
+    (("extreme", "ruined", "destroyed"), 1.4),
+    (("heavy", "high"), 1.0),
+    (("medium", "moderate"), 0.6),
+    (("light", "low", "slight", "mild"), 0.3),
+]
+
+
+def _severity_to_wear_scalar(text: str) -> Optional[float]:
+    """Scan a recipe's free-form severity/wear description for known
+    intensity words. Returns None if nothing recognizable is found — callers
+    fall back to the tool's own default rather than guessing further."""
+    if not text:
+        return None
+    lowered = str(text).lower()
+    for keywords, scalar in _SEVERITY_TO_WEAR_SCALAR:
+        if any(kw in lowered for kw in keywords):
+            return scalar
+    return None
+
+
+def _resolve_weathering_recipe(trigger_phrase: str, recipe_type: str) -> dict:
+    """Look up a stored creative recipe and derive a wear_scalar from
+    whichever severity-describing field it has (damage_severity, surface_wear,
+    or wear_level — different recipe types name this differently). Returns
+    {} if no recipe matches or nothing severity-like is found in it — this
+    is a best-effort convenience, never a silent override of explicit params."""
+    if not trigger_phrase:
+        return {}
+    raw = json.loads(query_creative_recipe(trigger_phrase=trigger_phrase, recipe_type=recipe_type))
+    matches = raw.get("matches", [])
+    if not matches:
+        return {}
+    top = matches[0]
+    params = top.get("parameters", {})
+    severity_text = params.get("damage_severity") or params.get("surface_wear") or params.get("wear_level")
+    derived_scalar = _severity_to_wear_scalar(severity_text)
+    return {
+        "recipe_used": top.get("canonical_name"),
+        "recipe_context_fit": top.get("context_fit"),
+        "derived_wear_scalar": derived_scalar,
+    }
+
+
 @mcp.tool()
 def apply_weathering_recipe(
     object_name: str,
     material_name: str = "",
-    wear_scalar: float = 0.8,
+    trigger_phrase: str = "",
+    recipe_type: str = "aging",
+    wear_scalar: Optional[float] = None,
     rust_color: list = [0.35, 0.14, 0.05],
     worn_roughness: float = 0.9,
     mask_percentile_low: float = 5.0,
@@ -5489,14 +5534,29 @@ def apply_weathering_recipe(
     Original Base Color/Roughness are preserved as one input to a new Mix
     node (not destroyed) — rust_color/worn_roughness blend in via the mask.
 
+    trigger_phrase: optional — looks up a stored recipe (query_creative_recipe)
+    and derives wear_scalar from its damage_severity/surface_wear/wear_level
+    field (e.g. "ancient" -> a recipe with damage_severity="medium" -> 0.6).
+    Only fills in wear_scalar if you didn't pass one explicitly — an explicit
+    wear_scalar always wins. No matching recipe or no recognizable severity
+    word in it silently falls back to the tool's own default (0.8), not an
+    error — recipe integration is a convenience, not a requirement.
+
     material_name: leave blank to apply to every material on the object with
     an active Principled BSDF (skips others, same honest flagging as
-    export_material_as_materialx). wear_scalar: 0.0-2.0 overall intensity.
+    export_material_as_materialx). wear_scalar: 0.0-2.0 overall intensity,
+    defaults to 0.8 if neither passed explicitly nor derived from a recipe.
     mask_percentile_low/high: which percentile of THIS mesh's measured
     curvature distribution maps to full wear (low) vs. no wear (high) —
     defaults (5/40) worked on the tested case; a mesh with very few sharp
     features may need a lower "low" percentile.
     """
+    recipe_info = {}
+    if wear_scalar is None:
+        recipe_info = _resolve_weathering_recipe(trigger_phrase, recipe_type)
+        wear_scalar = recipe_info.get("derived_wear_scalar")
+        if wear_scalar is None:
+            wear_scalar = 0.8
     script = r"""
 import bpy, json, mathutils, statistics
 
@@ -5672,7 +5732,11 @@ else:
         for line in output.strip().splitlines():
             line = line.strip()
             if line.startswith("{"):
-                return json.dumps(json.loads(line), indent=2)
+                parsed = json.loads(line)
+                parsed["wear_scalar_used"] = wear_scalar
+                if recipe_info:
+                    parsed["recipe_lookup"] = recipe_info
+                return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from apply_weathering_recipe", "raw": output})
     except Exception as e:
         logger.error(f"Error in apply_weathering_recipe: {e}")
