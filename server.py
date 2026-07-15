@@ -5850,6 +5850,224 @@ else:
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def bake_weathered_textures(
+    object_name: str,
+    material_name: str,
+    output_dir: str,
+    resolution: int = 2048,
+    bake_roughness: bool = True,
+    rewire_to_baked: bool = True,
+) -> str:
+    """
+    BAKE TO TEXTURE — closes the gap between "looks right in Blender" and
+    "survives export." Everything apply_weathering_recipe/export_material_as_
+    materialx produces is live Blender procedural shading (Mix nodes, vertex
+    color attributes) — none of it exists once exported to FBX/UE5. This
+    bakes the EFFECTIVE Base Color (and optionally Roughness) into real
+    portable PNG files via the Emission-trick (routes the property's current
+    source through an Emission shader and bakes with type='EMIT', capturing
+    node values directly regardless of scene lighting).
+
+    Handles two real failure modes this session hit live, not hypothetically:
+    - Blender's bake operator validates EVERY material on the object, not
+      just the target — one broken/unresolved texture reference anywhere on
+      the object (a real Tripo3D pipeline artifact, not rare) fails the
+      whole bake. Broken images (0 channels or 0x0 size) are temporarily
+      swapped for a placeholder for the bake's duration only, then restored.
+    - A failed bake mid-operation can leave the material's Output.Surface
+      wired to a temporary Emission node instead of the real shader if
+      cleanup doesn't run. Original wiring is captured before ANY node is
+      created, and restoration runs in a finally block — guaranteed even if
+      the bake itself raises.
+
+    rewire_to_baked=True (default) also reconnects Base Color/Roughness to
+    the new baked textures instead of the procedural chain, making the
+    material genuinely export-ready — not just previewable in Blender.
+    Requires the object to already have a UV map (it will).
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    safe_mat_name = re.sub(r'[^A-Za-z0-9_-]', '_', material_name)
+    basecolor_path = os.path.join(output_dir, f"{safe_mat_name}_baked_basecolor.png")
+    roughness_path = os.path.join(output_dir, f"{safe_mat_name}_baked_roughness.png")
+
+    script = r"""
+import bpy, json, statistics, traceback
+
+result = {"errors": []}
+obj = bpy.data.objects.get('{OBJ}')
+mat = bpy.data.materials.get('{MAT}')
+
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+elif mat is None:
+    print(json.dumps({"error": "Material not found: {MAT}"}))
+else:
+    nt = mat.node_tree
+    principled = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+
+    if principled is None or output_node is None:
+        print(json.dumps({"error": "Material has no Principled BSDF / Output node"}))
+    else:
+        # Capture TRUE original state BEFORE creating any temp nodes —
+        # a failed bake must never leave this ambiguous.
+        original_surface_link = output_node.inputs["Surface"].links[0] if output_node.inputs["Surface"].links else None
+        original_surface_from = original_surface_link.from_socket if original_surface_link else None
+
+        # Object-wide broken-image scan — Blender's bake validates every
+        # material on the object, not just the target one.
+        placeholder = bpy.data.images.new("TEMP_BakePlaceholder", width=4, height=4, alpha=False)
+        swapped = []
+        for slot in obj.material_slots:
+            m = slot.material
+            if not m or not m.node_tree:
+                continue
+            for n in m.node_tree.nodes:
+                if n.type == 'TEX_IMAGE' and n.image:
+                    img = n.image
+                    if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
+                        swapped.append((n, img))
+                        n.image = placeholder
+
+        original_engine = bpy.context.scene.render.engine
+        original_samples = bpy.context.scene.cycles.samples
+        temp_nodes = []
+        baked = {}
+
+        def bake_pass(source_socket, image_name, w, h):
+            bake_img = bpy.data.images.new(image_name, width=w, height=h, alpha=False)
+            bake_node = nt.nodes.new("ShaderNodeTexImage")
+            bake_node.name = "TEMP_BakeTarget"
+            bake_node.image = bake_img
+            for n in nt.nodes:
+                n.select = False
+            bake_node.select = True
+            nt.nodes.active = bake_node
+            temp_nodes.append(bake_node)
+
+            emit_node = nt.nodes.new("ShaderNodeEmission")
+            emit_node.name = "TEMP_BakeEmission"
+            nt.links.new(source_socket, emit_node.inputs["Color"])
+            temp_nodes.append(emit_node)
+
+            nt.links.new(emit_node.outputs["Emission"], output_node.inputs["Surface"])
+
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.bake(type='EMIT')
+
+            pixels = bake_img.pixels[:]
+            channels = bake_img.channels
+            sample = [pixels[i] for i in range(0, min(len(pixels), 40000), channels)]
+
+            # Remove this pass's temp nodes immediately — before the next
+            # pass or any exception — so state never straddles two passes.
+            nt.nodes.remove(bake_node)
+            nt.nodes.remove(emit_node)
+            temp_nodes.remove(bake_node)
+            temp_nodes.remove(emit_node)
+            nt.links.new(original_surface_from, output_node.inputs["Surface"])
+
+            return bake_img, {
+                "min": round(min(sample), 4), "max": round(max(sample), 4),
+                "mean": round(statistics.mean(sample), 4), "stdev": round(statistics.pstdev(sample), 4),
+            }
+
+        try:
+            bpy.context.scene.render.engine = 'CYCLES'
+            bpy.context.scene.cycles.samples = 16
+
+            bc_link = principled.inputs["Base Color"].links[0] if principled.inputs["Base Color"].links else None
+            if bc_link:
+                bc_img, bc_stats = bake_pass(bc_link.from_socket, "TEMP_bake_basecolor", {RES}, {RES})
+                bc_img.filepath_raw = '{BCPATH}'
+                bc_img.file_format = 'PNG'
+                bc_img.save()
+                baked["base_color"] = {"path": '{BCPATH}', "stats": bc_stats}
+            else:
+                result["errors"].append("Base Color has no input connection — nothing to bake, it's already a flat constant")
+
+            if {BAKEROUGH}:
+                rough_link = principled.inputs["Roughness"].links[0] if principled.inputs["Roughness"].links else None
+                if rough_link:
+                    r_img, r_stats = bake_pass(rough_link.from_socket, "TEMP_bake_roughness", {RES}, {RES})
+                    r_img.filepath_raw = '{ROUGHPATH}'
+                    r_img.file_format = 'PNG'
+                    r_img.save()
+                    baked["roughness"] = {"path": '{ROUGHPATH}', "stats": r_stats}
+                else:
+                    result["errors"].append("Roughness has no input connection — nothing to bake")
+
+            if {REWIRE} and baked:
+                for prop_name, info in baked.items():
+                    socket_name = "Base Color" if prop_name == "base_color" else "Roughness"
+                    img = bpy.data.images.load(info["path"], check_existing=True)
+                    tex_node = nt.nodes.new("ShaderNodeTexImage")
+                    tex_node.name = "Baked_" + prop_name
+                    tex_node.image = img
+                    if prop_name == "roughness":
+                        img.colorspace_settings.name = 'Non-Color'
+                    nt.links.new(tex_node.outputs["Color"], principled.inputs[socket_name])
+                result["rewired"] = True
+            else:
+                result["rewired"] = False
+
+        except Exception as e:
+            result["errors"].append(f"{type(e).__name__}: {e}")
+            result["trace"] = traceback.format_exc()
+        finally:
+            # GUARANTEED restoration, even if the bake itself raised.
+            for n in list(temp_nodes):
+                try:
+                    nt.nodes.remove(n)
+                except Exception:
+                    pass
+            if original_surface_from is not None:
+                try:
+                    nt.links.new(original_surface_from, output_node.inputs["Surface"])
+                except Exception:
+                    pass
+            for n, img in swapped:
+                try:
+                    n.image = img
+                except Exception:
+                    pass
+            try:
+                bpy.data.images.remove(placeholder)
+            except Exception:
+                pass
+            bpy.context.scene.render.engine = original_engine
+            bpy.context.scene.cycles.samples = original_samples
+
+        result["baked"] = baked
+        result["broken_images_worked_around"] = [img.name for n, img in swapped]
+        print(json.dumps(result))
+""".replace("{OBJ}", object_name.replace("'", "\\'")) \
+   .replace("{MAT}", material_name.replace("'", "\\'")) \
+   .replace("{RES}", str(resolution)) \
+   .replace("{BCPATH}", basecolor_path.replace("\\", "\\\\")) \
+   .replace("{ROUGHPATH}", roughness_path.replace("\\", "\\\\")) \
+   .replace("{BAKEROUGH}", str(bake_roughness)) \
+   .replace("{REWIRE}", str(rewire_to_baked))
+
+    try:
+        raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.dumps(json.loads(line), indent=2)
+        return json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in bake_weathered_textures: {e}")
+        return json.dumps({"error": str(e)})
+
+
 def _write_materialx_document(material_name: str, properties: dict, output_path: str) -> dict:
     """Build a real .mtlx file via the MaterialX SDK — the actual portable
     artifact, not just a JSON description of one. Isolated from the tool
