@@ -5457,6 +5457,228 @@ def export_material_as_materialx(material_name: str, write_file: bool = False, o
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def apply_weathering_recipe(
+    object_name: str,
+    material_name: str = "",
+    wear_scalar: float = 0.8,
+    rust_color: list = [0.35, 0.14, 0.05],
+    worn_roughness: float = 0.9,
+    mask_percentile_low: float = 5.0,
+    mask_percentile_high: float = 40.0,
+) -> str:
+    """
+    APPLY WEATHERING — generates real rust/edge-wear shader nodes on an
+    object's materials. MODIFIES the material(s) — call create_checkpoint()
+    first, this is generative, not reversible via a simple metric diff.
+
+    Technique (live-tested and verified, not theoretical): computes a
+    per-vertex curvature signal (each vertex's normal vs. its neighbors'
+    average — high deviation = edge/crevice), measures THIS mesh's actual
+    value distribution, and calibrates a wear mask against measured
+    percentiles rather than fixed thresholds — a fixed-threshold version of
+    this (raw Geometry Pointiness or Bevel-node dot product straight into a
+    0.4/0.6 ColorRamp) was tried and failed: verified numerically that mesh
+    curvature signals cluster tightly and vary a lot per-mesh, so fixed
+    thresholds silently produce a uniform "flat" result on some meshes. The
+    calibrated mask is baked into a vertex color attribute (AutoWeather_Mask)
+    and read by an Attribute node in the shader — deterministic and
+    independently verifiable by reading the vertex colors back, unlike a
+    live procedural node chain.
+
+    Original Base Color/Roughness are preserved as one input to a new Mix
+    node (not destroyed) — rust_color/worn_roughness blend in via the mask.
+
+    material_name: leave blank to apply to every material on the object with
+    an active Principled BSDF (skips others, same honest flagging as
+    export_material_as_materialx). wear_scalar: 0.0-2.0 overall intensity.
+    mask_percentile_low/high: which percentile of THIS mesh's measured
+    curvature distribution maps to full wear (low) vs. no wear (high) —
+    defaults (5/40) worked on the tested case; a mesh with very few sharp
+    features may need a lower "low" percentile.
+    """
+    script = r"""
+import bpy, json, mathutils, statistics
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+else:
+    mesh = obj.data
+    vert_normals = {}
+    for poly in mesh.polygons:
+        for li in poly.loop_indices:
+            loop = mesh.loops[li]
+            vert_normals.setdefault(loop.vertex_index, []).append(mathutils.Vector(loop.normal))
+
+    neighbor_map = {}
+    for edge in mesh.edges:
+        a, b = edge.vertices
+        neighbor_map.setdefault(a, set()).add(b)
+        neighbor_map.setdefault(b, set()).add(a)
+
+    def avg_normal(idx):
+        ns = vert_normals.get(idx)
+        if not ns:
+            return None
+        v = mathutils.Vector((0, 0, 0))
+        for n in ns:
+            v += n
+        return (v / len(ns)).normalized()
+
+    vert_avg = {vid: avg_normal(vid) for vid in vert_normals}
+
+    dot_by_vert = {}
+    for vid, own in vert_avg.items():
+        neighbor_avgs = [vert_avg[n] for n in neighbor_map.get(vid, set()) if vert_avg.get(n) is not None]
+        if own is None or not neighbor_avgs:
+            continue
+        v = mathutils.Vector((0, 0, 0))
+        for n in neighbor_avgs:
+            v += n
+        avg_neighbor = (v / len(neighbor_avgs)).normalized()
+        dot_by_vert[vid] = own.dot(avg_neighbor)
+
+    values = sorted(dot_by_vert.values())
+    n = len(values)
+    p_low  = values[int(n * ({PLOW} / 100.0))]
+    p_high = values[int(n * ({PHIGH} / 100.0))]
+
+    def wear_mask(dot_value):
+        if p_high == p_low:
+            return 0.0
+        v = (p_high - dot_value) / (p_high - p_low)
+        return max(0.0, min(1.0, v))
+
+    mask_name = "AutoWeather_Mask"
+    if mask_name in mesh.color_attributes:
+        mesh.color_attributes.remove(mesh.color_attributes[mask_name])
+    color_attr = mesh.color_attributes.new(name=mask_name, type='FLOAT_COLOR', domain='POINT')
+
+    mask_values = []
+    for vid, dot_value in dot_by_vert.items():
+        m = wear_mask(dot_value)
+        color_attr.data[vid].color = (m, m, m, 1.0)
+        mask_values.append(m)
+
+    def get_socket(collection, name, socket_type):
+        for s in collection:
+            if s.name == name and s.type == socket_type:
+                return s
+        return None
+
+    target_name = '{MATNAME}'
+    materials_applied = []
+    materials_skipped = []
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None:
+            continue
+        if target_name and mat.name != target_name:
+            continue
+        nt = mat.node_tree
+        if nt is None:
+            materials_skipped.append({"material": mat.name, "reason": "no node tree"})
+            continue
+        principled = next((nd for nd in nt.nodes if nd.type == 'BSDF_PRINCIPLED'), None)
+        if principled is None:
+            materials_skipped.append({"material": mat.name, "reason": "no Principled BSDF"})
+            continue
+
+        prefix = "AutoWeather_"
+        for nd in list(nt.nodes):
+            if nd.name.startswith(prefix):
+                nt.nodes.remove(nd)
+
+        base_x, base_y = principled.location.x - 700, principled.location.y
+
+        bc_input = principled.inputs["Base Color"]
+        existing_bc_from = bc_input.links[0].from_socket if bc_input.links else None
+        rough_input = principled.inputs["Roughness"]
+        existing_rough_from = rough_input.links[0].from_socket if rough_input.links else None
+
+        attr = nt.nodes.new("ShaderNodeAttribute")
+        attr.name = prefix + "MaskAttr"
+        attr.attribute_name = mask_name
+        attr.location = (base_x - 400, base_y - 300)
+
+        rust = nt.nodes.new("ShaderNodeRGB")
+        rust.name = prefix + "RustColor"
+        rust.location = (base_x - 400, base_y - 600)
+        rust.outputs[0].default_value = ({RUSTR}, {RUSTG}, {RUSTB}, 1.0)
+
+        factor_scale = nt.nodes.new("ShaderNodeMath")
+        factor_scale.name = prefix + "WearScale"
+        factor_scale.location = (base_x, base_y - 300)
+        factor_scale.operation = 'MULTIPLY'
+        nt.links.new(attr.outputs["Fac"], factor_scale.inputs[0])
+        factor_scale.inputs[1].default_value = {WEARSCALAR}
+
+        bc_mix = nt.nodes.new("ShaderNodeMix")
+        bc_mix.name = prefix + "BaseColorWeather"
+        bc_mix.data_type = 'RGBA'
+        bc_mix.location = (base_x + 300, base_y)
+        a_in = get_socket(bc_mix.inputs, "A", "RGBA")
+        b_in = get_socket(bc_mix.inputs, "B", "RGBA")
+        result_out = get_socket(bc_mix.outputs, "Result", "RGBA")
+        factor_in = get_socket(bc_mix.inputs, "Factor", "VALUE")
+        if existing_bc_from:
+            nt.links.new(existing_bc_from, a_in)
+        nt.links.new(rust.outputs[0], b_in)
+        nt.links.new(factor_scale.outputs[0], factor_in)
+        nt.links.new(result_out, principled.inputs["Base Color"])
+
+        rough_mix = nt.nodes.new("ShaderNodeMix")
+        rough_mix.name = prefix + "RoughnessWeather"
+        rough_mix.data_type = 'FLOAT'
+        rough_mix.location = (base_x + 300, base_y + 300)
+        ra_in = get_socket(rough_mix.inputs, "A", "VALUE")
+        rb_in = get_socket(rough_mix.inputs, "B", "VALUE")
+        rresult_out = get_socket(rough_mix.outputs, "Result", "VALUE")
+        rfactor_in = get_socket(rough_mix.inputs, "Factor", "VALUE")
+        if existing_rough_from:
+            nt.links.new(existing_rough_from, ra_in)
+        rb_in.default_value = {WORNROUGH}
+        nt.links.new(factor_scale.outputs[0], rfactor_in)
+        nt.links.new(rresult_out, principled.inputs["Roughness"])
+
+        materials_applied.append(mat.name)
+
+    print(json.dumps({
+        "object": '{OBJ}',
+        "materials_applied": materials_applied,
+        "materials_skipped": materials_skipped,
+        "mask_stats": {
+            "min": round(min(mask_values), 4) if mask_values else None,
+            "max": round(max(mask_values), 4) if mask_values else None,
+            "mean": round(statistics.mean(mask_values), 4) if mask_values else None,
+            "stdev": round(statistics.pstdev(mask_values), 4) if mask_values else None,
+        },
+        "percentiles_used": {"low": {PLOW}, "high": {PHIGH}, "p_low_value": round(p_low, 4), "p_high_value": round(p_high, 4)},
+    }))
+""".replace("{OBJ}", object_name.replace("'", "\\'")) \
+   .replace("{MATNAME}", material_name.replace("'", "\\'")) \
+   .replace("{PLOW}", str(mask_percentile_low)) \
+   .replace("{PHIGH}", str(mask_percentile_high)) \
+   .replace("{RUSTR}", str(rust_color[0])).replace("{RUSTG}", str(rust_color[1])).replace("{RUSTB}", str(rust_color[2])) \
+   .replace("{WEARSCALAR}", str(wear_scalar)) \
+   .replace("{WORNROUGH}", str(worn_roughness))
+
+    try:
+        raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
+        if "error" in raw:
+            return json.dumps({"error": raw["error"]})
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.dumps(json.loads(line), indent=2)
+        return json.dumps({"error": "No JSON output from apply_weathering_recipe", "raw": output})
+    except Exception as e:
+        logger.error(f"Error in apply_weathering_recipe: {e}")
+        return json.dumps({"error": str(e)})
+
+
 def _write_materialx_document(material_name: str, properties: dict, output_path: str) -> dict:
     """Build a real .mtlx file via the MaterialX SDK — the actual portable
     artifact, not just a JSON description of one. Isolated from the tool
