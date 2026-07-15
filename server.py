@@ -5518,13 +5518,18 @@ def apply_weathering_recipe(
     object's materials. MODIFIES the material(s) — call create_checkpoint()
     first, this is generative, not reversible via a simple metric diff.
 
-    Material-aware: rust belongs on metal, not skin/organic surfaces. Reads
-    each material's REAL metalness from its Principled BSDF — samples the
-    actual connected texture's average value (real computed number, not a
-    guess) if Metallic is texture-driven, else reads the constant directly —
-    and scales that material's wear intensity by it. metal_floor (0.0-1.0)
-    is the minimum multiplier even fully non-metal materials still get, so
-    organic surfaces show subtle wear rather than nothing at all.
+    Material-aware in TWO ways, both driven by real sampled data per material,
+    not one flat setting for the whole object:
+    - INTENSITY: reads each material's real metalness from Principled BSDF
+      (samples the connected texture's average if texture-driven, else the
+      constant) and scales wear by it. metal_floor (0.0-1.0) is the minimum
+      multiplier even fully non-metal materials still get.
+    - TINT: rust_color is the pure-metal endpoint, not applied flatly to
+      everything. Each material's own base color is sampled and darkened/
+      desaturated into a "grime" tone, then blended toward rust_color
+      proportional to that material's metal_factor — organic materials grime
+      in their own tone, metal materials rust orange, instead of every
+      surface getting painted the same color.
 
     Technique (live-tested and verified, not theoretical): computes a
     per-vertex curvature signal (each vertex's normal vs. its neighbors'
@@ -5637,6 +5642,27 @@ else:
                 return s
         return None
 
+    def sample_image_avg(image, num_channels_wanted):
+        '''Strided average of an image's first N channels — same technique
+        for metallic (1 channel) and base color (3 channels), real sampled
+        data instead of an assumed constant. Broken/missing image references
+        (0 channels, 0x0 size — a real thing on AI-generated assets whose
+        source texture path didn't resolve) fall back to neutral gray rather
+        than crashing the whole weathering pass over one bad texture.'''
+        channels = image.channels
+        if channels == 0 or image.size[0] == 0 or image.size[1] == 0:
+            return tuple(0.5 for _ in range(num_channels_wanted))
+        pixels = image.pixels[:]
+        texel_count = len(pixels) // channels
+        stride = max(1, texel_count // 2000)
+        totals = [0.0] * num_channels_wanted
+        count = 0
+        for i in range(0, len(pixels), channels * stride):
+            for c in range(num_channels_wanted):
+                totals[c] += pixels[i + c] if c < channels else pixels[i]
+            count += 1
+        return tuple(t / count if count else 0.5 for t in totals)
+
     target_name = '{MATNAME}'
     materials_applied = []
     materials_skipped = []
@@ -5674,29 +5700,59 @@ else:
         metallic_input = principled.inputs["Metallic"]
         metal_source = "constant"
         if metallic_input.links:
-            metal_source = "texture_sampled"
             src_node = metallic_input.links[0].from_node
             metal_factor = 0.5
             if src_node.type == 'TEX_IMAGE' and src_node.image:
-                try:
-                    img = src_node.image
-                    pixels = img.pixels[:]
-                    channels = img.channels
-                    texel_count = len(pixels) // channels
-                    stride = max(1, texel_count // 2000)
-                    total, count = 0.0, 0
-                    for i in range(0, len(pixels), channels * stride):
-                        total += pixels[i]
-                        count += 1
-                    metal_factor = total / count if count else 0.5
-                except Exception:
-                    metal_source = "texture_sample_failed"
-                    metal_factor = 0.5
+                img = src_node.image
+                if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
+                    metal_source = "broken_image_fallback"
+                else:
+                    try:
+                        metal_factor = sample_image_avg(img, 1)[0]
+                        metal_source = "texture_sampled"
+                    except Exception:
+                        metal_source = "texture_sample_failed"
+            else:
+                metal_source = "texture_node_no_image"
         else:
             metal_factor = float(metallic_input.default_value)
 
         metal_factor_floored = max({METALFLOOR}, min(1.0, metal_factor))
         effective_wear_scalar = {WEARSCALAR} * metal_factor_floored
+
+        # Material-aware TINT: instead of one flat rust color for every
+        # material, sample this material's own base color and derive a
+        # weathering tint from it — a darkened/desaturated "grime" version
+        # for organic materials, blended toward the pure rust_color for
+        # metal materials proportional to the same measured metal_factor.
+        # Real materials don't oxidize orange-rust uniformly; skin/fabric
+        # grimes and darkens, metal rusts — this mirrors that instead of
+        # painting every surface the same tone.
+        bc_source = "constant"
+        base_rgb = (0.5, 0.5, 0.5)
+        if existing_bc_from is not None and existing_bc_from.node.type == 'TEX_IMAGE' and existing_bc_from.node.image:
+            img = existing_bc_from.node.image
+            if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
+                bc_source = "broken_image_fallback"
+            else:
+                try:
+                    base_rgb = sample_image_avg(img, 3)
+                    bc_source = "texture_sampled"
+                except Exception:
+                    bc_source = "texture_sample_failed"
+        elif existing_bc_from is None:
+            bc_default = bc_input.default_value
+            base_rgb = (bc_default[0], bc_default[1], bc_default[2])
+        else:
+            bc_source = "texture_node_no_image"
+
+        gray = sum(base_rgb) / 3.0
+        grime_rgb = tuple(base_rgb[c] * 0.5 + gray * 0.15 for c in range(3))
+        rust_target = ({RUSTR}, {RUSTG}, {RUSTB})
+        weather_rgb = tuple(
+            grime_rgb[c] * (1.0 - metal_factor_floored) + rust_target[c] * metal_factor_floored
+            for c in range(3)
+        )
 
         attr = nt.nodes.new("ShaderNodeAttribute")
         attr.name = prefix + "MaskAttr"
@@ -5706,7 +5762,7 @@ else:
         rust = nt.nodes.new("ShaderNodeRGB")
         rust.name = prefix + "RustColor"
         rust.location = (base_x - 400, base_y - 600)
-        rust.outputs[0].default_value = ({RUSTR}, {RUSTG}, {RUSTB}, 1.0)
+        rust.outputs[0].default_value = (weather_rgb[0], weather_rgb[1], weather_rgb[2], 1.0)
 
         factor_scale = nt.nodes.new("ShaderNodeMath")
         factor_scale.name = prefix + "WearScale"
@@ -5749,6 +5805,9 @@ else:
             "metal_factor": round(metal_factor, 4),
             "metal_factor_floored": round(metal_factor_floored, 4),
             "effective_wear_scalar": round(effective_wear_scalar, 4),
+            "base_color_source": bc_source,
+            "sampled_base_rgb": [round(c, 4) for c in base_rgb],
+            "weathering_tint_rgb": [round(c, 4) for c in weather_rgb],
         })
 
     print(json.dumps({

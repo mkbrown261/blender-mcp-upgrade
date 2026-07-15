@@ -12,6 +12,11 @@ import sys, os, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import server
 
+# Isolate from the real, persistent recipe store — this test seeds its own
+# recipe and must never read or write .blender_mcp_recipes.json.
+server._RECIPES = []
+server._save_recipes = lambda: None
+
 failures = []
 
 

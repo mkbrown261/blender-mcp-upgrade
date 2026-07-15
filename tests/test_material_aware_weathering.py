@@ -58,7 +58,7 @@ check("script reads the Metallic input, not a hardcoded assumption",
 check("script distinguishes texture-driven vs constant metallic",
       "metallic_input.links" in code)
 check("script samples the REAL connected image's pixel data when texture-driven",
-      "img.pixels" in code and "TEX_IMAGE" in code)
+      "sample_image_avg(" in code and "image.pixels" in code and "TEX_IMAGE" in code)
 check("metal_floor value substituted correctly into the clamp", "0.3" in code)
 check("effective_wear_scalar computed as wear_scalar * floored metal factor",
       "effective_wear_scalar = " in code and "metal_factor_floored" in code)

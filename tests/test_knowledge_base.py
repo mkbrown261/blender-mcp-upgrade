@@ -15,6 +15,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import server
 
+# Isolate from the real, persistent knowledge base — this test must never
+# read or write .blender_mcp_knowledge.json. Swap in an empty in-memory
+# store and a no-op save for the duration of this test only.
+server._KNOWLEDGE = []
+server._save_knowledge = lambda: None
+
 failures = []
 
 
