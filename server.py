@@ -5511,11 +5511,20 @@ def apply_weathering_recipe(
     worn_roughness: float = 0.9,
     mask_percentile_low: float = 5.0,
     mask_percentile_high: float = 40.0,
+    metal_floor: float = 0.25,
 ) -> str:
     """
     APPLY WEATHERING — generates real rust/edge-wear shader nodes on an
     object's materials. MODIFIES the material(s) — call create_checkpoint()
     first, this is generative, not reversible via a simple metric diff.
+
+    Material-aware: rust belongs on metal, not skin/organic surfaces. Reads
+    each material's REAL metalness from its Principled BSDF — samples the
+    actual connected texture's average value (real computed number, not a
+    guess) if Metallic is texture-driven, else reads the constant directly —
+    and scales that material's wear intensity by it. metal_floor (0.0-1.0)
+    is the minimum multiplier even fully non-metal materials still get, so
+    organic surfaces show subtle wear rather than nothing at all.
 
     Technique (live-tested and verified, not theoretical): computes a
     per-vertex curvature signal (each vertex's normal vs. its neighbors'
@@ -5551,6 +5560,7 @@ def apply_weathering_recipe(
     defaults (5/40) worked on the tested case; a mesh with very few sharp
     features may need a lower "low" percentile.
     """
+
     recipe_info = {}
     if wear_scalar is None:
         recipe_info = _resolve_weathering_recipe(trigger_phrase, recipe_type)
@@ -5657,6 +5667,37 @@ else:
         rough_input = principled.inputs["Roughness"]
         existing_rough_from = rough_input.links[0].from_socket if rough_input.links else None
 
+        # Material-aware intensity: rust belongs on metal, not skin/organic
+        # surfaces. Read this material's REAL metalness — sample the actual
+        # connected texture's average value if metallic is texture-driven,
+        # not a guessed constant — and use it to scale wear intensity.
+        metallic_input = principled.inputs["Metallic"]
+        metal_source = "constant"
+        if metallic_input.links:
+            metal_source = "texture_sampled"
+            src_node = metallic_input.links[0].from_node
+            metal_factor = 0.5
+            if src_node.type == 'TEX_IMAGE' and src_node.image:
+                try:
+                    img = src_node.image
+                    pixels = img.pixels[:]
+                    channels = img.channels
+                    texel_count = len(pixels) // channels
+                    stride = max(1, texel_count // 2000)
+                    total, count = 0.0, 0
+                    for i in range(0, len(pixels), channels * stride):
+                        total += pixels[i]
+                        count += 1
+                    metal_factor = total / count if count else 0.5
+                except Exception:
+                    metal_source = "texture_sample_failed"
+                    metal_factor = 0.5
+        else:
+            metal_factor = float(metallic_input.default_value)
+
+        metal_factor_floored = max({METALFLOOR}, min(1.0, metal_factor))
+        effective_wear_scalar = {WEARSCALAR} * metal_factor_floored
+
         attr = nt.nodes.new("ShaderNodeAttribute")
         attr.name = prefix + "MaskAttr"
         attr.attribute_name = mask_name
@@ -5672,7 +5713,7 @@ else:
         factor_scale.location = (base_x, base_y - 300)
         factor_scale.operation = 'MULTIPLY'
         nt.links.new(attr.outputs["Fac"], factor_scale.inputs[0])
-        factor_scale.inputs[1].default_value = {WEARSCALAR}
+        factor_scale.inputs[1].default_value = effective_wear_scalar
 
         bc_mix = nt.nodes.new("ShaderNodeMix")
         bc_mix.name = prefix + "BaseColorWeather"
@@ -5702,7 +5743,13 @@ else:
         nt.links.new(factor_scale.outputs[0], rfactor_in)
         nt.links.new(rresult_out, principled.inputs["Roughness"])
 
-        materials_applied.append(mat.name)
+        materials_applied.append({
+            "material": mat.name,
+            "metal_source": metal_source,
+            "metal_factor": round(metal_factor, 4),
+            "metal_factor_floored": round(metal_factor_floored, 4),
+            "effective_wear_scalar": round(effective_wear_scalar, 4),
+        })
 
     print(json.dumps({
         "object": '{OBJ}',
@@ -5722,7 +5769,8 @@ else:
    .replace("{PHIGH}", str(mask_percentile_high)) \
    .replace("{RUSTR}", str(rust_color[0])).replace("{RUSTG}", str(rust_color[1])).replace("{RUSTB}", str(rust_color[2])) \
    .replace("{WEARSCALAR}", str(wear_scalar)) \
-   .replace("{WORNROUGH}", str(worn_roughness))
+   .replace("{WORNROUGH}", str(worn_roughness)) \
+   .replace("{METALFLOOR}", str(metal_floor))
 
     try:
         raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
