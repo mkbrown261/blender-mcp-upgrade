@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp[cli]", "pillow"]
+# dependencies = ["mcp[cli]", "pillow", "MaterialX"]
 # ///
 """
 Custom MCP server for blender-mcp-upgrade — v2.2 AI Technical Director Edition.
@@ -189,6 +189,14 @@ _SESSION: dict = {
     # Open issue tracker — issues opened by analysis tools, closed by repair/QA tools.
     # Each entry: {id, ts_opened, tool, object, issue_type, severity, detail, status, ts_closed}
     "issue_tracker": [],
+    # Absolute path of the .blend file this session's context belongs to.
+    # session_status() compares this against the currently open file on every
+    # call and resets file-scoped fields if they no longer match — otherwise
+    # stale context from a previously open project silently leaks into a new one.
+    "blend_filepath": None,
+    # File-level restore points created via create_checkpoint(). Each entry:
+    # {label, timestamp, filepath, blend_filepath_at_creation}
+    "checkpoints": [],
 }
 
 
@@ -213,6 +221,80 @@ def _session_append(key: str, value):
     lst = _SESSION.get(key)
     if isinstance(lst, list) and value not in lst:
         lst.append(value)
+
+
+def _get_blend_filepath() -> str:
+    """
+    Absolute path of the currently open .blend file, or "" if unsaved/unavailable.
+    get_scene_info's schema has no "filepath" key, so query bpy.data.filepath
+    directly via execute_code_safe. Never raises — returns "" on any failure so
+    callers (session_status, on every turn) can't be broken by a Blender hiccup.
+    """
+    try:
+        raw = _send_raw(
+            "execute_code_safe",
+            code="import bpy, json\nprint(json.dumps({'filepath': bpy.data.filepath}))",
+            required_mode=None,
+            push_undo=False,
+        )
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                blend_path = json.loads(line).get("filepath", "")
+                return blend_path if blend_path and blend_path != "//" else ""
+    except Exception as e:
+        logger.warning(f"_get_blend_filepath: could not query bpy.data.filepath: {e}")
+    return ""
+
+
+def _check_session_file_match() -> dict:
+    """
+    Compare the session's recorded blend_filepath against the actually open
+    file. If they differ, the session was built against a DIFFERENT project —
+    reset file-scoped fields rather than silently serving stale context
+    (active_object/asset_type from a character in a totally different .blend
+    file has bitten this project more than once).
+    Returns {"file_changed": bool, "previous_file": str|None, "current_file": str}.
+    """
+    current = _get_blend_filepath()
+    previous = _SESSION.get("blend_filepath")
+
+    if not current:
+        # Can't determine the open file right now — don't reset on uncertainty.
+        return {"file_changed": False, "previous_file": previous, "current_file": current}
+
+    if not previous:
+        _session_set(blend_filepath=current)
+        _save_session()
+        return {"file_changed": False, "previous_file": None, "current_file": current}
+
+    if previous == current:
+        return {"file_changed": False, "previous_file": previous, "current_file": current}
+
+    # File genuinely changed — reset facts scoped to the previous file.
+    # journal/issue_tracker/checkpoints are kept as history (entries carry
+    # their own object names, so old entries stay legible, not misleading).
+    _session_set(
+        asset_type=None,
+        active_playbook=None,
+        confirmed_stage=None,
+        active_object=None,
+        verified_checks=[],
+        open_issues=[],
+        user_corrections=[],
+        surfaced_conflicts=[],
+        multiview=None,
+        blend_filepath=current,
+    )
+    _journal_entry(
+        tool="_check_session_file_match",
+        object_name="",
+        outcome="ok",
+        detail=f"Blend file changed ({previous} -> {current}) — reset file-scoped session context.",
+    )
+    _save_session()
+    return {"file_changed": True, "previous_file": previous, "current_file": current}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +423,8 @@ _SESSION_PERSIST_KEYS = [
     "multiview",   # metadata only — no image bytes, safe to persist
     "journal",     # list of {ts, tool, object, outcome, detail} dicts
     "issue_tracker", # list of open/closed issue entries
+    "blend_filepath", # which .blend file this context belongs to
+    "checkpoints",    # file-level restore points
 ]
 
 
@@ -370,6 +454,147 @@ def _load_session() -> None:
 
 # Load persisted session immediately at import time
 _load_session()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION KNOWLEDGE BASE — Phase 1 of the Spatial Intelligence roadmap.
+#
+# Deliberately SEPARATE from _SESSION: _SESSION is per-project and resets its
+# file-scoped fields on a .blend switch (see _check_session_file_match).
+# Knowledge is the opposite — it must survive across every project and every
+# server restart, because the whole point is that solved problems compound
+# into reusable expertise instead of being re-solved from scratch each time.
+#
+# Lives next to server.py (not next to any one .blend) because it belongs to
+# the MCP installation itself, not to any single user's world/project data —
+# unlike ERYNDOR_master_manifest.json, which is correctly gitignored and kept
+# next to the user's .blend files.
+#
+# Every entry MUST carry context_tags (blender_version, asset_source, mesh_type
+# etc.) — the fcurves bug fixed this session (a Blender-4.4-only API change)
+# is the concrete failure mode a context-free "this always works" store would
+# hit: a fact that was true stops being true when the environment changes.
+# Untagged, unconditional "lessons" are how a knowledge base turns into a
+# liability instead of an asset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_KNOWLEDGE_FILE: Path = Path(__file__).parent / ".blender_mcp_knowledge.json"
+_KNOWLEDGE: list = []
+
+
+def _load_knowledge() -> None:
+    """Read the persisted knowledge base from disk. Called once at startup."""
+    global _KNOWLEDGE
+    if not _KNOWLEDGE_FILE.exists():
+        return
+    try:
+        data = json.loads(_KNOWLEDGE_FILE.read_text())
+        if isinstance(data, list):
+            _KNOWLEDGE = data
+        logger.info(f"_load_knowledge: restored {len(_KNOWLEDGE)} entries from {_KNOWLEDGE_FILE}")
+    except Exception as e:
+        logger.warning(f"_load_knowledge: could not read {_KNOWLEDGE_FILE}: {e}")
+
+
+def _save_knowledge() -> None:
+    """Write the knowledge base to disk. Silent on failure — never crash the server."""
+    try:
+        _KNOWLEDGE_FILE.write_text(json.dumps(_KNOWLEDGE, indent=2))
+    except Exception as e:
+        logger.warning(f"_save_knowledge: could not write {_KNOWLEDGE_FILE}: {e}")
+
+
+def _next_knowledge_id() -> str:
+    """Derive next KB-NNN id from the max id already present — same pattern as
+    _next_issue_id, so restarts don't collide IDs with a reset counter."""
+    max_n = 0
+    for entry in _KNOWLEDGE:
+        eid = entry.get("id", "")
+        if eid.startswith("KB-"):
+            try:
+                max_n = max(max_n, int(eid[3:]))
+            except ValueError:
+                pass
+    return f"KB-{max_n + 1:03d}"
+
+
+def _knowledge_entries_match(a: dict, b_problem_type: str, b_category: str, b_tags: dict) -> bool:
+    """Two entries are 'the same lesson' if problem_type, category, and every
+    supplied context tag match. Used to increment confidence on repeat
+    confirmation instead of accumulating duplicate near-identical entries."""
+    if a.get("problem_type") != b_problem_type or a.get("category") != b_category:
+        return False
+    a_tags = a.get("context_tags", {}) or {}
+    for k, v in (b_tags or {}).items():
+        if a_tags.get(k) != v:
+            return False
+    return True
+
+
+# Load persisted knowledge immediately at import time
+_load_knowledge()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CREATIVE RECIPE STORE — Phase 2 of the Spatial Intelligence roadmap.
+#
+# Translates natural-language intent/style references into structured,
+# reusable parameter objects instead of re-deriving them from prose every
+# call. "Make this look ancient" or "dark souls-like" becomes a stored
+# {age_years, environment, weather_exposure, ...} / {palette, materials,
+# form_language, ...} object, queryable by trigger phrase.
+#
+# Deliberate constraint from the spec this implements: NEVER store a brand/
+# game/IP name as a recipe's canonical identity. IP names are only valid as
+# trigger_phrases that map to a generalized recipe (e.g. "elden ring" and
+# "dark souls" both map to canonical_name="grimdark_souls_fantasy") — the
+# MCP executes the recipe, not the trademark.
+#
+# Same token-discipline rule as the knowledge base: zero-filter queries
+# return name/type summaries only, never a full dump of stored recipes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RECIPE_FILE: Path = Path(__file__).parent / ".blender_mcp_recipes.json"
+_RECIPES: list = []
+
+
+def _load_recipes() -> None:
+    """Read the persisted recipe store from disk. Called once at startup."""
+    global _RECIPES
+    if not _RECIPE_FILE.exists():
+        return
+    try:
+        data = json.loads(_RECIPE_FILE.read_text())
+        if isinstance(data, list):
+            _RECIPES = data
+        logger.info(f"_load_recipes: restored {len(_RECIPES)} entries from {_RECIPE_FILE}")
+    except Exception as e:
+        logger.warning(f"_load_recipes: could not read {_RECIPE_FILE}: {e}")
+
+
+def _save_recipes() -> None:
+    """Write the recipe store to disk. Silent on failure — never crash the server."""
+    try:
+        _RECIPE_FILE.write_text(json.dumps(_RECIPES, indent=2))
+    except Exception as e:
+        logger.warning(f"_save_recipes: could not write {_RECIPE_FILE}: {e}")
+
+
+def _next_recipe_id() -> str:
+    """Derive next RECIPE-NNN id from the max id already present."""
+    max_n = 0
+    for entry in _RECIPES:
+        eid = entry.get("id", "")
+        if eid.startswith("RECIPE-"):
+            try:
+                max_n = max(max_n, int(eid[7:]))
+            except ValueError:
+                pass
+    return f"RECIPE-{max_n + 1:03d}"
+
+
+# Load persisted recipes immediately at import time
+_load_recipes()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2002,8 +2227,10 @@ GATE 3 EXPORT                → run_unreal_readiness_check() zero errors + run_
 GATE 4 IRREVERSIBLE OPS      → state exactly what happens + wait for explicit confirm
 GATE 5 BAKE                  → validate_bake_setup() MUST run first, every time
 GATE 6 TD PLAN               → plan_production_path() → PRESENT PLAN → WAIT for approval
+GATE 7 CHECKPOINT RESTORE    → state what's discarded + wait for explicit confirm before restore_checkpoint()
 
 NEVER:
+  ✗ restore_checkpoint() without explicit user approval — discards unsaved changes
   ✗ auto_repair_mesh() without explicit user approval, or without snapshot_mesh_state() first
   ✗ PASS without running the actual tool, or a "clean" verdict from visual inspection alone
   ✗ Export with known critical issues · Repair the wrong object · Delete user data
@@ -2149,6 +2376,22 @@ Never skip the snapshot step — without it compare_mesh_state will fail.
 AI/SCAN ASSETS: very high poly + irregular topology → state "AI/scanned
 asset detected. Pipeline: validate→cleanup→retopo→bake→texture→rig→export.
 Do not export in current state."
+
+── KNOWLEDGE BASE — persists across every project, not just this session ──
+query_knowledge(problem_type, category, ...tags) BEFORE re-deriving a known
+problem from scratch — non-manifold repair ceilings, version-specific API
+breaks, workflows already proven out. record_knowledge(...) AFTER solving
+something nontrivial, always with context tags (blender_version, asset_source,
+mesh_type) — an untagged "always works" entry is how this goes stale and
+misfires later. Not for routine repairs already covered by existing tools.
+
+── CREATIVE RECIPES — structured intent/style, not re-derived prose ──────
+query_creative_recipe(trigger_phrase) BEFORE reasoning a style/aging request
+from scratch — "make this ancient", "souls-like", genre references. If none
+fits, reason it out normally then record_creative_recipe(...) so it's reusable
+next time. canonical_name must be a GENERALIZED name, never a brand/game/IP —
+IP names belong only in trigger_phrases (the recipe, not the trademark, gets
+executed).
 """
 
 
@@ -2206,7 +2449,15 @@ def session_status() -> str:
     stage, verified checks, open issues, user corrections. Call at the start
     of a turn to orient before reaching for other tools; if empty, fall back
     to screenshot → scene_info → object_info.
+
+    Checks the open .blend file against the file this session's context was
+    built from — if they differ, file-scoped fields (asset_type, active_object,
+    verified_checks, etc.) are reset automatically. See "file_check" in the
+    response. Journal/issue history is kept, not reset — old entries carry
+    their own object names so they stay legible across a file switch.
     """
+    file_check = _check_session_file_match()
+
     has_context = any([
         _SESSION.get("asset_type"),
         _SESSION.get("active_playbook"),
@@ -2238,13 +2489,355 @@ def session_status() -> str:
     else:
         orientation = "No session context yet. Run screenshot → get_scene_info → get_object_info to orient."
 
+    if file_check["file_changed"]:
+        orientation = (
+            f"Blend file changed since last context ({file_check['previous_file']} -> "
+            f"{file_check['current_file']}) — file-scoped session context was reset. "
+            + orientation
+        )
+
     return json.dumps({
         "has_context":        has_context,
         "orientation_summary": orientation,
+        "file_check":         file_check,
         "session":            _SESSION,
         "persisted":          _SESSION_FILE.exists(),
         "session_file":       str(_SESSION_FILE),
     }, indent=2)
+
+
+@mcp.tool()
+def create_checkpoint(label: str = "") -> str:
+    """
+    CHECKPOINT — save a timestamped copy of the current .blend file as a
+    file-level restore point, independent of Blender's undo stack. Undo has
+    proven non-atomic in this project — one revert silently dropped an object
+    (recoverable only because it was checked for). Call before any risky
+    operation you'd want a guaranteed way back from: joins, rig edits, bulk
+    repairs. label: short name, e.g. "before_rig_fix".
+    """
+    try:
+        current = _get_blend_filepath()
+        if not current:
+            return json.dumps({"error": "Current file has no path yet — save the .blend file first."})
+
+        import datetime as _dt
+        timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_label = re.sub(r'[^A-Za-z0-9_-]', '_', label)[:40] if label else "checkpoint"
+        blend_path = Path(current)
+        checkpoint_path = str(blend_path.parent / f"{blend_path.stem}_CHECKPOINT_{safe_label}_{timestamp}.blend")
+
+        code = (
+            "import bpy, json\n"
+            f"bpy.ops.wm.save_as_mainfile(filepath={checkpoint_path!r}, copy=True)\n"
+            "print(json.dumps({'saved': True}))"
+        )
+        raw = _send_raw("execute_code_safe", code=code, required_mode=None, push_undo=False)
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        if "saved" not in output:
+            return json.dumps({"error": f"Checkpoint save failed: {output}"})
+
+        entry = {
+            "label": label or "checkpoint",
+            "timestamp": timestamp,
+            "filepath": checkpoint_path,
+            "blend_filepath_at_creation": current,
+        }
+        checkpoints = _SESSION.get("checkpoints", [])
+        checkpoints.append(entry)
+        _session_set(checkpoints=checkpoints)
+        _save_session()
+
+        return json.dumps({
+            "checkpoint_created": True,
+            "label": entry["label"],
+            "path": checkpoint_path,
+            "note": "Restore with restore_checkpoint() — ask the user to confirm first, it discards unsaved changes.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_checkpoints() -> str:
+    """
+    List all checkpoints created this session, most recent first, with
+    file_exists so stale/deleted checkpoints are visible before you rely on
+    them. Use before restore_checkpoint() to pick the right one.
+    """
+    checkpoints = _SESSION.get("checkpoints", [])
+    existing = [{**cp, "file_exists": Path(cp["filepath"]).exists()} for cp in checkpoints]
+    return json.dumps({"checkpoints": list(reversed(existing)), "count": len(existing)}, indent=2)
+
+
+@mcp.tool()
+def restore_checkpoint(label_or_path: str) -> str:
+    """
+    RESTORE CHECKPOINT — reopen a previously saved checkpoint file, discarding
+    ALL unsaved changes in the currently open file. ASK THE USER TO CONFIRM
+    before ever calling this. Opening a new file also invalidates this
+    session's in-memory context (reset automatically) and may briefly drop
+    the live MCP connection, the same way an addon reload does — reconnect
+    and call session_status() afterward to confirm the restore landed.
+    label_or_path: a checkpoint's label (most recent match wins) or an exact
+    filepath from list_checkpoints().
+    """
+    try:
+        checkpoints = _SESSION.get("checkpoints", [])
+        target = next((cp for cp in checkpoints if cp["filepath"] == label_or_path), None)
+        if target is None:
+            matches = [cp for cp in checkpoints if cp["label"] == label_or_path]
+            target = matches[-1] if matches else None
+        if target is None:
+            return json.dumps({"error": f"No checkpoint found matching '{label_or_path}'. Call list_checkpoints() first."})
+        if not Path(target["filepath"]).exists():
+            return json.dumps({"error": f"Checkpoint file no longer exists on disk: {target['filepath']}"})
+
+        code = (
+            "import bpy, json\n"
+            f"bpy.ops.wm.open_mainfile(filepath={target['filepath']!r})\n"
+            "print(json.dumps({'opened': True}))"
+        )
+        raw = _send_raw("execute_code_safe", code=code, required_mode=None, push_undo=False)
+        output = raw.get("result", "") if isinstance(raw, dict) else ""
+        if "opened" not in output:
+            return json.dumps({"error": f"Restore failed: {output}"})
+
+        # Opening a new file invalidates this process's in-memory session context.
+        _session_set(
+            asset_type=None, active_playbook=None, confirmed_stage=None,
+            active_object=None, verified_checks=[], open_issues=[],
+            user_corrections=[], surfaced_conflicts=[], multiview=None,
+            blend_filepath=target["blend_filepath_at_creation"],
+        )
+        _save_session()
+
+        return json.dumps({
+            "restored": True,
+            "label": target["label"],
+            "path": target["filepath"],
+            "note": "Session context reset for the restored file state.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def record_knowledge(
+    problem_type: str,
+    category: str,
+    problem: str,
+    solution: str,
+    why_it_worked: str,
+    outcome: str = "success",
+    blender_version: str = "",
+    asset_source: str = "",
+    mesh_type: str = "",
+) -> str:
+    """
+    KNOWLEDGE BASE — persist a solved production problem so it survives
+    across every project and server restart, not just this session. Use
+    after genuinely solving something nontrivial (a repair ceiling, a
+    version-specific API break, a workflow that actually worked) — not for
+    routine repairs already covered by existing tools.
+
+    problem_type: short slug, e.g. "non_manifold_repair_ceiling". category:
+    mesh_topology|rigging|materials|export|animation|workflow. Always pass
+    context tags (blender_version, asset_source, mesh_type) that were true
+    when this was learned — an untagged "this always works" entry is exactly
+    how a knowledge base goes stale and misfires later (see: the fcurves API
+    break that only applies to Blender 4.4+).
+
+    Calling this again with matching problem_type+category+tags increments
+    confidence on the existing entry instead of creating a duplicate.
+    """
+    context_tags = {}
+    if blender_version:
+        context_tags["blender_version"] = blender_version
+    if asset_source:
+        context_tags["asset_source"] = asset_source
+    if mesh_type:
+        context_tags["mesh_type"] = mesh_type
+
+    for entry in _KNOWLEDGE:
+        if _knowledge_entries_match(entry, problem_type, category, context_tags):
+            entry["times_confirmed"] = entry.get("times_confirmed", 1) + 1
+            entry["solution"] = solution
+            entry["why_it_worked"] = why_it_worked
+            entry["outcome"] = outcome
+            entry["confidence"] = "high" if entry["times_confirmed"] >= 3 else "medium"
+            _save_knowledge()
+            return json.dumps({"recorded": True, "id": entry["id"], "action": "confirmed_existing",
+                                "times_confirmed": entry["times_confirmed"]})
+
+    import datetime as _dt
+    entry = {
+        "id": _next_knowledge_id(),
+        "created": _dt.datetime.now().isoformat(timespec="seconds"),
+        "problem_type": problem_type,
+        "category": category,
+        "context_tags": context_tags,
+        "problem": problem,
+        "solution": solution,
+        "why_it_worked": why_it_worked,
+        "outcome": outcome,
+        "confidence": "medium",
+        "times_confirmed": 1,
+    }
+    _KNOWLEDGE.append(entry)
+    _save_knowledge()
+    return json.dumps({"recorded": True, "id": entry["id"], "action": "new_entry"})
+
+
+@mcp.tool()
+def query_knowledge(
+    problem_type: str = "",
+    category: str = "",
+    blender_version: str = "",
+    asset_source: str = "",
+    mesh_type: str = "",
+    max_results: int = 5,
+) -> str:
+    """
+    KNOWLEDGE BASE — check for prior solved-problem knowledge before
+    re-deriving something from scratch. Call with no filters to see category
+    counts only (never dumps the full base into context). Filter by
+    problem_type/category plus whatever context tags apply now — a match
+    whose tags DON'T fit the current context (different Blender version,
+    different asset source) is flagged, not silently trusted.
+    """
+    if not problem_type and not category:
+        counts = {}
+        for entry in _KNOWLEDGE:
+            counts[entry.get("category", "unknown")] = counts.get(entry.get("category", "unknown"), 0) + 1
+        return json.dumps({
+            "total_entries": len(_KNOWLEDGE),
+            "by_category": counts,
+            "note": "Pass problem_type and/or category to search; add context tags to check fit.",
+        }, indent=2)
+
+    current_tags = {}
+    if blender_version:
+        current_tags["blender_version"] = blender_version
+    if asset_source:
+        current_tags["asset_source"] = asset_source
+    if mesh_type:
+        current_tags["mesh_type"] = mesh_type
+
+    matches = []
+    for entry in _KNOWLEDGE:
+        if problem_type and entry.get("problem_type") != problem_type:
+            continue
+        if category and entry.get("category") != category:
+            continue
+        entry_tags = entry.get("context_tags", {}) or {}
+        tag_mismatches = [k for k, v in current_tags.items() if k in entry_tags and entry_tags[k] != v]
+        result = dict(entry)
+        result["context_fit"] = "exact" if not tag_mismatches else f"mismatch on {tag_mismatches}"
+        matches.append(result)
+
+    matches.sort(key=lambda e: (e.get("confidence") == "high", e.get("times_confirmed", 0)), reverse=True)
+    return json.dumps({"matches": matches[:max_results], "total_matches": len(matches)}, indent=2)
+
+
+@mcp.tool()
+def record_creative_recipe(
+    recipe_type: str,
+    canonical_name: str,
+    trigger_phrases: list,
+    parameters: dict,
+    notes: str = "",
+) -> str:
+    """
+    CREATIVE RECIPE — persist a structured translation of intent or style
+    into reusable parameters, instead of re-reasoning "make this look
+    ancient" or "dark souls-like" from scratch every time it comes up.
+
+    recipe_type: "aging"|"style"|"material_condition"|"mood".
+    canonical_name: a GENERALIZED name for the recipe — NEVER a brand, game,
+    or IP name (e.g. "grimdark_souls_fantasy", not "elden_ring"). IP names
+    belong only in trigger_phrases, as the language a user might actually
+    say — the recipe itself must stay reusable and not brand-bound.
+    trigger_phrases: list of phrases that should surface this recipe, e.g.
+    ["elden ring", "dark souls", "souls-like"] for a dark-fantasy style, or
+    ["ancient", "300 years old", "long abandoned"] for an aging recipe.
+    parameters: the structured recipe itself — free-form dict, shape depends
+    on recipe_type (aging: age_years/environment/weather_exposure/damage_
+    severity/surface_wear/narrative; style: palette/materials/form_language/
+    wear_level/silhouette).
+
+    Calling again with a matching canonical_name+recipe_type merges new
+    trigger_phrases into the existing entry and increments confirmation
+    rather than creating a duplicate.
+    """
+    for entry in _RECIPES:
+        if entry.get("canonical_name") == canonical_name and entry.get("recipe_type") == recipe_type:
+            existing_phrases = set(entry.get("trigger_phrases", []))
+            entry["trigger_phrases"] = sorted(existing_phrases | set(trigger_phrases))
+            entry["parameters"] = parameters
+            if notes:
+                entry["notes"] = notes
+            entry["times_confirmed"] = entry.get("times_confirmed", 1) + 1
+            entry["confidence"] = "high" if entry["times_confirmed"] >= 3 else "medium"
+            _save_recipes()
+            return json.dumps({"recorded": True, "id": entry["id"], "action": "confirmed_existing",
+                                "times_confirmed": entry["times_confirmed"]})
+
+    import datetime as _dt
+    entry = {
+        "id": _next_recipe_id(),
+        "created": _dt.datetime.now().isoformat(timespec="seconds"),
+        "recipe_type": recipe_type,
+        "canonical_name": canonical_name,
+        "trigger_phrases": list(trigger_phrases),
+        "parameters": parameters,
+        "notes": notes,
+        "confidence": "medium",
+        "times_confirmed": 1,
+    }
+    _RECIPES.append(entry)
+    _save_recipes()
+    return json.dumps({"recorded": True, "id": entry["id"], "action": "new_entry"})
+
+
+@mcp.tool()
+def query_creative_recipe(
+    trigger_phrase: str = "",
+    recipe_type: str = "",
+    canonical_name: str = "",
+    max_results: int = 5,
+) -> str:
+    """
+    CREATIVE RECIPE — check for an existing structured recipe before
+    re-deriving one from a style reference or aging request. Call with no
+    filters to see canonical_name/recipe_type summaries only — never dumps
+    every recipe's full parameters into context. trigger_phrase does a
+    case-insensitive substring match against each recipe's stored phrases.
+    """
+    if not trigger_phrase and not recipe_type and not canonical_name:
+        summary = [{"canonical_name": e.get("canonical_name"), "recipe_type": e.get("recipe_type")}
+                   for e in _RECIPES]
+        return json.dumps({
+            "total_entries": len(_RECIPES),
+            "recipes": summary,
+            "note": "Pass trigger_phrase, recipe_type, or canonical_name to retrieve full parameters.",
+        }, indent=2)
+
+    needle = trigger_phrase.lower().strip()
+    matches = []
+    for entry in _RECIPES:
+        if recipe_type and entry.get("recipe_type") != recipe_type:
+            continue
+        if canonical_name and entry.get("canonical_name") != canonical_name:
+            continue
+        if needle:
+            phrases = [p.lower() for p in entry.get("trigger_phrases", [])]
+            if not any(needle in p or p in needle for p in phrases):
+                continue
+        matches.append(entry)
+
+    matches.sort(key=lambda e: (e.get("confidence") == "high", e.get("times_confirmed", 0)), reverse=True)
+    return json.dumps({"matches": matches[:max_results], "total_matches": len(matches)}, indent=2)
 
 
 @mcp.tool()
@@ -4747,6 +5340,162 @@ def get_material_graph(material_name: str) -> str:
     return _send_json("get_material_graph", material_name=material_name)
 
 
+# Blender 4.x+ Principled BSDF socket name -> MaterialX/OpenPBR semantic property.
+# This is the actual translation table — nearly 1:1 for the common case, which
+# is exactly why Principled BSDF materials are in scope for v1 and arbitrary
+# procedural node networks are not.
+_MATERIALX_SOCKET_MAP = {
+    "Base Color":        "base_color",
+    "Metallic":           "metalness",
+    "Roughness":          "specular_roughness",
+    "IOR":                "specular_IOR",
+    "Alpha":              "opacity",
+    "Normal":             "normal",
+    "Emission Color":     "emission_color",
+}
+
+
+def _find_principled_input_source(socket_name: str, principled_name: str, nodes: list, links: list):
+    """What feeds a Principled BSDF input socket, if anything is connected —
+    an image texture (portable), a normal map, or something procedural we
+    don't attempt to translate."""
+    target = f"{principled_name}.{socket_name}"
+    link = next((l for l in links if l["to"] == target), None)
+    if not link:
+        return None
+    from_node_name = link["from"].rsplit(".", 1)[0]
+    from_node = next((n for n in nodes if n["name"] == from_node_name), None)
+    if from_node is None:
+        return {"type": "unknown"}
+    if from_node.get("type") == "TEX_IMAGE":
+        return {"type": "image_texture", "image": from_node.get("image"),
+                "filepath": from_node.get("filepath"), "colorspace": from_node.get("colorspace")}
+    if from_node.get("type") == "NORMAL_MAP":
+        return {"type": "normal_map", "space": from_node.get("normal_space"),
+                "ue5_warning": from_node.get("ue5_warning")}
+    return {"type": "procedural_or_unsupported", "node_type": from_node.get("type")}
+
+
+@mcp.tool()
+def export_material_as_materialx(material_name: str, write_file: bool = False, output_path: str = "") -> str:
+    """
+    MATERIAL UNDERSTANDING — foundation layer, not generation. Translates a
+    Blender material's Principled BSDF node graph into MaterialX/OpenPBR
+    semantic properties (base_color, specular_roughness, metalness, normal,
+    emission_color, opacity) instead of raw Blender node names — the AI
+    reasons in industry-standard vocabulary, portable to USD/UE5 pipelines.
+
+    Covers the common case: Principled BSDF + connected image textures or
+    flat values. Procedural-only networks (Noise/Musgrave/Mix chains) or a
+    missing Principled BSDF are explicitly flagged unsupported, not silently
+    mistranslated — same "needs baking first" honesty as analyze_material_pbr.
+
+    write_file=True writes a real portable .mtlx document to output_path
+    using the actual MaterialX SDK — this is the exchange-ready artifact.
+    Default (False) returns a compact structured summary only, no XML.
+
+    This tool reads and represents. It does not modify the Blender material —
+    that's a separate, later "apply a weathering recipe" tool that doesn't
+    exist yet.
+    """
+    try:
+        graph = _send_raw("get_material_graph", material_name=material_name)
+        if "error" in graph:
+            return json.dumps({"error": graph["error"]})
+        if graph.get("use_nodes") is False:
+            return json.dumps({
+                "material": material_name,
+                "supported": False,
+                "reason": "Material does not use nodes — flat color only, nothing to translate.",
+            })
+
+        nodes = graph.get("nodes", [])
+        links = graph.get("links", [])
+
+        principled = next((n for n in nodes if n.get("type") == "BSDF_PRINCIPLED" and n.get("active")), None)
+        if not principled:
+            return json.dumps({
+                "material": material_name,
+                "supported": False,
+                "reason": "No active Principled BSDF found — procedural-only or non-standard shader "
+                          "graph. Bake to texture maps before MaterialX translation.",
+            })
+
+        p_name = principled["name"]
+        inputs = principled.get("inputs", {})
+
+        properties = {}
+        unsupported = []
+        for blender_socket, mx_property in _MATERIALX_SOCKET_MAP.items():
+            source = _find_principled_input_source(blender_socket, p_name, nodes, links)
+            if source:
+                if source["type"] == "procedural_or_unsupported":
+                    unsupported.append({"property": mx_property,
+                                         "reason": f"fed by unsupported node type '{source['node_type']}'"})
+                else:
+                    properties[mx_property] = source
+            elif blender_socket in inputs:
+                properties[mx_property] = {"type": "constant", "value": inputs[blender_socket]}
+
+        result = {
+            "material": material_name,
+            "supported": True,
+            "materialx_node_type": "open_pbr_surface",
+            "properties": properties,
+            "unsupported_inputs": unsupported,
+            "orphaned_nodes_ignored": graph.get("orphaned_nodes", []),
+        }
+
+        if write_file:
+            if not output_path:
+                return json.dumps({"error": "write_file=True requires output_path"})
+            file_result = _write_materialx_document(material_name, properties, output_path)
+            result.update(file_result)
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _write_materialx_document(material_name: str, properties: dict, output_path: str) -> dict:
+    """Build a real .mtlx file via the MaterialX SDK — the actual portable
+    artifact, not just a JSON description of one. Isolated from the tool
+    function so a missing/broken MaterialX install degrades to a clear error
+    instead of taking down the whole translation result."""
+    try:
+        import MaterialX as mx
+    except ImportError:
+        return {"file_written": None,
+                "file_write_error": "MaterialX Python package not installed in this server's environment."}
+
+    try:
+        doc = mx.createDocument()
+        shader = doc.addNode("open_pbr_surface", material_name + "_shader", "surfaceshader")
+
+        color3_props = {"base_color", "emission_color"}
+        float_props = {"metalness", "specular_roughness", "specular_IOR", "opacity"}
+
+        for prop_name, source in properties.items():
+            if source.get("type") == "image_texture" and source.get("filepath"):
+                img_type = "color3" if prop_name in color3_props else "float"
+                image_node = doc.addNode("image", f"{prop_name}_image", img_type)
+                image_node.setInputValue("file", source["filepath"], "filename")
+                shader.addInput(prop_name, img_type).setNodeName(image_node.getName())
+            elif source.get("type") == "constant":
+                value = source["value"]
+                if prop_name in color3_props and isinstance(value, (list, tuple)):
+                    shader.setInputValue(prop_name, mx.Color3(*value[:3]), "color3")
+                elif prop_name in float_props and isinstance(value, (int, float)):
+                    shader.setInputValue(prop_name, float(value), "float")
+            # normal_map / unsupported sources: skipped, not guessed at
+
+        doc.addMaterialNode(material_name, shader)
+        mx.writeToXmlFile(doc, output_path)
+        return {"file_written": output_path}
+    except Exception as e:
+        return {"file_written": None, "file_write_error": str(e)}
+
+
 @mcp.tool()
 def get_animation_data(name: str) -> str:
     """Get action/keyframe/fcurve data for a named object."""
@@ -4934,7 +5683,17 @@ def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbos
         has_mat    = bool(r_ue5.get("_reasoning", {}).get("findings"))  # rough proxy
         has_uv     = raw_quality.get("uv", {}).get("has_uvs", False)
 
-        if vert_count > 300_000:
+        session_asset_type = _session_get("asset_type")
+        if session_asset_type:
+            # Trust what the user already confirmed this session over re-guessing
+            # from vert-count/armature heuristics on every single call.
+            assumed_tier = session_asset_type
+            budget_note  = (
+                f"Evaluating as '{session_asset_type}' — confirmed this session via "
+                f"session_update(). {vert_count:,} verts. Call session_update(asset_type=...) "
+                "again if this has changed."
+            )
+        elif vert_count > 300_000:
             assumed_tier = "high-poly sculpt or scan source"
             budget_note  = "No polygon budget applies — this is a source mesh, not a runtime asset."
         elif has_arm and vert_count > 50_000:
@@ -5621,8 +6380,13 @@ def what_next(object_name: str, context: str = "") -> str:
         confidence   = stage_result.get("confidence",   "low")
 
         # ── Infer asset context (state assumption, invite correction) ──────────
+        session_asset_type = _session_get("asset_type")
         if context:
             assumed_context = context
+        elif session_asset_type:
+            # Trust what's already confirmed this session over re-deriving from
+            # signals on every call.
+            assumed_context = session_asset_type
         else:
             # Derive a plain-language assumption from signals
             if vertex_count > 300_000:
@@ -10359,24 +11123,11 @@ def _compress_manifest_vocab(manifest: dict, scene_asset_names: list[str]) -> st
 def _get_blend_dir() -> Optional[Path]:
     """
     Directory of the currently open .blend file, or None if unsaved/unavailable.
-    get_scene_info's schema has no "filepath" key — query bpy.data.filepath
-    directly via execute_code_safe instead.
+    Thin wrapper over _get_blend_filepath() — kept separate because most
+    callers here want the containing directory, not the file path itself.
     """
-    raw = _send_raw(
-        "execute_code_safe",
-        code="import bpy, json\nprint(json.dumps({'filepath': bpy.data.filepath}))",
-        required_mode=None,
-        push_undo=False,
-    )
-    output = raw.get("result", "") if isinstance(raw, dict) else ""
-    for line in output.strip().splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            blend_path = json.loads(line).get("filepath", "")
-            if blend_path and blend_path != "//":
-                return Path(blend_path).parent
-            break
-    return None
+    blend_path = _get_blend_filepath()
+    return Path(blend_path).parent if blend_path else None
 
 
 def _find_manifest(hint_path: str = "") -> str:

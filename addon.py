@@ -37,6 +37,63 @@ RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhof
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
+
+def get_action_fcurves(action, obj=None):
+    """
+    Return a flat list of FCurves from an action, handling both the legacy
+    API (Blender < 4.4) and the new layered action API (Blender 4.4+).
+
+    Blender 4.4 removed the direct action.fcurves shortcut. FCurves now
+    live at: action.layers[n].strips[m] (type KEYFRAME) -> channelbag
+    scoped to an action slot -> channelbag.fcurves.
+
+    Module-level (not a class method) so every call site in this file —
+    BlenderMCPServer's animation analysis AND the standalone UI panel
+    classes below — shares one implementation instead of drifting apart
+    when the Blender API changes again.
+
+    Strategy:
+      1. If Blender >= 4.4 and action has layers, iterate layers/strips/
+         channelbags. Try slot-scoped channelbag first (correct for
+         multi-object actions); fall back to all channelbags on the strip
+         if the slot isn't available.
+      2. Otherwise use the legacy action.fcurves list directly.
+      3. If neither exists, return [].
+    """
+    if bpy.app.version >= (4, 4, 0) and hasattr(action, 'layers'):
+        fcurves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                if strip.type != 'KEYFRAME':
+                    continue
+                # Prefer slot-scoped channelbag — correct for multi-object actions
+                slot = None
+                if (obj
+                        and hasattr(obj, 'animation_data')
+                        and obj.animation_data
+                        and hasattr(obj.animation_data, 'action_slot')):
+                    slot = obj.animation_data.action_slot
+                if slot is not None:
+                    # strip.channelbags is a plain collection — its .get() does
+                    # not accept a slot object (raises, doesn't return None).
+                    # The real lookup is the *singular* strip.channelbag(slot) method.
+                    try:
+                        cb = strip.channelbag(slot)
+                    except Exception:
+                        cb = None
+                    if cb:
+                        fcurves.extend(cb.fcurves)
+                        continue
+                # Fallback: collect from every channelbag on this strip
+                for cb in strip.channelbags:
+                    fcurves.extend(cb.fcurves)
+        return fcurves
+    # ── Legacy API (pre-4.4): fcurves directly on action ──────────────────
+    if hasattr(action, 'fcurves'):
+        return list(action.fcurves)
+    return []
+
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -357,55 +414,11 @@ class BlenderMCPServer:
 
     @staticmethod
     def _get_fcurves(action, obj=None):
-        """
-        Return a flat list of FCurves from an action, handling both the legacy
-        API (Blender < 4.4) and the new layered action API (Blender 4.4+).
-
-        Blender 4.4 removed the direct action.fcurves shortcut. FCurves now
-        live at: action.layers[n].strips[m] (type KEYFRAME) -> channelbag
-        scoped to an action slot -> channelbag.fcurves.
-
-        Strategy:
-          1. If Blender >= 4.4 and action has layers, iterate layers/strips/
-             channelbags. Try slot-scoped channelbag first (correct for
-             multi-object actions); fall back to all channelbags on the strip
-             if the slot isn't available.
-          2. Otherwise use the legacy action.fcurves list directly.
-          3. If neither exists, return [].
-        """
-        # ── Blender 4.4+ layered action API ───────────────────────────────────
-        if bpy.app.version >= (4, 4, 0) and hasattr(action, 'layers'):
-            fcurves = []
-            for layer in action.layers:
-                for strip in layer.strips:
-                    if strip.type != 'KEYFRAME':
-                        continue
-                    # Prefer slot-scoped channelbag — correct for multi-object actions
-                    slot = None
-                    if (obj
-                            and hasattr(obj, 'animation_data')
-                            and obj.animation_data
-                            and hasattr(obj.animation_data, 'action_slot')):
-                        slot = obj.animation_data.action_slot
-                    if slot is not None:
-                        # FIX: strip.channelbags is a plain collection — its .get()
-                        # does not accept a slot object (raises, doesn't return None).
-                        # The real lookup is the *singular* strip.channelbag(slot) method.
-                        try:
-                            cb = strip.channelbag(slot)
-                        except Exception:
-                            cb = None
-                        if cb:
-                            fcurves.extend(cb.fcurves)
-                            continue
-                    # Fallback: collect from every channelbag on this strip
-                    for cb in strip.channelbags:
-                        fcurves.extend(cb.fcurves)
-            return fcurves
-        # ── Legacy API (pre-4.4): fcurves directly on action ──────────────────
-        if hasattr(action, 'fcurves'):
-            return list(action.fcurves)
-        return []
+        """Delegates to module-level get_action_fcurves() — see that function
+        for the Blender 4.4+ layered-action compatibility logic. Kept as a
+        method here only so existing self._get_fcurves(...) call sites don't
+        need touching."""
+        return get_action_fcurves(action, obj)
 
     @staticmethod
     def _build_bmesh_from_object(obj):
@@ -702,6 +715,10 @@ class BlenderMCPServer:
                 if node.type == 'TEX_IMAGE' and node.image:
                     n["image"] = node.image.name
                     n["colorspace"] = node.image.colorspace_settings.name
+                    # Real filesystem path — needed for portable exchange formats
+                    # (MaterialX/USD) that reference textures by file path, not
+                    # Blender's internal datablock name.
+                    n["filepath"] = bpy.path.abspath(node.image.filepath) if node.image.filepath else None
                 # FIX: detect normal map direction for UE5 compatibility
                 if node.type == 'NORMAL_MAP':
                     n["normal_space"] = node.space  # 'TANGENT', 'OBJECT', etc.
@@ -4125,32 +4142,73 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             layout.label(text=f"Running on port {scene.blendermcp_port}")
 
 
+def _resolve_armature(obj):
+    """Find the armature that actually drives this object's animation:
+    the object itself if it's an armature, else an Armature-modifier target,
+    else a parent armature. Actions live on the armature, not the mesh."""
+    if obj is None:
+        return None
+    if obj.type == 'ARMATURE':
+        return obj
+    for mod in getattr(obj, "modifiers", []):
+        if mod.type == 'ARMATURE' and mod.object is not None:
+            return mod.object
+    parent = obj.parent
+    if parent is not None and parent.type == 'ARMATURE':
+        return parent
+    return None
+
+
+def _action_compatible_with_armature(action, armature_obj):
+    """An action belongs to this armature if its fcurves target bones that
+    actually exist on it — real compatibility, not a name-substring guess."""
+    bone_names = {b.name for b in armature_obj.data.bones}
+    if not bone_names:
+        return False
+    for fcurve in get_action_fcurves(action, armature_obj):
+        data_path = fcurve.data_path
+        if data_path.startswith('pose.bones["'):
+            bone_name = data_path.split('"')[1]
+            if bone_name in bone_names:
+                return True
+    return False
+
+
 class BLENDERMCP_OT_PlayAnimation(bpy.types.Operator):
-    """Assign this action to the active object and start playback"""
+    """Assign this action to the driving armature and start playback"""
     bl_idname = "blendermcp.play_animation"
     bl_label = "Play Animation"
     action_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        obj = context.active_object
+        arm = _resolve_armature(context.active_object)
         action = bpy.data.actions.get(self.action_name)
-        if not obj:
-            self.report({'ERROR'}, "No active object")
+        if not arm:
+            self.report({'ERROR'}, "No armature found for active object")
             return {'CANCELLED'}
         if not action:
             self.report({'ERROR'}, f"Action '{self.action_name}' not found")
             return {'CANCELLED'}
-        if not obj.animation_data:
-            obj.animation_data_create()
-        obj.animation_data.action = action
-        context.scene.frame_set(int(action.frame_range[0]))
+        if not arm.animation_data:
+            arm.animation_data_create()
+        arm.animation_data.action = action
+
+        # Scene playback range must match THIS action's range, or switching
+        # to a longer/shorter clip gets clipped by whatever range was left
+        # over from the previously played action.
+        start = int(action.frame_range[0])
+        end = int(action.frame_range[1]) + (1 if action.frame_range[1] % 1 else 0)
+        context.scene.frame_start = start
+        context.scene.frame_end = end
+        context.scene.frame_set(start)
+
         if context.screen and not context.screen.is_animation_playing:
             bpy.ops.screen.animation_play()
         return {'FINISHED'}
 
 
 class BLENDERMCP_PT_AnimPanel(bpy.types.Panel):
-    """Auto-populated list of animations for the active object, with quick playback"""
+    """Auto-populated list of animations for the active object's armature, with quick playback"""
     bl_label = "Animations"
     bl_idname = "BLENDERMCP_PT_AnimPanel"
     bl_space_type = 'VIEW_3D'
@@ -4165,12 +4223,18 @@ class BLENDERMCP_PT_AnimPanel(bpy.types.Panel):
             layout.label(text="No active object", icon='INFO')
             return
 
-        layout.label(text=f"For: {obj.name}")
+        arm = _resolve_armature(obj)
+        if not arm:
+            layout.label(text=f"For: {obj.name}")
+            layout.label(text="No armature found", icon='INFO')
+            return
 
-        # Match actions by name (Blender's default auto-naming embeds the object
-        # name, e.g. "ZombieRigAction.002") plus whatever is currently assigned.
-        matches = [a for a in bpy.data.actions if obj.name.lower() in a.name.lower()]
-        current = obj.animation_data.action if obj.animation_data else None
+        layout.label(text=f"For: {arm.name}" + (f" (via {obj.name})" if obj is not arm else ""))
+
+        # Match actions by real bone-fcurve compatibility with this armature,
+        # not by name substring — action names don't have to embed the rig's name.
+        matches = [a for a in bpy.data.actions if _action_compatible_with_armature(a, arm)]
+        current = arm.animation_data.action if arm.animation_data else None
         if current and current not in matches:
             matches.append(current)
 

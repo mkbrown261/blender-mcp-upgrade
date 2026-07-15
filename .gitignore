@@ -36,6 +36,12 @@ lerna-debug.log*
 .blender_mcp_session.json
 studio_profile.json
 
+# Production knowledge base — local-only by default so it never gets
+# pushed to a shared repo without a deliberate decision to do so. Can be
+# manually un-ignored later if you decide to share it with collaborators.
+.blender_mcp_knowledge.json
+.blender_mcp_recipes.json
+
 # World asset manifests — these belong next to the user's .blend files,
 # NOT in this repo. Every user has their own world/assets.
 *_master_manifest.json
