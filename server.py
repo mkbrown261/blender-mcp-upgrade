@@ -4466,6 +4466,37 @@ print(__import__('json').dumps(result))
     return data
 
 
+def _capture_plain_screenshot(object_name: str) -> Optional[Image]:
+    """Select+activate object_name and capture a plain FRONT-view screenshot
+    as a FastMCP Image, no problem-marker annotation (unlike auto_repair_mesh's
+    version — a rust/wear diff has no ngon/non-manifold/pole clusters to
+    burn in). Used to force visual before/after proof into a tool's own
+    result instead of depending on someone remembering to take a screenshot
+    afterward (see: the black-arms and black-spots incidents, both only
+    caught because a screenshot happened to get taken). Returns None on any
+    failure — screenshots are supplementary, never load-bearing."""
+    try:
+        select_script = f"""
+import bpy
+obj = bpy.data.objects.get({repr(object_name)})
+if obj is None:
+    raise ValueError("Object not found: {object_name}")
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+print("active:set")
+"""
+        result = _send_raw("execute_code_safe", code=select_script, required_mode="OBJECT", push_undo=False)
+        if "error" in result:
+            return None
+        screenshot_bytes = _capture_single_front_view(object_name)
+        if not screenshot_bytes:
+            return None
+        return Image(data=screenshot_bytes, format="png")
+    except Exception as e:
+        logger.warning(f"_capture_plain_screenshot({object_name}): {e}")
+        return None
+
+
 @mcp.tool()
 def get_spatial_analysis(object_name: str, deep: bool = False) -> list:
     """
@@ -5667,11 +5698,20 @@ def apply_weathering_recipe(
     metal_floor: float = 0.25,
     material_category: Optional[str] = None,
     fray_roughness: float = 0.95,
-) -> str:
+) -> list:
     """
     APPLY WEATHERING — generates real rust/edge-wear shader nodes on an
     object's materials. MODIFIES the material(s) — call create_checkpoint()
     first, this is generative, not reversible via a simple metric diff.
+
+    Returns a list: [before_image?, after_image?, result_json_string] —
+    before/after FRONT-view screenshots are included whenever at least one
+    material was actually weathered (skipped on a no-op/error/all-skipped
+    call), so visual proof travels with the result instead of depending on
+    a follow-up screenshot someone has to remember to take (real incidents
+    tonight — black arms, black spots — were only caught because a
+    screenshot happened to get taken afterward). The JSON result is always
+    the LAST element; parse it with json.loads(result[-1]).
 
     Material-aware in TWO ways, both driven by real sampled data per material,
     not one flat setting for the whole object:
@@ -6165,10 +6205,15 @@ else:
    .replace("{FORCEDCATEGORY}", str(material_category or "")) \
    .replace("{FRAYROUGH}", str(fray_roughness))
 
+    # Captured before the mutation runs, unconditionally — cheap Blender-side
+    # render, only actually RETURNED (and so only costs response payload)
+    # if something ends up being weathered below.
+    _before_image = _capture_plain_screenshot(object_name)
+
     try:
         raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
         if "error" in raw:
-            return json.dumps({"error": raw["error"]})
+            return [json.dumps({"error": raw["error"]})]
         output = raw.get("result", "")
         for line in output.strip().splitlines():
             line = line.strip()
@@ -6202,11 +6247,19 @@ else:
                     if handoffs:
                         parsed["dna_verification"] = {"needs_baking": handoffs}
 
-                return json.dumps(parsed, indent=2)
-        return json.dumps({"error": "No JSON output from apply_weathering_recipe", "raw": output})
+                out = []
+                if applied_names:
+                    after_image = _capture_plain_screenshot(object_name)
+                    if _before_image:
+                        out.append(_before_image)
+                    if after_image:
+                        out.append(after_image)
+                out.append(json.dumps(parsed, indent=2))
+                return out
+        return [json.dumps({"error": "No JSON output from apply_weathering_recipe", "raw": output})]
     except Exception as e:
         logger.error(f"Error in apply_weathering_recipe: {e}")
-        return json.dumps({"error": str(e)})
+        return [json.dumps({"error": str(e)})]
 
 
 @mcp.tool()
@@ -6218,7 +6271,7 @@ def bake_weathered_textures(
     bake_roughness: Optional[bool] = None,
     rewire_to_baked: bool = True,
     force: bool = False,
-) -> str:
+) -> list:
     """
     BAKE TO TEXTURE — closes the gap between "looks right in Blender" and
     "survives export." Everything apply_weathering_recipe/export_material_as_
@@ -6228,6 +6281,15 @@ def bake_weathered_textures(
     portable PNG files via the Emission-trick (routes the property's current
     source through an Emission shader and bakes with type='EMIT', capturing
     node values directly regardless of scene lighting).
+
+    Returns a list: [before_image?, after_image?, result_json_string] —
+    before/after FRONT-view screenshots are included whenever at least one
+    channel was actually baked (skipped on a no-op/error/gate-refused call),
+    same convention as apply_weathering_recipe and auto_repair_mesh — visual
+    proof travels with the result instead of depending on a follow-up
+    screenshot (real incident: KB-006's black bake artifacts were only
+    caught because a screenshot happened to get taken afterward). The JSON
+    result is always the LAST element; parse it with json.loads(result[-1]).
 
     Handles two real failure modes this session hit live, not hypothetically:
     - Blender's bake operator validates EVERY material on the object, not
@@ -6271,7 +6333,7 @@ def bake_weathered_textures(
     nm_edges = dna_before.get("geometry", {}).get("non_manifold_edges") or 0
     bd_edges = dna_before.get("geometry", {}).get("boundary_edges") or 0
     if (nm_edges or bd_edges) and not force:
-        return json.dumps({
+        return [json.dumps({
             "error": "Refusing to bake onto unrepaired topology.",
             "non_manifold_edges": nm_edges,
             "boundary_edges": bd_edges,
@@ -6280,7 +6342,7 @@ def bake_weathered_textures(
                    "some texels) — a real, previously-hit incident (KB-006), not theoretical.",
             "fix": "Run auto_repair_mesh(object_name) first, or if the remaining topology "
                    "issue is acceptable for this asset, call again with force=True.",
-        })
+        })]
 
     if bake_roughness is None:
         bake_roughness = "Roughness" in mat_before.get("missing_maps", [])
@@ -6498,10 +6560,14 @@ else:
    .replace("{BAKEROUGH}", str(bake_roughness)) \
    .replace("{REWIRE}", str(rewire_to_baked))
 
+    # Captured before the bake runs, unconditionally — cheap Blender-side
+    # render, only actually RETURNED if something ends up getting baked.
+    _before_image = _capture_plain_screenshot(object_name)
+
     try:
         raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
         if "error" in raw:
-            return json.dumps({"error": raw["error"]})
+            return [json.dumps({"error": raw["error"]})]
         output = raw.get("result", "")
         for line in output.strip().splitlines():
             line = line.strip()
@@ -6557,11 +6623,20 @@ else:
                         "auto_repair_mesh before re-baking."
                     ) if bake_artifact else None,
                 }
-                return json.dumps(parsed, indent=2)
-        return json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})
+
+                out = []
+                if parsed.get("baked"):
+                    after_image = _capture_plain_screenshot(object_name)
+                    if _before_image:
+                        out.append(_before_image)
+                    if after_image:
+                        out.append(after_image)
+                out.append(json.dumps(parsed, indent=2))
+                return out
+        return [json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})]
     except Exception as e:
         logger.error(f"Error in bake_weathered_textures: {e}")
-        return json.dumps({"error": str(e)})
+        return [json.dumps({"error": str(e)})]
 
 
 def _write_materialx_document(material_name: str, properties: dict, output_path: str) -> dict:

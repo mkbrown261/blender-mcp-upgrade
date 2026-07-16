@@ -56,12 +56,16 @@ def make_fake_send_raw(captured):
 
 server._RECIPES = []
 server._save_recipes = lambda: None
+# apply_weathering_recipe now returns [before_image?, after_image?, json_str] —
+# screenshot capture needs a real Blender connection, irrelevant to these
+# script-generation/dispatch tests, so stub it out for the whole file.
+server._capture_plain_screenshot = lambda name: None
 
 # ── Script structure ─────────────────────────────────────────────────────────
 captured = {}
 server._send_raw = make_fake_send_raw(captured)
 server._SNAPSHOTS.clear()
-result = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+result = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M")[-1])
 code = captured["code"]
 
 check("tool call succeeds", "error" not in result)

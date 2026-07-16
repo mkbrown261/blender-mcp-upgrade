@@ -18,6 +18,11 @@ import sys, os, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import server
 
+# bake_weathered_textures and apply_weathering_recipe now return
+# [before_image?, after_image?, json_str] — screenshot capture needs a real
+# Blender connection, irrelevant to these logic tests, so stub it out.
+server._capture_plain_screenshot = lambda name: None
+
 failures = []
 
 
@@ -75,7 +80,7 @@ server._send_raw = make_bake_fake(
 server._SNAPSHOTS.clear()
 result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("bake_roughness left unset infers True when Roughness is in missing_maps (DNA-informed default)",
       "Roughness" in ["Base Color", "Roughness", "Normal"])  # sanity on the fixture itself
 check("dna_verification.base_color_confirmed is True once missing_maps no longer contains Base Color",
@@ -92,7 +97,7 @@ server._send_raw = make_bake_fake(
 server._SNAPSHOTS.clear()
 result_unconfirmed = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("dna_verification reports False (not True) when the gap demonstrably did not close",
       result_unconfirmed.get("dna_verification", {}).get("base_color_confirmed") is False)
 
@@ -330,7 +335,7 @@ server._send_raw = make_weathering_fake(
     materials_applied=[{"material": "M"}],
 )
 server._SNAPSHOTS.clear()
-result = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+result = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M")[-1])
 check("apply_weathering_recipe attaches a needs_baking handoff when weathering left the material non-texture-fed",
       result.get("dna_verification", {}).get("needs_baking", {}).get("M", {}).get("now_procedural")
       == ["Base Color", "Roughness"])
@@ -339,13 +344,13 @@ check("the handoff explicitly names bake_weathered_textures as the next step",
 
 server._send_raw = make_weathering_fake(missing_maps_after=[], materials_applied=[{"material": "M"}])
 server._SNAPSHOTS.clear()
-result_clean = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+result_clean = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M")[-1])
 check("no handoff is attached when the material stayed texture-fed after weathering",
       "dna_verification" not in result_clean)
 
 server._send_raw = make_weathering_fake(missing_maps_after=["Base Color"], materials_applied=[])
 server._SNAPSHOTS.clear()
-result_skipped = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+result_skipped = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M")[-1])
 check("no handoff (and no DNA re-check at all) when no material was actually weathered",
       "dna_verification" not in result_skipped)
 

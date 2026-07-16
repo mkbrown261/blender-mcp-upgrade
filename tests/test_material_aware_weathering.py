@@ -37,10 +37,11 @@ def fake_send_raw(cmd, **kwargs):
 
 
 server._send_raw = fake_send_raw
+server._capture_plain_screenshot = lambda name: None
 
 result = json.loads(server.apply_weathering_recipe(
     object_name="X", wear_scalar=1.0, metal_floor=0.3,
-))
+)[-1])
 check("tool call succeeds with metal_floor param", "error" not in result)
 
 code = captured["code"]

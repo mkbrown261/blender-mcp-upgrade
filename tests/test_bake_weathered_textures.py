@@ -27,6 +27,10 @@ def check(name, condition):
 
 captured = {}
 original_send_raw = server._send_raw
+# bake_weathered_textures now returns [before_image?, after_image?, json_str] —
+# screenshot capture needs a real Blender connection, irrelevant to these
+# script-generation/logic tests, so stub it out for the whole file.
+server._capture_plain_screenshot = lambda name: None
 
 # bake_weathered_textures now calls _reaffirm_dna() (get_asset_dna) both
 # before (to infer bake_roughness) and after (to verify the bake actually
@@ -67,7 +71,7 @@ server._send_raw = fake_send_raw
 
 result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 code = captured["code"]
 
 check("tool call succeeds", "error" not in result)
@@ -144,7 +148,7 @@ server._send_raw = make_stats_fake(roughness_stdev=0.0)
 server._SNAPSHOTS.clear()
 flat_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("a zero-variance bake is flagged in suspiciously_flat_bakes",
       "roughness" in flat_result.get("dna_verification", {}).get("suspiciously_flat_bakes", []))
 check("a zero-variance bake carries a human-readable warning, not just a silent flag",
@@ -154,7 +158,7 @@ server._send_raw = make_stats_fake(roughness_stdev=0.15)
 server._SNAPSHOTS.clear()
 healthy_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("a normal-variance bake is NOT flagged as suspiciously flat",
       healthy_result.get("dna_verification", {}).get("suspiciously_flat_bakes") == [])
 check("a normal-variance bake carries no flat_bake_warning",
@@ -196,7 +200,7 @@ server._send_raw = make_broken_topo_fake(calls)
 server._SNAPSHOTS.clear()
 blocked_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("bake_weathered_textures refuses to run on unrepaired non-manifold/boundary topology",
       "error" in blocked_result and blocked_result.get("non_manifold_edges") == 33)
 check("the refusal names KB-006 / explains why, not just 'error'",
@@ -230,7 +234,7 @@ server._send_raw = make_broken_topo_forced_fake()
 server._SNAPSHOTS.clear()
 forced_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024, force=True,
-))
+)[-1])
 check("force=True bypasses the gate and lets the real bake script run",
       "error" not in forced_result)
 
@@ -238,7 +242,7 @@ server._send_raw = fake_send_raw
 server._SNAPSHOTS.clear()
 clean_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("clean topology (0 non-manifold, 0 boundary edges) never triggers the gate",
       "error" not in clean_result or "topology" not in clean_result.get("error", "").lower())
 
@@ -275,7 +279,7 @@ server._send_raw = make_black_artifact_fake(baked_pct=33.9, source_pct=15.2)
 server._SNAPSHOTS.clear()
 artifact_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("a bake with +10pts more near-black content than its source is flagged",
       artifact_result.get("dna_verification", {}).get("bake_introduced_black_artifact") is True)
 check("the black-artifact flag carries a human-readable warning with the real numbers",
@@ -286,7 +290,7 @@ server._send_raw = make_black_artifact_fake(baked_pct=16.0, source_pct=15.2)
 server._SNAPSHOTS.clear()
 no_artifact_result = json.loads(server.bake_weathered_textures(
     object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
-))
+)[-1])
 check("a small, normal difference from source is NOT flagged as an artifact",
       no_artifact_result.get("dna_verification", {}).get("bake_introduced_black_artifact") is False)
 

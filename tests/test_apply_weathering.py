@@ -36,6 +36,10 @@ def fake_send_raw(cmd, **kwargs):
 
 
 server._send_raw = fake_send_raw
+# apply_weathering_recipe now returns [before_image?, after_image?, json_str] —
+# screenshot capture needs a real Blender connection, irrelevant to this
+# script-generation test, so stub it out directly.
+server._capture_plain_screenshot = lambda name: None
 
 result = json.loads(server.apply_weathering_recipe(
     object_name="Test'Object",  # apostrophe deliberately, to check escaping
@@ -43,7 +47,7 @@ result = json.loads(server.apply_weathering_recipe(
     wear_scalar=1.2,
     rust_color=[0.5, 0.2, 0.1],
     worn_roughness=0.95,
-))
+)[-1])
 
 check("tool returns without error on normal params", "error" not in result)
 
