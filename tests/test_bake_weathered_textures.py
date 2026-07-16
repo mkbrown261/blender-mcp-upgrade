@@ -28,12 +28,38 @@ def check(name, condition):
 captured = {}
 original_send_raw = server._send_raw
 
+# bake_weathered_textures now calls _reaffirm_dna() (get_asset_dna) both
+# before (to infer bake_roughness) and after (to verify the bake actually
+# closed the gap) — stub the raw commands that feeds so DNA assembly doesn't
+# hit a real Blender connection or crash the test.
+_DNA_RAW = {
+    "get_mesh_quality_report": {"counts": {"verts": 100, "edges": 200, "faces": 100},
+                                 "uv": {"has_uvs": True, "layer_count": 1}, "modifiers": []},
+    "analyze_topology": {"topology_score": 90, "stats": {}},
+    "run_unreal_readiness_check": {"checks": {}},
+    "get_object_info": {"name": "X", "materials": ["M"]},
+}
+
 
 def fake_send_raw(cmd, **kwargs):
+    if cmd in _DNA_RAW:
+        return _DNA_RAW[cmd]
     if cmd == "execute_code_safe":
-        captured["code"] = kwargs["code"]
-        return {"result": '{"baked": {}, "errors": [], "rewired": false, '
-                           '"broken_images_worked_around": []}'}
+        code = kwargs["code"]
+        if "original_surface_link" in code:
+            # this is the real bake script — the one this test inspects
+            captured["code"] = code
+            return {"result": '{"baked": {}, "errors": [], "rewired": false, '
+                               '"broken_images_worked_around": []}'}
+        if "has_principled" in code:
+            # DNA's PBR socket scan
+            return {"result": json.dumps([{
+                "name": "M", "has_principled": True, "texture_fed": [],
+                "missing_maps": ["Base Color", "Roughness", "Metallic", "Normal"],
+            }])}
+        if "filepath_raw" in code:
+            # missing-normal-map handoff export — nothing to export in this test
+            return {"result": json.dumps({"path": None})}
     return original_send_raw(cmd, **kwargs)
 
 

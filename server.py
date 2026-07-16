@@ -32,6 +32,7 @@ import re
 import socket
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -606,6 +607,19 @@ _load_recipes()
 
 _SNAPSHOTS: dict = {}   # { object_name: { ...mesh stats... , "_timestamp": str } }
 
+
+def _invalidate_dna_cache(object_name: str = None):
+    """Drop cached Asset DNA raw fetches (see get_asset_dna()). Called by every
+    mutating tool, eagerly before the mutation is attempted, so a failed or
+    partial mutation can never leave a stale-but-trusted cache behind — same
+    class of bug as KB-006 (a tool trusting stale state after a mutation)."""
+    if object_name is None:
+        for snap in _SNAPSHOTS.values():
+            snap.pop("_dna_raw", None)
+    else:
+        _SNAPSHOTS.get(object_name, {}).pop("_dna_raw", None)
+
+
 # Visual before/after snapshots for auto_repair_mesh (Tier 1c).
 # { object_name: { "before": <PNG bytes>, "after": <PNG bytes>, "timestamp": str } }
 # NOT persisted — per-session only.
@@ -764,6 +778,116 @@ def _get_active_playbook() -> Optional[dict]:
     """Return the active playbook dict, or None if none is set."""
     key = _session_get("active_playbook")
     return _PLAYBOOKS.get(key) if key else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION RULES ENGINE — deterministic, zero-LLM-cost recommendations.
+# Each rule reasons against Asset DNA (see get_asset_dna()), never invents a
+# category or confidence — only fires on measured fields or real session state
+# (active_playbook). Predicates must be pure and never raise; missing fields
+# read as falsy via .get() so a partial DNA dict just skips the rule.
+# ─────────────────────────────────────────────────────────────────────────────
+_PRODUCTION_RULES: list = [
+    {
+        "id": "high_poly_nanite",
+        "severity": "info",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("polygon_count", 0) > 250_000
+            and dna.get("target_engine") == "unreal"
+        ),
+        "recommendation": "Use Nanite for this mesh — skip manual retopo and skip generating LODs.",
+        "why": "Above ~250k polygons, UE5 Nanite virtualized geometry handles the density directly. "
+               "Manual retopo/LOD work at this budget is wasted effort for a Nanite-eligible static mesh.",
+    },
+    {
+        "id": "topology_below_playbook_min",
+        "severity": "warning",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("category")
+            and dna.get("geometry", {}).get("topology_score") is not None
+            and dna["geometry"]["topology_score"] < _PLAYBOOKS.get(dna["identity"]["category"], {}).get("topology_score_min", 0)
+        ),
+        "recommendation": "Retopologize before continuing — topology score is below this playbook's minimum.",
+        "why": "The active playbook sets a topology_score_min for this asset category; scores below it "
+               "predict deformation/shading problems downstream (see _reason_topology).",
+    },
+    {
+        "id": "over_vert_budget",
+        "severity": "warning",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("category")
+            and dna.get("identity", {}).get("vertex_count", 0) > _PLAYBOOKS.get(dna["identity"]["category"], {}).get("vert_budget", float("inf"))
+        ),
+        "recommendation": "Decimate before export — vertex count exceeds this playbook's budget.",
+        "why": "Each playbook sets a vert_budget for its asset category based on real-time performance "
+               "targets for that class of asset.",
+    },
+    {
+        "id": "missing_lightmap_uv",
+        "severity": "warning",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("category")
+            and _PLAYBOOKS.get(dna["identity"]["category"], {}).get("uv_channels", 1) >= 2
+            and not dna.get("geometry", {}).get("lightmap_uv_present", False)
+        ),
+        "recommendation": "Add a dedicated lightmap UV channel (UV1) before export.",
+        "why": "This playbook requires 2 UV channels. Without a non-overlapping UV1, Lightmass/Lumen "
+               "baking fails or produces shadow bleeding.",
+    },
+    {
+        "id": "missing_pbr_maps",
+        "severity": "info",
+        "predicate": lambda dna: any(
+            m.get("missing_maps") for m in dna.get("materials", [])
+        ),
+        "recommendation": "Generate or bake the missing PBR maps before hand-texturing — check materials[].missing_maps.",
+        "why": "One or more materials rely on constant values instead of textures for at least one "
+               "PBR channel. Constant channels can't carry surface detail (wear, grime, variation).",
+    },
+    {
+        "id": "character_no_rig",
+        "severity": "critical",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("category") in ("hero_char", "creature")
+            and not dna.get("identity", {}).get("has_armature", False)
+        ),
+        "recommendation": "This asset needs a rig before it can move into the animation pipeline.",
+        "why": "hero_char and creature playbooks assume a skinned armature. No armature means no "
+               "animation is possible in its current state.",
+    },
+    {
+        "id": "no_collision_mesh_prop",
+        "severity": "info",
+        "predicate": lambda dna: (
+            dna.get("identity", {}).get("category") in ("env_prop", "weapon")
+            and dna.get("target_engine") == "unreal"
+            and not dna.get("production", {}).get("collision_mesh_present", False)
+        ),
+        "recommendation": "No collision mesh found — ask the user before generating one "
+                           "(many teams build collision in-engine; do not auto-generate).",
+        "why": "env_prop/weapon assets typically need collision before they're usable in level design, "
+               "but collision generation is gated behind explicit user approval in this project.",
+    },
+]
+
+
+def _evaluate_production_rules(dna: dict) -> list:
+    """Run every production rule's predicate against an assembled Asset DNA dict.
+    Pure Python, no network/LLM cost. A raising predicate is treated as 'did not fire'
+    rather than aborting the whole evaluation."""
+    fired = []
+    for rule in _PRODUCTION_RULES:
+        try:
+            if rule["predicate"](dna):
+                fired.append({
+                    "id": rule["id"],
+                    "severity": rule["severity"],
+                    "recommendation": rule["recommendation"],
+                    "why": rule["why"],
+                })
+        except Exception:
+            continue
+    return fired
 
 
 def get_blender_connection() -> BlenderConnection:
@@ -2582,6 +2706,7 @@ def restore_checkpoint(label_or_path: str) -> str:
     label_or_path: a checkpoint's label (most recent match wins) or an exact
     filepath from list_checkpoints().
     """
+    _invalidate_dna_cache()  # scene-wide — every object's state may have changed
     try:
         checkpoints = _SESSION.get("checkpoints", [])
         target = next((cp for cp in checkpoints if cp["filepath"] == label_or_path), None)
@@ -3116,6 +3241,8 @@ def close_boundary_holes(object_name: str, dry_run: bool = True) -> str:
     is a judgment call (genuine hole vs. intentional open-shell geometry).
     dry_run=True (default): preview only. dry_run=False: executes + re-scans.
     """
+    if not dry_run:
+        _invalidate_dna_cache(object_name)
     script = r"""
 import bpy, bmesh, json
 
@@ -3222,6 +3349,16 @@ else:
                         "ngons":              fresh_topo.get("stats", {}).get("ngons", 0) if "error" not in fresh_topo else None,
                         "topology_score":     fresh_topo.get("topology_score", 0) if "error" not in fresh_topo else None,
                         "topology_rating":    fresh_topo.get("rating", "unknown") if "error" not in fresh_topo else None,
+                    }
+                    # Reuse this scan's own boundary_edges reading rather than
+                    # a second, heavier DNA fetch just for one field — same
+                    # ground truth, no redundant round-trip.
+                    before = result.get("boundary_edges_before", 0)
+                    after  = result["after_scan"]["boundary_edges"]
+                    result["dna_verification"] = {
+                        "boundary_edges_before": before,
+                        "boundary_edges_after":  after,
+                        "confirmed": after < before,
                     }
                 _session_append("verified_checks", "close_boundary_holes")
                 return json.dumps(result, indent=2, default=str)
@@ -4873,6 +5010,7 @@ def download_polyhaven_asset(
 @mcp.tool()
 def set_texture(object_name: str, texture_id: str) -> str:
     """Apply a previously downloaded PolyHaven texture to an object."""
+    _invalidate_dna_cache(object_name)
     try:
         result = get_blender_connection().send_command(
             "set_texture", {"object_name": object_name, "texture_id": texture_id}
@@ -5565,6 +5703,7 @@ def apply_weathering_recipe(
     defaults (5/40) worked on the tested case; a mesh with very few sharp
     features may need a lower "low" percentile.
     """
+    _invalidate_dna_cache(object_name)
 
     recipe_info = {}
     if wear_scalar is None:
@@ -5856,7 +5995,7 @@ def bake_weathered_textures(
     material_name: str,
     output_dir: str,
     resolution: int = 2048,
-    bake_roughness: bool = True,
+    bake_roughness: Optional[bool] = None,
     rewire_to_baked: bool = True,
 ) -> str:
     """
@@ -5885,7 +6024,23 @@ def bake_weathered_textures(
     the new baked textures instead of the procedural chain, making the
     material genuinely export-ready — not just previewable in Blender.
     Requires the object to already have a UV map (it will).
+
+    bake_roughness: pass True/False to force it. Left at its default (None),
+    it's inferred from Asset DNA — True if this material's Roughness socket
+    isn't texture-fed (get_asset_dna's missing_maps), meaning it's still
+    procedural/constant and worth baking; False if it's already a real
+    texture, to skip redundant work. An explicit value always wins over the
+    inferred one. After baking, re-checks DNA and reports whether Base
+    Color/Roughness actually stopped showing up as missing_maps — not just
+    that the bake operation didn't raise.
     """
+    _invalidate_dna_cache(object_name)
+    dna_before = _reaffirm_dna(object_name)
+    mat_before = next(
+        (m for m in dna_before.get("materials", []) if m.get("name") == material_name), {}
+    )
+    if bake_roughness is None:
+        bake_roughness = "Roughness" in mat_before.get("missing_maps", [])
     import os
     os.makedirs(output_dir, exist_ok=True)
     safe_mat_name = re.sub(r'[^A-Za-z0-9_-]', '_', material_name)
@@ -6061,7 +6216,19 @@ else:
         for line in output.strip().splitlines():
             line = line.strip()
             if line.startswith("{"):
-                return json.dumps(json.loads(line), indent=2)
+                parsed = json.loads(line)
+                dna_after = _reaffirm_dna(object_name)
+                mat_after = next(
+                    (m for m in dna_after.get("materials", []) if m.get("name") == material_name), {}
+                )
+                missing_after = mat_after.get("missing_maps", [])
+                parsed["dna_verification"] = {
+                    "base_color_confirmed": "base_color" in parsed.get("baked", {}) and "Base Color" not in missing_after,
+                    "roughness_confirmed": (
+                        ("Roughness" not in missing_after) if "roughness" in parsed.get("baked", {}) else None
+                    ),
+                }
+                return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})
     except Exception as e:
         logger.error(f"Error in bake_weathered_textures: {e}")
@@ -6143,6 +6310,7 @@ def generate_collision_mesh(object_name: str, collision_type: str = "convex") ->
     cheaper, looser fit). Creates a new object, hidden in the viewport by
     default (collision meshes aren't meant to be seen).
     """
+    _invalidate_dna_cache(object_name)  # changes production.collision_mesh_present
     script = r"""
 import bpy, json
 from mathutils import Vector
@@ -6213,7 +6381,12 @@ else:
         for line in output.strip().splitlines():
             line = line.strip()
             if line.startswith("{"):
-                return json.dumps(json.loads(line), indent=2)
+                parsed = json.loads(line)
+                dna_after = _reaffirm_dna(object_name)
+                parsed["dna_verification"] = {
+                    "collision_mesh_confirmed": dna_after.get("production", {}).get("collision_mesh_present", False),
+                }
+                return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from generate_collision_mesh", "raw": output})
     except Exception as e:
         logger.error(f"Error in generate_collision_mesh: {e}")
@@ -6229,6 +6402,211 @@ def get_session_log() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # AI TECHNICAL DIRECTOR LAYER (v2.2) — compound tools, auto-repair, critic
 # ─────────────────────────────────────────────────────────────────────────────
+
+_PBR_SOCKET_SCAN_SCRIPT = r"""
+import bpy, json
+obj = bpy.data.objects.get('{OBJECT_NAME}')
+result = []
+if obj is not None:
+    expected = ["Base Color", "Roughness", "Metallic", "Normal"]
+    for slot in obj.material_slots:
+        m = slot.material
+        if not m:
+            continue
+        entry = {"name": m.name, "has_principled": False, "texture_fed": [], "missing_maps": []}
+        if m.use_nodes and m.node_tree:
+            principled = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if principled:
+                entry["has_principled"] = True
+                for socket_name in expected:
+                    sock = principled.inputs.get(socket_name)
+                    is_textured = bool(sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE')
+                    if is_textured:
+                        entry["texture_fed"].append(socket_name)
+                    else:
+                        entry["missing_maps"].append(socket_name)
+        result.append(entry)
+print(json.dumps(result))
+"""
+
+_DNA_CACHE_TTL_SECONDS = 300  # defense in depth for mutations _invalidate_dna_cache
+                               # can't see (e.g. raw execute_code_safe scripts, or
+                               # edits made directly in the Blender UI)
+
+_TEXTURE_EXPORT_SCRIPT = r"""
+import bpy, json
+obj = bpy.data.objects.get('{OBJECT_NAME}')
+mat = bpy.data.materials.get('{MATERIAL_NAME}') if obj else None
+result = {"path": None}
+if mat and mat.use_nodes and mat.node_tree:
+    principled = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    sock = principled.inputs.get('{SOCKET_NAME}') if principled else None
+    if sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE':
+        img = sock.links[0].from_node.image
+        out_path = '{OUT_PATH}'
+        orig_format = img.file_format
+        img.filepath_raw = out_path
+        img.file_format = 'PNG'
+        img.save()
+        img.file_format = orig_format
+        result = {"path": out_path, "size": list(img.size)}
+print(json.dumps(result))
+"""
+
+_DNA_EXPORT_DIR = "/private/tmp/claude-501/-Users-masonbrown-Desktop-blender-mcp-upgrade-main/ca239516-0531-44e8-a988-5b54bd0895fe/scratchpad/textures"
+
+
+def _export_material_texture(object_name: str, material_name: str, socket_name: str, out_dir: str = _DNA_EXPORT_DIR) -> Optional[dict]:
+    """Save the TEX_IMAGE feeding `socket_name` on `material_name` to a PNG in
+    out_dir. Returns {"path", "size"} or None if the socket isn't texture-fed."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    safe_mat = re.sub(r'[^A-Za-z0-9_-]', '_', material_name)
+    safe_sock = re.sub(r'[^A-Za-z0-9_-]', '_', socket_name)
+    out_path = os.path.join(out_dir, f"{safe_mat}_{safe_sock}.png")
+    code = (
+        _TEXTURE_EXPORT_SCRIPT
+        .replace("{OBJECT_NAME}", object_name)
+        .replace("{MATERIAL_NAME}", material_name)
+        .replace("{SOCKET_NAME}", socket_name)
+        .replace("{OUT_PATH}", out_path)
+    )
+    result = _send_raw("execute_code_safe", code=code, required_mode="OBJECT", push_undo=False)
+    for line in str(result.get("result", "")).splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            parsed = json.loads(line)
+            return parsed if parsed.get("path") else None
+    return None
+
+
+@mcp.tool()
+def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh: bool = False) -> str:
+    """
+    COMPOUND TOOL — assembles one canonical ground-truth spec for an object:
+    measured geometry/UV/material facts plus deterministic production-rule
+    recommendations. No invented category/genre/confidence — identity.category
+    comes only from session_update(active_playbook=...) if set, never guessed.
+    Call this before recommending any workflow so every decision reasons
+    against the same facts instead of re-deriving them each time.
+
+    Raw fetches are cached per object and invalidated automatically by every
+    mutating tool (weathering, bake, repair, collision gen, checkpoint restore,
+    etc.) — see _invalidate_dna_cache(). A 300s TTL is a safety net for
+    mutations made outside this MCP (raw execute_code_safe scripts, direct
+    Blender UI edits) that the automatic hooks can't see. force_refresh=True
+    bypasses the cache entirely when you know something changed.
+    """
+    try:
+        cached = None if force_refresh else _SNAPSHOTS.get(object_name, {}).get("_dna_raw")
+        if cached and (time.time() - cached[0]) < _DNA_CACHE_TTL_SECONDS:
+            _, raw_quality, raw_topology, raw_ue5, raw_object, raw_materials, handoffs = cached
+        else:
+            raw_quality  = _send_raw("get_mesh_quality_report", name=object_name)
+            raw_topology = _send_raw("analyze_topology", name=object_name, context="generic")
+            raw_ue5      = _send_raw("run_unreal_readiness_check", name=object_name)
+            raw_object   = _send_raw("get_object_info", name=object_name)
+            pbr_code     = _PBR_SOCKET_SCAN_SCRIPT.replace("{OBJECT_NAME}", object_name)
+            pbr_result   = _send_raw("execute_code_safe", code=pbr_code, required_mode="OBJECT", push_undo=False)
+            raw_materials = []
+            for line in str(pbr_result.get("result", "")).splitlines():
+                line = line.strip()
+                if line.startswith("["):
+                    raw_materials = json.loads(line)
+                    break
+
+            # Missing-normal-map auto-handoff: computed once per fresh fetch
+            # (not on every cache hit — a cache hit means nothing about the
+            # material could have changed, so re-exporting would just be a
+            # redundant Blender round-trip), then cached alongside the raw
+            # bundle so the output shape is identical whether this call hit
+            # the cache or not.
+            handoffs = {}
+            for mat in raw_materials:
+                if "Normal" not in mat.get("missing_maps", []):
+                    continue
+                exported = _export_material_texture(object_name, mat["name"], "Base Color")
+                if exported:
+                    handoffs[mat["name"]] = {
+                        "export_path": exported["path"],
+                        "next_step": (
+                            "Generate a normal map from this Base Color texture at "
+                            "https://cpetry.github.io/NormalMap-Online/, then hand it "
+                            "back to rewire it into the material."
+                        ),
+                    }
+
+            _SNAPSHOTS.setdefault(object_name, {})["_dna_raw"] = (
+                time.time(), raw_quality, raw_topology, raw_ue5, raw_object, raw_materials, handoffs
+            )
+
+        if "error" in raw_quality:
+            return json.dumps({"error": raw_quality["error"]})
+
+        counts   = raw_quality.get("counts", {})
+        uv       = raw_quality.get("uv", {})
+        modifiers = raw_quality.get("modifiers", [])
+        has_armature = any(
+            isinstance(m, dict) and m.get("type") == "ARMATURE" for m in modifiers
+        )
+        checks = raw_ue5.get("checks", {})
+
+        category = _session_get("active_playbook")
+        playbook = _PLAYBOOKS.get(category) if category else None
+
+        dna = {
+            "object": object_name,
+            "target_engine": target_engine,
+            "identity": {
+                "category": category,  # real session state only — never guessed
+                "vertex_count": counts.get("verts", 0),
+                "edge_count": counts.get("edges", 0),
+                "polygon_count": counts.get("faces", 0),
+                "has_armature": has_armature,
+                "material_count": len(raw_object.get("materials", [])),
+            },
+            "geometry": {
+                "topology_score": raw_topology.get("topology_score"),
+                "quad_ratio_pct": raw_topology.get("stats", {}).get("quad_ratio_pct"),
+                "tris_pct": raw_topology.get("stats", {}).get("tris_pct"),
+                "ngon_count": raw_topology.get("stats", {}).get("ngons"),
+                "non_manifold_edges": raw_topology.get("stats", {}).get("non_manifold_edges"),
+                "boundary_edges": raw_topology.get("stats", {}).get("boundary_edges"),
+                "has_uvs": uv.get("has_uvs", False),
+                "uv_layer_count": uv.get("layer_count", 0),
+                "lightmap_uv_present": checks.get("lightmap_uv", {}).get("pass", False),
+            },
+            "materials": raw_materials,
+            "production": {
+                "rig_present": has_armature,
+                "lod_naming_present": checks.get("lod_naming", {}).get("pass", False),
+                "collision_mesh_present": checks.get("collision_mesh", {}).get("pass", False),
+                "playbook_vert_budget": playbook.get("vert_budget") if playbook else None,
+                "over_budget": (
+                    bool(playbook) and counts.get("verts", 0) > playbook.get("vert_budget", float("inf"))
+                ),
+            },
+        }
+        dna["rules_fired"] = _evaluate_production_rules(dna)
+
+        if handoffs:
+            for fired in dna["rules_fired"]:
+                if fired["id"] == "missing_pbr_maps":
+                    fired["handoff"] = handoffs
+
+        return json.dumps(dna, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Error in get_asset_dna: {e}")
+        return json.dumps({"error": str(e)})
+
+
+def _reaffirm_dna(object_name: str) -> dict:
+    """Force-refresh Asset DNA immediately after a mutation, for tools that
+    need to confirm their own effect rather than trust the operation succeeded
+    just because it didn't raise. Returns the parsed DNA dict (or {"error":...})."""
+    return json.loads(get_asset_dna(object_name, force_refresh=True))
+
 
 @mcp.tool()
 def analyze_mesh_for_unreal(name: str, topology_context: str = "generic", verbose: bool = False) -> str:
@@ -6383,6 +6761,8 @@ def auto_repair_mesh(name: str, dry_run: bool = False) -> list:
     Returns list: dry_run=True → [report]; dry_run=False → [before_image,
     after_image, report] — FRONT-view screenshots with problem markers burned in.
     """
+    if not dry_run:
+        _invalidate_dna_cache(name)
     try:
         blender = get_blender_connection()
 
@@ -6561,6 +6941,9 @@ if obj:
             "status":    status,
         }
 
+        nm_before = before_counts.get("non_manifold_edges", 0)
+        nm_after  = after_counts.get("non_manifold_edges", 0)
+
         report_dict = {
             "object": name,
             "status": status,
@@ -6568,6 +6951,11 @@ if obj:
             "repairs_attempted_no_effect": repairs_no_effect,
             "repair_errors": repair_errors,
             "issues_that_need_artist_review": needs_artist,
+            "dna_verification": {
+                "non_manifold_edges_before": nm_before,
+                "non_manifold_edges_after": nm_after,
+                "confirmed": nm_after <= nm_before,
+            },
             "summary": (
                 f"Repaired {len(repairs_executed)} issue(s): {', '.join(repairs_executed) or 'none'}. "
                 f"{len(repairs_no_effect)} repair(s) ran but had no measurable effect "
@@ -12158,6 +12546,7 @@ def execute_construction(scene_name: str, collection_name: str = "") -> str:
 
     Returns: placement results — what succeeded, what failed, total placed.
     """
+    _invalidate_dna_cache()  # places/moves multiple assets, not one tracked object
     global _CONSTRUCTION_STATE
     if scene_name not in _CONSTRUCTION_STATE:
         return json.dumps({
@@ -12223,6 +12612,7 @@ def adjust_asset(
     Use this instead of moving manually in Blender — keeps agent state in sync.
     scale_delta is additive (0.1 = +10%, -0.1 = -10%).
     """
+    _invalidate_dna_cache()  # instance_id, not a plain object name — clear broadly
     global _CONSTRUCTION_STATE
     if scene_name not in _CONSTRUCTION_STATE:
         return json.dumps({"error": f"No active construction scene '{scene_name}'"}, indent=2)
