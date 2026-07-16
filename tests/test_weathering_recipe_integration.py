@@ -38,12 +38,31 @@ server.record_creative_recipe(
 captured = {}
 original_send_raw = server._send_raw
 
+# apply_weathering_recipe now re-checks Asset DNA after applying (to offer a
+# bake_weathered_textures handoff when weathering left materials non-texture-
+# fed) — stub the raw commands that feeds so DNA assembly doesn't hit a real
+# Blender connection. Materials list has no missing_maps here, so the DNA
+# handoff path stays inert and these tests only need to not crash.
+_DNA_RAW = {
+    "get_mesh_quality_report": {"counts": {"verts": 100, "edges": 200, "faces": 100},
+                                 "uv": {"has_uvs": True, "layer_count": 1}, "modifiers": []},
+    "analyze_topology": {"topology_score": 90, "stats": {}},
+    "run_unreal_readiness_check": {"checks": {}},
+    "get_object_info": {"name": "X", "materials": ["M"]},
+}
+
 
 def fake_send_raw(cmd, **kwargs):
+    if cmd in _DNA_RAW:
+        return _DNA_RAW[cmd]
     if cmd == "execute_code_safe":
-        captured["code"] = kwargs["code"]
-        return {"result": '{"object": "X", "materials_applied": ["M"], "materials_skipped": [], '
-                           '"mask_stats": {}, "percentiles_used": {}}'}
+        code = kwargs["code"]
+        if "has_principled" in code:
+            return {"result": json.dumps([{"name": "M", "has_principled": True,
+                                            "texture_fed": ["Base Color"], "missing_maps": []}])}
+        captured["code"] = code
+        return {"result": '{"object": "X", "materials_applied": [{"material": "M"}], '
+                           '"materials_skipped": [], "mask_stats": {}, "percentiles_used": {}}'}
     return original_send_raw(cmd, **kwargs)
 
 

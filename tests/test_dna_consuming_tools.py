@@ -3,11 +3,15 @@
 # dependencies = ["mcp[cli]", "pillow", "MaterialX"]
 # ///
 """
-Verifies the 4 tools wired to Asset DNA this pass: DNA informs the parts of
-an action the caller didn't pin down explicitly (never whether the action
-happens — only how), and every one of them re-checks DNA afterward and
-reports honestly whether the specific gap it was trying to close actually
-closed, instead of trusting "no exception" as success.
+Verifies the 5 tools wired to Asset DNA: DNA informs the parts of an action
+the caller didn't pin down explicitly (never whether the action happens —
+only how), and every one of them re-checks DNA afterward and reports
+honestly whether the specific gap it was trying to close actually closed,
+instead of trusting "no exception" as success. apply_weathering_recipe is
+the odd one out — it doesn't take a DNA-informed default (its own live
+material inspection already covers that), it just proactively surfaces the
+bake_weathered_textures handoff when weathering leaves a material
+non-texture-fed.
 Run: uv run tests/test_dna_consuming_tools.py
 """
 import sys, os, json
@@ -293,6 +297,57 @@ check("a dry_run call does not attach dna_verification",
       "dna_verification" not in server.auto_repair_mesh(name="X", dry_run=True)[-1])
 
 server.get_blender_connection = original_get_connection
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. apply_weathering_recipe — proactively surfaces a bake_weathered_textures
+#    handoff when weathering left a material non-texture-fed, stays silent
+#    when it didn't, and never touches which materials get weathered (DNA
+#    only observes the result here, it doesn't steer the action).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def make_weathering_fake(missing_maps_after, materials_applied):
+    def fake(cmd, **kwargs):
+        if cmd in _DNA_RAW_BASE:
+            return _DNA_RAW_BASE[cmd]
+        if cmd == "execute_code_safe":
+            code = kwargs["code"]
+            if "has_principled" in code:
+                return {"result": json.dumps([{
+                    "name": "M", "has_principled": True, "texture_fed": [],
+                    "missing_maps": missing_maps_after,
+                }])}
+            return {"result": json.dumps({
+                "object": "X", "materials_applied": materials_applied,
+                "materials_skipped": [], "mask_stats": {}, "percentiles_used": {},
+            })}
+        raise AssertionError(f"unexpected command: {cmd}")
+    return fake
+
+
+server._send_raw = make_weathering_fake(
+    missing_maps_after=["Base Color", "Roughness"],
+    materials_applied=[{"material": "M"}],
+)
+server._SNAPSHOTS.clear()
+result = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+check("apply_weathering_recipe attaches a needs_baking handoff when weathering left the material non-texture-fed",
+      result.get("dna_verification", {}).get("needs_baking", {}).get("M", {}).get("now_procedural")
+      == ["Base Color", "Roughness"])
+check("the handoff explicitly names bake_weathered_textures as the next step",
+      "bake_weathered_textures" in result["dna_verification"]["needs_baking"]["M"]["next_step"])
+
+server._send_raw = make_weathering_fake(missing_maps_after=[], materials_applied=[{"material": "M"}])
+server._SNAPSHOTS.clear()
+result_clean = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+check("no handoff is attached when the material stayed texture-fed after weathering",
+      "dna_verification" not in result_clean)
+
+server._send_raw = make_weathering_fake(missing_maps_after=["Base Color"], materials_applied=[])
+server._SNAPSHOTS.clear()
+result_skipped = json.loads(server.apply_weathering_recipe(object_name="X", material_name="M"))
+check("no handoff (and no DNA re-check at all) when no material was actually weathered",
+      "dna_verification" not in result_skipped)
 
 
 print()

@@ -5702,6 +5702,12 @@ def apply_weathering_recipe(
     curvature distribution maps to full wear (low) vs. no wear (high) —
     defaults (5/40) worked on the tested case; a mesh with very few sharp
     features may need a lower "low" percentile.
+
+    After applying, re-checks Asset DNA: weathering rewires Base Color/
+    Roughness through a Mix node instead of a direct texture, so DNA will
+    correctly flag them as missing_maps. If it does, the result carries
+    dna_verification.needs_baking pointing at bake_weathered_textures —
+    closing the loop instead of leaving that gap to be discovered later.
     """
     _invalidate_dna_cache(object_name)
 
@@ -5982,6 +5988,31 @@ else:
                 parsed["wear_scalar_used"] = wear_scalar
                 if recipe_info:
                     parsed["recipe_lookup"] = recipe_info
+
+                # Weathering rewires Base Color/Roughness through a new Mix
+                # node reading the wear mask — they're no longer texture-fed,
+                # so Asset DNA will correctly start flagging them as
+                # missing_maps. Surface that proactively: the same handoff
+                # shape as the missing-normal-map case, pointing at the tool
+                # that actually closes this specific gap.
+                applied_names = [m["material"] for m in parsed.get("materials_applied", [])]
+                if applied_names:
+                    dna_after = _reaffirm_dna(object_name)
+                    handoffs = {}
+                    for mat in dna_after.get("materials", []):
+                        if mat["name"] in applied_names and mat.get("missing_maps"):
+                            handoffs[mat["name"]] = {
+                                "now_procedural": mat["missing_maps"],
+                                "next_step": (
+                                    "This weathering is live in Blender but won't survive FBX/UE5 "
+                                    "export as-is — run bake_weathered_textures(object_name, "
+                                    f"material_name='{mat['name']}', ...) to bake it into real "
+                                    "portable textures before export."
+                                ),
+                            }
+                    if handoffs:
+                        parsed["dna_verification"] = {"needs_baking": handoffs}
+
                 return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from apply_weathering_recipe", "raw": output})
     except Exception as e:
