@@ -6217,6 +6217,7 @@ def bake_weathered_textures(
     resolution: int = 2048,
     bake_roughness: Optional[bool] = None,
     rewire_to_baked: bool = True,
+    force: bool = False,
 ) -> str:
     """
     BAKE TO TEXTURE — closes the gap between "looks right in Blender" and
@@ -6253,12 +6254,34 @@ def bake_weathered_textures(
     inferred one. After baking, re-checks DNA and reports whether Base
     Color/Roughness actually stopped showing up as missing_maps — not just
     that the bake operation didn't raise.
+
+    Refuses to bake onto unrepaired non-manifold/boundary-edge topology
+    unless force=True (real incident: baking onto a mesh auto_repair_mesh
+    had already flagged production_ready: false produced genuine black-
+    texel artifacts — KB-006). force=True is for when a human has looked
+    at the topology and decided to bake anyway; it doesn't silence the
+    reason, just the block.
     """
     _invalidate_dna_cache(object_name)
     dna_before = _reaffirm_dna(object_name)
     mat_before = next(
         (m for m in dna_before.get("materials", []) if m.get("name") == material_name), {}
     )
+
+    nm_edges = dna_before.get("geometry", {}).get("non_manifold_edges") or 0
+    bd_edges = dna_before.get("geometry", {}).get("boundary_edges") or 0
+    if (nm_edges or bd_edges) and not force:
+        return json.dumps({
+            "error": "Refusing to bake onto unrepaired topology.",
+            "non_manifold_edges": nm_edges,
+            "boundary_edges": bd_edges,
+            "why": "Baking onto non-manifold/boundary-edge geometry can produce genuine "
+                   "black-texel artifacts (Cycles sampling the wrong or degenerate face at "
+                   "some texels) — a real, previously-hit incident (KB-006), not theoretical.",
+            "fix": "Run auto_repair_mesh(object_name) first, or if the remaining topology "
+                   "issue is acceptable for this asset, call again with force=True.",
+        })
+
     if bake_roughness is None:
         bake_roughness = "Roughness" in mat_before.get("missing_maps", [])
     import os
@@ -6351,16 +6374,63 @@ else:
                 "mean": round(statistics.mean(sample), 4), "stdev": round(statistics.pstdev(sample), 4),
             }
 
+        def near_black_pct(image, stride_mult=7):
+            '''Fraction of sampled texels that are near-pure-black. Used to
+            detect bake artifacts: a topology problem or a missing shader
+            fallback can make a bake introduce black content the ORIGINAL
+            source texture never had (real incident: 33.9% vs 15.2% on a
+            mesh with unrepaired non-manifold edges — KB-006).'''
+            px = image.pixels[:]
+            ch = image.channels
+            if ch == 0 or not px:
+                return None
+            n = 0
+            black = 0
+            for i in range(0, len(px), ch * stride_mult):
+                n += 1
+                if px[i] < 0.03 and px[i+1] < 0.03 and px[i+2] < 0.03:
+                    black += 1
+            return round(100 * black / n, 2) if n else None
+
+        def find_source_tex_image(socket):
+            '''Walk back at most one Mix node's "A" input to find the
+            TEX_IMAGE node apply_weathering_recipe preserves the original
+            through — that's precisely where it lives by this tool's own
+            design. None if not found within that one hop (skip the
+            comparison rather than guess).'''
+            node = socket.node
+            if node.type == 'TEX_IMAGE':
+                return node.image
+            if node.type == 'MIX':
+                a_sock = next((s for s in node.inputs if s.name == 'A' and s.links), None)
+                if a_sock:
+                    src = a_sock.links[0].from_node
+                    if src.type == 'TEX_IMAGE':
+                        return src.image
+            return None
+
         try:
             bpy.context.scene.render.engine = 'CYCLES'
             bpy.context.scene.cycles.samples = 16
 
             bc_link = principled.inputs["Base Color"].links[0] if principled.inputs["Base Color"].links else None
             if bc_link:
+                source_img = find_source_tex_image(bc_link.from_socket)
+                source_black_pct = near_black_pct(source_img) if source_img else None
+
                 bc_img, bc_stats = bake_pass(bc_link.from_socket, "TEMP_bake_basecolor", {RES}, {RES})
                 bc_img.filepath_raw = '{BCPATH}'
                 bc_img.file_format = 'PNG'
                 bc_img.save()
+                baked_black_pct = near_black_pct(bc_img)
+                bc_stats["source_near_black_pct"] = source_black_pct
+                bc_stats["baked_near_black_pct"] = baked_black_pct
+                # +10 percentage points over source is a real anomaly, not
+                # noise — the live incident this guards against was +18.7pts.
+                bc_stats["bake_introduced_black_artifact"] = bool(
+                    source_black_pct is not None and baked_black_pct is not None
+                    and baked_black_pct > source_black_pct + 10.0
+                )
                 baked["base_color"] = {"path": '{BCPATH}', "stats": bc_stats}
             else:
                 result["errors"].append("Base Color has no input connection — nothing to bake, it's already a flat constant")
@@ -6455,6 +6525,17 @@ else:
                     if info.get("stats", {}).get("stdev", 1.0) < 0.005
                 ]
 
+                # Same idea, different signal: does the baked Base Color have
+                # meaningfully MORE near-black content than the original
+                # source texture it was baked from? Computed live during the
+                # bake (find_source_tex_image/near_black_pct in the script
+                # above) — surfaced here so it's part of the tool's own
+                # verified result, not something only visible by eyeballing
+                # the viewport (real incident: KB-006, +18.7 points on a
+                # mesh with unrepaired non-manifold topology).
+                bc_stats = parsed.get("baked", {}).get("base_color", {}).get("stats", {})
+                bake_artifact = bc_stats.get("bake_introduced_black_artifact", False)
+
                 parsed["dna_verification"] = {
                     "base_color_confirmed": "base_color" in parsed.get("baked", {}) and "Base Color" not in missing_after,
                     "roughness_confirmed": (
@@ -6467,6 +6548,14 @@ else:
                         "constant input's fallback wasn't set, or the mesh has topology problems "
                         "corrupting the bake). Inspect visually before trusting this bake."
                     ) if flat_bakes else None,
+                    "bake_introduced_black_artifact": bake_artifact,
+                    "black_artifact_warning": (
+                        f"Base Color baked with {bc_stats.get('baked_near_black_pct')}% near-black pixels "
+                        f"vs. {bc_stats.get('source_near_black_pct')}% in the original source texture — "
+                        "a jump this large usually means unrepaired mesh topology (non-manifold/boundary "
+                        "edges) is corrupting the bake, not legitimate shading. Inspect visually; consider "
+                        "auto_repair_mesh before re-baking."
+                    ) if bake_artifact else None,
                 }
                 return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})
