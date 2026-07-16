@@ -6033,6 +6033,14 @@ else:
             factor_in = get_socket(bc_mix.inputs, "Factor", "VALUE")
             if existing_bc_from:
                 nt.links.new(existing_bc_from, a_in)
+            else:
+                # No existing link — preserve the material's TRUE original
+                # constant instead of leaving this new Mix node's own
+                # arbitrary default (real bug hit live: a wall panel with a
+                # constant, never-linked Roughness baked out to 0.0 mirror-
+                # smooth almost everywhere, rendering pure black in every
+                # recess, because this fallback was missing).
+                a_in.default_value = tuple(bc_input.default_value)
             nt.links.new(rust.outputs[0], b_in)
             nt.links.new(factor_scale.outputs[0], factor_in)
             nt.links.new(result_out, principled.inputs["Base Color"])
@@ -6047,6 +6055,8 @@ else:
             rfactor_in = get_socket(rough_mix.inputs, "Factor", "VALUE")
             if existing_rough_from:
                 nt.links.new(existing_rough_from, ra_in)
+            else:
+                ra_in.default_value = float(rough_input.default_value)
             rb_in.default_value = {WORNROUGH}
             nt.links.new(factor_scale.outputs[0], rfactor_in)
             nt.links.new(rresult_out, principled.inputs["Roughness"])
@@ -6091,6 +6101,8 @@ else:
             ffactor_in = get_socket(fray_bc_mix.inputs, "Factor", "VALUE")
             if existing_bc_from:
                 nt.links.new(existing_bc_from, fa_in)
+            else:
+                fa_in.default_value = tuple(bc_input.default_value)
             nt.links.new(desat.outputs["Color"], fb_in)
             nt.links.new(fray_factor_scale.outputs[0], ffactor_in)
             nt.links.new(fresult_out, principled.inputs["Base Color"])
@@ -6105,6 +6117,8 @@ else:
             frfactor_in = get_socket(fray_rough_mix.inputs, "Factor", "VALUE")
             if existing_rough_from:
                 nt.links.new(existing_rough_from, fra_in)
+            else:
+                fra_in.default_value = float(rough_input.default_value)
             frb_in.default_value = {FRAYROUGH}
             nt.links.new(fray_factor_scale.outputs[0], frfactor_in)
             nt.links.new(frresult_out, principled.inputs["Roughness"])
@@ -6428,11 +6442,31 @@ else:
                     (m for m in dna_after.get("materials", []) if m.get("name") == material_name), {}
                 )
                 missing_after = mat_after.get("missing_maps", [])
+
+                # "texture-fed now" (missing_maps check above) proves the
+                # socket is WIRED to a baked image, not that the baked
+                # CONTENT is sane — a real bug hit live tonight: a flat 0.0
+                # roughness bake reported "confirmed" because it was
+                # correctly wired, even though the pixel data itself was
+                # degenerate (stdev 0.0, uniform mirror-smooth). Flag that
+                # class of problem explicitly instead of only checking wiring.
+                flat_bakes = [
+                    prop for prop, info in parsed.get("baked", {}).items()
+                    if info.get("stats", {}).get("stdev", 1.0) < 0.005
+                ]
+
                 parsed["dna_verification"] = {
                     "base_color_confirmed": "base_color" in parsed.get("baked", {}) and "Base Color" not in missing_after,
                     "roughness_confirmed": (
                         ("Roughness" not in missing_after) if "roughness" in parsed.get("baked", {}) else None
                     ),
+                    "suspiciously_flat_bakes": flat_bakes,
+                    "flat_bake_warning": (
+                        f"{', '.join(flat_bakes)} baked with near-zero variance (stdev < 0.005) — "
+                        "wired correctly but the content itself may be degenerate (e.g. an unlinked "
+                        "constant input's fallback wasn't set, or the mesh has topology problems "
+                        "corrupting the bake). Inspect visually before trusting this bake."
+                    ) if flat_bakes else None,
                 }
                 return json.dumps(parsed, indent=2)
         return json.dumps({"error": "No JSON output from bake_weathered_textures", "raw": output})

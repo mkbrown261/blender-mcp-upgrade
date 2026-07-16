@@ -143,6 +143,21 @@ server.apply_weathering_recipe(object_name="X", material_name="")
 check("blank material_name skips the recipe-lookup tier and falls straight to automatic dispatch",
       "forced_category = ''" in captured6["code"])
 
+# ── Regression: unlinked constant Roughness/Base Color must NOT fall back to ─
+# a Mix node's own arbitrary default. Real bug hit live: a wall panel with a
+# constant, never-linked Roughness baked out to 0.0 (mirror-smooth) almost
+# everywhere because this fallback was missing, rendering pure black in every
+# deep recess. All four mix constructions (oxidation BC/Roughness, fraying
+# BC/Roughness) must preserve the material's true original constant.
+check("oxidation Base Color mix preserves the original constant when unlinked",
+      "a_in.default_value = tuple(bc_input.default_value)" in code)
+check("oxidation Roughness mix preserves the original constant when unlinked",
+      "ra_in.default_value = float(rough_input.default_value)" in code)
+check("fraying Base Color mix preserves the original constant when unlinked",
+      "fa_in.default_value = tuple(bc_input.default_value)" in code)
+check("fraying Roughness mix preserves the original constant when unlinked",
+      "fra_in.default_value = float(rough_input.default_value)" in code)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

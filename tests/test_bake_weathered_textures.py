@@ -104,6 +104,57 @@ check("bake uses the Emission-trick (EMIT type captures node values regardless o
 check("baked images are actually saved to real files, not left as in-memory-only datablocks",
       ".save()" in code)
 
+# ── Regression: a flat/zero-variance bake must be flagged explicitly, not ───
+# silently reported as "confirmed" just because it's correctly wired. Real
+# bug hit live: a wall panel's roughness baked to stdev=0.0 (a missing Mix-
+# node fallback made it 0.0/mirror-smooth everywhere) and the old
+# dna_verification said "confirmed: true" because the socket WAS texture-fed
+# — wiring correctness and content sanity are different claims.
+def make_stats_fake(roughness_stdev):
+    def fake(cmd, **kwargs):
+        if cmd in _DNA_RAW:
+            return _DNA_RAW[cmd]
+        if cmd == "execute_code_safe":
+            code = kwargs["code"]
+            if "original_surface_link" in code:
+                return {"result": json.dumps({
+                    "baked": {
+                        "base_color": {"path": "/tmp/bc.png", "stats": {"min": 0.0, "max": 0.8, "mean": 0.3, "stdev": 0.15}},
+                        "roughness": {"path": "/tmp/r.png", "stats": {"min": 0.0, "max": 0.9, "mean": 0.5, "stdev": roughness_stdev}},
+                    },
+                    "errors": [], "rewired": True, "broken_images_worked_around": [],
+                })}
+            if "has_principled" in code:
+                return {"result": json.dumps([{
+                    "name": "M", "has_principled": True, "texture_fed": ["Base Color", "Roughness"],
+                    "missing_maps": [],
+                }])}
+            if "filepath_raw" in code:
+                return {"result": json.dumps({"path": None})}
+        return original_send_raw(cmd, **kwargs)
+    return fake
+
+
+server._send_raw = make_stats_fake(roughness_stdev=0.0)
+server._SNAPSHOTS.clear()
+flat_result = json.loads(server.bake_weathered_textures(
+    object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
+))
+check("a zero-variance bake is flagged in suspiciously_flat_bakes",
+      "roughness" in flat_result.get("dna_verification", {}).get("suspiciously_flat_bakes", []))
+check("a zero-variance bake carries a human-readable warning, not just a silent flag",
+      flat_result.get("dna_verification", {}).get("flat_bake_warning") is not None)
+
+server._send_raw = make_stats_fake(roughness_stdev=0.15)
+server._SNAPSHOTS.clear()
+healthy_result = json.loads(server.bake_weathered_textures(
+    object_name="X", material_name="M", output_dir="/tmp/bake_out", resolution=1024,
+))
+check("a normal-variance bake is NOT flagged as suspiciously flat",
+      healthy_result.get("dna_verification", {}).get("suspiciously_flat_bakes") == [])
+check("a normal-variance bake carries no flat_bake_warning",
+      healthy_result.get("dna_verification", {}).get("flat_bake_warning") is None)
+
 server._send_raw = original_send_raw
 
 print()
