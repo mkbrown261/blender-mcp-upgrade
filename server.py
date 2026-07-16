@@ -5638,6 +5638,21 @@ def _resolve_weathering_recipe(trigger_phrase: str, recipe_type: str) -> dict:
     }
 
 
+def _resolve_material_category(material_name: str) -> Optional[str]:
+    """Look up a stored recipe_type='material' recipe by material name (the
+    smallest real slice of the material knowledge layer — no pre-populated
+    entries, grown the same organic way RECIPE-001/002 were). Returns the
+    matched category string or None if nothing matches — a best-effort
+    convenience, never a silent override of an explicit material_category."""
+    if not material_name:
+        return None
+    raw = json.loads(query_creative_recipe(trigger_phrase=material_name, recipe_type="material"))
+    matches = raw.get("matches", [])
+    if not matches:
+        return None
+    return matches[0].get("parameters", {}).get("category")
+
+
 @mcp.tool()
 def apply_weathering_recipe(
     object_name: str,
@@ -5650,6 +5665,8 @@ def apply_weathering_recipe(
     mask_percentile_low: float = 5.0,
     mask_percentile_high: float = 40.0,
     metal_floor: float = 0.25,
+    material_category: Optional[str] = None,
+    fray_roughness: float = 0.95,
 ) -> str:
     """
     APPLY WEATHERING — generates real rust/edge-wear shader nodes on an
@@ -5708,6 +5725,31 @@ def apply_weathering_recipe(
     correctly flag them as missing_maps. If it does, the result carries
     dna_verification.needs_baking pointing at bake_weathered_textures —
     closing the loop instead of leaving that gap to be discovered later.
+
+    TWO TECHNIQUES, dispatched per material — not one recolored mechanism:
+    - "oxidation" (the original technique above): curvature-driven — edges
+      and crevices wear more. Correct for metal.
+    - "fraying": a structurally different signal — graph distance (edge-
+      steps) from the nearest UV-seam or mesh-boundary edge, baked into a
+      SEPARATE vertex color attribute (AutoWeather_FrayMask) so it never
+      collides with the oxidation mask on objects using both. Blends toward
+      a desaturated, higher-roughness (fray_roughness, default 0.95) look
+      instead of a rust tint — fabric grays and roughens at seams/hems, it
+      doesn't oxidize. No effect on a material with no seams and no
+      boundary edges (a genuinely watertight, unseamed mesh) — mask_stats
+      will show it honestly (all-zero), not fake wear.
+
+    material_category: "metal" or "organic" forces that technique on every
+    material this call touches — explicit always wins. Left at its default
+    (None), each material picks automatically from its own real sampled
+    metal_factor_floored (>0.5 -> oxidation, else -> fraying) — a call with
+    material_name="" (every material) correctly gives metal armor oxidation
+    and a cloth cape fraying in the same pass. If material_category is None
+    AND material_name names one specific material, a recipe_type="material"
+    lookup by that name (query_creative_recipe) can also supply the category
+    — same explicit > recipe > automatic precedence as wear_scalar/
+    trigger_phrase. That lookup is skipped when material_name is blank
+    (applying to every material) since there's no single name to look up yet.
     """
     _invalidate_dna_cache(object_name)
 
@@ -5717,6 +5759,9 @@ def apply_weathering_recipe(
         wear_scalar = recipe_info.get("derived_wear_scalar")
         if wear_scalar is None:
             wear_scalar = 0.8
+
+    if material_category is None and material_name:
+        material_category = _resolve_material_category(material_name)
     script = r"""
 import bpy, json, mathutils, statistics
 
@@ -5781,6 +5826,53 @@ else:
         color_attr.data[vid].color = (m, m, m, 1.0)
         mask_values.append(m)
 
+    # FRAYING signal — structurally different from curvature above: graph
+    # distance (edge-steps) from the nearest UV-seam or open boundary edge,
+    # not a normal-deviation dot product. Fabric frays at seams/hems, not at
+    # curvature extrema. Falls back to true boundary edges too, so genuinely
+    # open meshes still get a signal even with no seams marked. Already
+    # naturally bounded (0..FRAY_RADIUS steps) — no percentile calibration
+    # needed the way curvature's unbounded dot-product distribution required.
+    edge_poly_count = {}
+    for poly in mesh.polygons:
+        for key in poly.edge_keys:
+            edge_poly_count[key] = edge_poly_count.get(key, 0) + 1
+
+    seam_or_boundary_verts = set()
+    for edge in mesh.edges:
+        key = tuple(sorted(edge.vertices))
+        is_boundary = edge_poly_count.get(key, 0) <= 1
+        if is_boundary or edge.use_seam:
+            seam_or_boundary_verts.add(edge.vertices[0])
+            seam_or_boundary_verts.add(edge.vertices[1])
+
+    FRAY_RADIUS = 4
+    fray_dist = {vid: (0 if vid in seam_or_boundary_verts else None) for vid in neighbor_map}
+    frontier = list(seam_or_boundary_verts)
+    step = 0
+    while frontier and step < FRAY_RADIUS:
+        step += 1
+        next_frontier = []
+        for vid in frontier:
+            for nb in neighbor_map.get(vid, ()):
+                if fray_dist.get(nb) is None:
+                    fray_dist[nb] = step
+                    next_frontier.append(nb)
+        frontier = next_frontier
+
+    fray_mask_name = "AutoWeather_FrayMask"
+    if fray_mask_name in mesh.color_attributes:
+        mesh.color_attributes.remove(mesh.color_attributes[fray_mask_name])
+    fray_attr = mesh.color_attributes.new(name=fray_mask_name, type='FLOAT_COLOR', domain='POINT')
+
+    fray_mask_values = []
+    for vid in neighbor_map:
+        d = fray_dist.get(vid)
+        d = FRAY_RADIUS if d is None else d
+        m = max(0.0, min(1.0, 1.0 - (d / FRAY_RADIUS)))
+        fray_attr.data[vid].color = (m, m, m, 1.0)
+        fray_mask_values.append(m)
+
     def get_socket(collection, name, socket_type):
         for s in collection:
             if s.name == name and s.type == socket_type:
@@ -5827,8 +5919,9 @@ else:
             continue
 
         prefix = "AutoWeather_"
+        fray_prefix = "AutoWeatherFray_"
         for nd in list(nt.nodes):
-            if nd.name.startswith(prefix):
+            if nd.name.startswith(prefix) or nd.name.startswith(fray_prefix):
                 nt.nodes.remove(nd)
 
         base_x, base_y = principled.location.x - 700, principled.location.y
@@ -5863,89 +5956,162 @@ else:
             metal_factor = float(metallic_input.default_value)
 
         metal_factor_floored = max({METALFLOOR}, min(1.0, metal_factor))
-        effective_wear_scalar = {WEARSCALAR} * metal_factor_floored
 
-        # Material-aware TINT: instead of one flat rust color for every
-        # material, sample this material's own base color and derive a
-        # weathering tint from it — a darkened/desaturated "grime" version
-        # for organic materials, blended toward the pure rust_color for
-        # metal materials proportional to the same measured metal_factor.
-        # Real materials don't oxidize orange-rust uniformly; skin/fabric
-        # grimes and darkens, metal rusts — this mirrors that instead of
-        # painting every surface the same tone.
-        bc_source = "constant"
-        base_rgb = (0.5, 0.5, 0.5)
-        if existing_bc_from is not None and existing_bc_from.node.type == 'TEX_IMAGE' and existing_bc_from.node.image:
-            img = existing_bc_from.node.image
-            if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
-                bc_source = "broken_image_fallback"
-            else:
-                try:
-                    base_rgb = sample_image_avg(img, 3)
-                    bc_source = "texture_sampled"
-                except Exception:
-                    bc_source = "texture_sample_failed"
-        elif existing_bc_from is None:
-            bc_default = bc_input.default_value
-            base_rgb = (bc_default[0], bc_default[1], bc_default[2])
+        # TECHNIQUE DISPATCH — explicit material_category always wins (forces
+        # the same technique on every material this call touches); left
+        # automatic, each material picks from its OWN real sampled
+        # metal_factor_floored, not a guess or an object-wide flag.
+        forced_category = '{FORCEDCATEGORY}'
+        if forced_category == 'metal':
+            technique = 'oxidation'
+        elif forced_category == 'organic':
+            technique = 'fraying'
         else:
-            bc_source = "texture_node_no_image"
+            technique = 'oxidation' if metal_factor_floored > 0.5 else 'fraying'
 
-        gray = sum(base_rgb) / 3.0
-        grime_rgb = tuple(base_rgb[c] * 0.5 + gray * 0.15 for c in range(3))
-        rust_target = ({RUSTR}, {RUSTG}, {RUSTB})
-        weather_rgb = tuple(
-            grime_rgb[c] * (1.0 - metal_factor_floored) + rust_target[c] * metal_factor_floored
-            for c in range(3)
-        )
+        if technique == 'oxidation':
+            effective_wear_scalar = {WEARSCALAR} * metal_factor_floored
 
-        attr = nt.nodes.new("ShaderNodeAttribute")
-        attr.name = prefix + "MaskAttr"
-        attr.attribute_name = mask_name
-        attr.location = (base_x - 400, base_y - 300)
+            # Material-aware TINT: instead of one flat rust color for every
+            # material, sample this material's own base color and derive a
+            # weathering tint from it — a darkened/desaturated "grime" version
+            # for organic materials, blended toward the pure rust_color for
+            # metal materials proportional to the same measured metal_factor.
+            # Real materials don't oxidize orange-rust uniformly; skin/fabric
+            # grimes and darkens, metal rusts — this mirrors that instead of
+            # painting every surface the same tone.
+            bc_source = "constant"
+            base_rgb = (0.5, 0.5, 0.5)
+            if existing_bc_from is not None and existing_bc_from.node.type == 'TEX_IMAGE' and existing_bc_from.node.image:
+                img = existing_bc_from.node.image
+                if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
+                    bc_source = "broken_image_fallback"
+                else:
+                    try:
+                        base_rgb = sample_image_avg(img, 3)
+                        bc_source = "texture_sampled"
+                    except Exception:
+                        bc_source = "texture_sample_failed"
+            elif existing_bc_from is None:
+                bc_default = bc_input.default_value
+                base_rgb = (bc_default[0], bc_default[1], bc_default[2])
+            else:
+                bc_source = "texture_node_no_image"
 
-        rust = nt.nodes.new("ShaderNodeRGB")
-        rust.name = prefix + "RustColor"
-        rust.location = (base_x - 400, base_y - 600)
-        rust.outputs[0].default_value = (weather_rgb[0], weather_rgb[1], weather_rgb[2], 1.0)
+            gray = sum(base_rgb) / 3.0
+            grime_rgb = tuple(base_rgb[c] * 0.5 + gray * 0.15 for c in range(3))
+            rust_target = ({RUSTR}, {RUSTG}, {RUSTB})
+            weather_rgb = tuple(
+                grime_rgb[c] * (1.0 - metal_factor_floored) + rust_target[c] * metal_factor_floored
+                for c in range(3)
+            )
 
-        factor_scale = nt.nodes.new("ShaderNodeMath")
-        factor_scale.name = prefix + "WearScale"
-        factor_scale.location = (base_x, base_y - 300)
-        factor_scale.operation = 'MULTIPLY'
-        nt.links.new(attr.outputs["Fac"], factor_scale.inputs[0])
-        factor_scale.inputs[1].default_value = effective_wear_scalar
+            attr = nt.nodes.new("ShaderNodeAttribute")
+            attr.name = prefix + "MaskAttr"
+            attr.attribute_name = mask_name
+            attr.location = (base_x - 400, base_y - 300)
 
-        bc_mix = nt.nodes.new("ShaderNodeMix")
-        bc_mix.name = prefix + "BaseColorWeather"
-        bc_mix.data_type = 'RGBA'
-        bc_mix.location = (base_x + 300, base_y)
-        a_in = get_socket(bc_mix.inputs, "A", "RGBA")
-        b_in = get_socket(bc_mix.inputs, "B", "RGBA")
-        result_out = get_socket(bc_mix.outputs, "Result", "RGBA")
-        factor_in = get_socket(bc_mix.inputs, "Factor", "VALUE")
-        if existing_bc_from:
-            nt.links.new(existing_bc_from, a_in)
-        nt.links.new(rust.outputs[0], b_in)
-        nt.links.new(factor_scale.outputs[0], factor_in)
-        nt.links.new(result_out, principled.inputs["Base Color"])
+            rust = nt.nodes.new("ShaderNodeRGB")
+            rust.name = prefix + "RustColor"
+            rust.location = (base_x - 400, base_y - 600)
+            rust.outputs[0].default_value = (weather_rgb[0], weather_rgb[1], weather_rgb[2], 1.0)
 
-        rough_mix = nt.nodes.new("ShaderNodeMix")
-        rough_mix.name = prefix + "RoughnessWeather"
-        rough_mix.data_type = 'FLOAT'
-        rough_mix.location = (base_x + 300, base_y + 300)
-        ra_in = get_socket(rough_mix.inputs, "A", "VALUE")
-        rb_in = get_socket(rough_mix.inputs, "B", "VALUE")
-        rresult_out = get_socket(rough_mix.outputs, "Result", "VALUE")
-        rfactor_in = get_socket(rough_mix.inputs, "Factor", "VALUE")
-        if existing_rough_from:
-            nt.links.new(existing_rough_from, ra_in)
-        rb_in.default_value = {WORNROUGH}
-        nt.links.new(factor_scale.outputs[0], rfactor_in)
-        nt.links.new(rresult_out, principled.inputs["Roughness"])
+            factor_scale = nt.nodes.new("ShaderNodeMath")
+            factor_scale.name = prefix + "WearScale"
+            factor_scale.location = (base_x, base_y - 300)
+            factor_scale.operation = 'MULTIPLY'
+            nt.links.new(attr.outputs["Fac"], factor_scale.inputs[0])
+            factor_scale.inputs[1].default_value = effective_wear_scalar
+
+            bc_mix = nt.nodes.new("ShaderNodeMix")
+            bc_mix.name = prefix + "BaseColorWeather"
+            bc_mix.data_type = 'RGBA'
+            bc_mix.location = (base_x + 300, base_y)
+            a_in = get_socket(bc_mix.inputs, "A", "RGBA")
+            b_in = get_socket(bc_mix.inputs, "B", "RGBA")
+            result_out = get_socket(bc_mix.outputs, "Result", "RGBA")
+            factor_in = get_socket(bc_mix.inputs, "Factor", "VALUE")
+            if existing_bc_from:
+                nt.links.new(existing_bc_from, a_in)
+            nt.links.new(rust.outputs[0], b_in)
+            nt.links.new(factor_scale.outputs[0], factor_in)
+            nt.links.new(result_out, principled.inputs["Base Color"])
+
+            rough_mix = nt.nodes.new("ShaderNodeMix")
+            rough_mix.name = prefix + "RoughnessWeather"
+            rough_mix.data_type = 'FLOAT'
+            rough_mix.location = (base_x + 300, base_y + 300)
+            ra_in = get_socket(rough_mix.inputs, "A", "VALUE")
+            rb_in = get_socket(rough_mix.inputs, "B", "VALUE")
+            rresult_out = get_socket(rough_mix.outputs, "Result", "VALUE")
+            rfactor_in = get_socket(rough_mix.inputs, "Factor", "VALUE")
+            if existing_rough_from:
+                nt.links.new(existing_rough_from, ra_in)
+            rb_in.default_value = {WORNROUGH}
+            nt.links.new(factor_scale.outputs[0], rfactor_in)
+            nt.links.new(rresult_out, principled.inputs["Roughness"])
+
+        else:  # fraying — structurally different signal AND different blend
+            # target: desaturate/gray toward higher roughness, no rust tint.
+            bc_source = "n/a (fraying technique)"
+            base_rgb = (0.0, 0.0, 0.0)
+            weather_rgb = (0.0, 0.0, 0.0)
+            effective_wear_scalar = {WEARSCALAR}
+
+            fray_attr = nt.nodes.new("ShaderNodeAttribute")
+            fray_attr.name = fray_prefix + "MaskAttr"
+            fray_attr.attribute_name = fray_mask_name
+            fray_attr.location = (base_x - 400, base_y - 300)
+
+            fray_factor_scale = nt.nodes.new("ShaderNodeMath")
+            fray_factor_scale.name = fray_prefix + "WearScale"
+            fray_factor_scale.location = (base_x, base_y - 300)
+            fray_factor_scale.operation = 'MULTIPLY'
+            nt.links.new(fray_attr.outputs["Fac"], fray_factor_scale.inputs[0])
+            fray_factor_scale.inputs[1].default_value = effective_wear_scalar
+
+            desat = nt.nodes.new("ShaderNodeHueSaturation")
+            desat.name = fray_prefix + "Desaturate"
+            desat.location = (base_x - 400, base_y - 600)
+            desat.inputs["Saturation"].default_value = 0.15
+            desat.inputs["Value"].default_value = 0.85
+            if existing_bc_from:
+                nt.links.new(existing_bc_from, desat.inputs["Color"])
+            else:
+                bc_default = bc_input.default_value
+                desat.inputs["Color"].default_value = (bc_default[0], bc_default[1], bc_default[2], 1.0)
+
+            fray_bc_mix = nt.nodes.new("ShaderNodeMix")
+            fray_bc_mix.name = fray_prefix + "BaseColorWeather"
+            fray_bc_mix.data_type = 'RGBA'
+            fray_bc_mix.location = (base_x + 300, base_y)
+            fa_in = get_socket(fray_bc_mix.inputs, "A", "RGBA")
+            fb_in = get_socket(fray_bc_mix.inputs, "B", "RGBA")
+            fresult_out = get_socket(fray_bc_mix.outputs, "Result", "RGBA")
+            ffactor_in = get_socket(fray_bc_mix.inputs, "Factor", "VALUE")
+            if existing_bc_from:
+                nt.links.new(existing_bc_from, fa_in)
+            nt.links.new(desat.outputs["Color"], fb_in)
+            nt.links.new(fray_factor_scale.outputs[0], ffactor_in)
+            nt.links.new(fresult_out, principled.inputs["Base Color"])
+
+            fray_rough_mix = nt.nodes.new("ShaderNodeMix")
+            fray_rough_mix.name = fray_prefix + "RoughnessWeather"
+            fray_rough_mix.data_type = 'FLOAT'
+            fray_rough_mix.location = (base_x + 300, base_y + 300)
+            fra_in = get_socket(fray_rough_mix.inputs, "A", "VALUE")
+            frb_in = get_socket(fray_rough_mix.inputs, "B", "VALUE")
+            frresult_out = get_socket(fray_rough_mix.outputs, "Result", "VALUE")
+            frfactor_in = get_socket(fray_rough_mix.inputs, "Factor", "VALUE")
+            if existing_rough_from:
+                nt.links.new(existing_rough_from, fra_in)
+            frb_in.default_value = {FRAYROUGH}
+            nt.links.new(fray_factor_scale.outputs[0], frfactor_in)
+            nt.links.new(frresult_out, principled.inputs["Roughness"])
 
         materials_applied.append({
             "material": mat.name,
+            "technique_used": technique,
             "metal_source": metal_source,
             "metal_factor": round(metal_factor, 4),
             "metal_factor_floored": round(metal_factor_floored, 4),
@@ -5965,6 +6131,13 @@ else:
             "mean": round(statistics.mean(mask_values), 4) if mask_values else None,
             "stdev": round(statistics.pstdev(mask_values), 4) if mask_values else None,
         },
+        "fray_mask_stats": {
+            "min": round(min(fray_mask_values), 4) if fray_mask_values else None,
+            "max": round(max(fray_mask_values), 4) if fray_mask_values else None,
+            "mean": round(statistics.mean(fray_mask_values), 4) if fray_mask_values else None,
+            "stdev": round(statistics.pstdev(fray_mask_values), 4) if fray_mask_values else None,
+            "note": "all-zero means this mesh has no UV seams and no boundary edges within reach — a real 'no signal', not a bug.",
+        },
         "percentiles_used": {"low": {PLOW}, "high": {PHIGH}, "p_low_value": round(p_low, 4), "p_high_value": round(p_high, 4)},
     }))
 """.replace("{OBJ}", object_name.replace("'", "\\'")) \
@@ -5974,7 +6147,9 @@ else:
    .replace("{RUSTR}", str(rust_color[0])).replace("{RUSTG}", str(rust_color[1])).replace("{RUSTB}", str(rust_color[2])) \
    .replace("{WEARSCALAR}", str(wear_scalar)) \
    .replace("{WORNROUGH}", str(worn_roughness)) \
-   .replace("{METALFLOOR}", str(metal_floor))
+   .replace("{METALFLOOR}", str(metal_floor)) \
+   .replace("{FORCEDCATEGORY}", str(material_category or "")) \
+   .replace("{FRAYROUGH}", str(fray_roughness))
 
     try:
         raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
