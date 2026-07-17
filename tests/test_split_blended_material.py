@@ -118,6 +118,53 @@ check("result carries RE-MEASURED fingerprints for both materials after the spli
 check("result honestly states both materials share the same graph immediately after splitting",
       "addressability" in out.get("note", "").lower())
 
+# ── Structural checks on the real script sent to Blender: the trivial-split rejection fix ──
+# Real live incident: the single-largest-gap alone peeled off exactly 1 face
+# out of ~1.9M on the couch. Capture the ACTUAL script text (not the mocked
+# JSON output above, which bypasses the in-script clustering entirely) to
+# confirm the real fix — a minimum-fraction floor + walking candidate gaps
+# largest-first — is actually present, not just documented.
+captured_script = {"code": None}
+
+
+def capture_fake(cmd, **kwargs):
+    if cmd == "execute_code_safe":
+        code = kwargs.get("code", "")
+        if '"original_material":' in code:
+            captured_script["code"] = code
+            return {"result": json.dumps(split_ok)}
+        if "has_principled" in code:
+            return {"result": json.dumps([{
+                "name": "M", "has_principled": True, "texture_fed": ["Base Color"], "missing_maps": [],
+                "fingerprint": {}, "heterogeneity": {"likely_blended": True, "island_count": 3},
+            }])}
+        if "filepath_raw" in code:
+            return {"result": json.dumps({"path": None})}
+    if cmd in _DNA_RAW:
+        return _DNA_RAW[cmd]
+    raise AssertionError(f"unexpected command: {cmd}")
+
+
+server._send_raw = capture_fake
+server._SNAPSHOTS.clear()
+server.split_blended_material(object_name="X", material_name="M")
+script = captured_script["code"]
+check("the real split script computes a minimum-fraction floor for the minority group, not just the raw largest gap",
+      "MIN_SPLIT_FRACTION = 0.02" in script)
+check("candidate gaps are walked largest-first, skipping ones whose minority is a stray fragment",
+      "for _, split_at in gaps:" in script
+      and "minority_faces / total_faces) >= MIN_SPLIT_FRACTION" in script)
+# Real bug caught live: picking "minority" by ISLAND COUNT reassigned
+# 1,898,711 of ~1,898,715 faces on the real couch to the "minority" group
+# (2 large islands beat 3 small ones on island count, backwards on face
+# count) — confirmed via a live run before this fix, corrected after.
+check("minority/majority is chosen by real FACE COUNT, not island count — the exact bug caught live",
+      "faces_a = sum(len(e[\"faces\"]) for e in cand_a)" in script
+      and "faces_b = sum(len(e[\"faces\"]) for e in cand_b)" in script
+      and "cand_minority = cand_a if faces_a < faces_b else cand_b" in script)
+check("a real, honest rejection message names the fraction and explains why, when nothing qualifies",
+      "every candidate gap's minority group" in script and "stray fragment" in script)
+
 # ── The split script itself refuses when there's nothing meaningful to split ──
 no_split_result = {"error": "Could not find a meaningful split — all islands landed in one group."}
 server._send_raw = make_fake({"likely_blended": True, "island_count": 2}, split_result=no_split_result)

@@ -421,19 +421,93 @@ class BlenderMCPServer:
         return get_action_fcurves(action, obj)
 
     @staticmethod
-    def _build_bmesh_from_object(obj):
+    def _build_bmesh_from_object(obj, include_modifiers=False):
         """
         Safely build a new BMesh from obj in OBJECT mode.
         Returns (bm, prev_mode). Caller MUST call bm.free() in a finally block.
         FIX: Centralised bmesh construction with active-object guarantee.
+        include_modifiers=False (default, unchanged behavior): reads the
+        raw base mesh (obj.data) — ignores Mirror/Solidify/Boolean/Subsurf
+        etc. A mirrored half-mesh or a Boolean result's real post-modifier
+        geometry is NOT what gets measured by default. include_modifiers=
+        True evaluates the depsgraph-evaluated mesh instead, reflecting
+        what actually gets exported/rendered. Opt-in, not default, so
+        existing callers' numbers don't silently change.
         """
         prev_mode = BlenderMCPServer._ensure_object_mode(obj)
         bm = bmesh.new()
-        bm.from_mesh(obj.data)
+        if include_modifiers and obj.modifiers:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            obj_eval = obj.evaluated_get(depsgraph)
+            mesh_eval = obj_eval.to_mesh()
+            bm.from_mesh(mesh_eval)
+            obj_eval.to_mesh_clear()
+        else:
+            bm.from_mesh(obj.data)
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
         return bm, prev_mode
+
+    @staticmethod
+    def _count_uv_overlap_loops(obj, uv_layer_index=None):
+        """
+        Real UV overlap detection via bpy.ops.uv.select_overlap() — the
+        only reliable way to detect actual overlapping UV islands; a
+        bounds-only check (islands outside 0-1) cannot catch two islands
+        that overlap each other while both staying inside 0-1. FIX: this
+        was previously missing entirely — get_mesh_quality_report's own
+        docstring claimed "UV overlap detection added" but the real
+        implementation only ever checked bounds, and run_unreal_readiness_
+        check's lightmap_uv check was just uv_count >= 2 with no actual
+        overlap/bounds validation of the lightmap channel at all.
+        uv_layer_index=None uses the currently active UV layer; otherwise
+        switches to that index first (used for checking channel 1
+        specifically — the lightmap channel — without disturbing which
+        layer is active when this returns).
+        Returns the overlapping-loop count, or None if the check couldn't
+        run (no UV data, no faces, etc.) — never a guessed 0.
+        FIX: real bug caught live — MeshUVLoop.select (and BMLoopUV.select)
+        no longer exist on this Blender version; UV-corner selection state
+        moved to a generic mesh attribute, '.uv_select_vert' (CORNER
+        domain, BOOLEAN). Confirmed live: the old .select-based read raised
+        AttributeError every time despite select_overlap() itself running
+        fine, silently returning None (honest, but the check never actually
+        worked). Reads the real attribute now instead.
+        """
+        if obj.type != 'MESH' or len(obj.data.uv_layers) == 0:
+            return None
+        if uv_layer_index is not None and uv_layer_index >= len(obj.data.uv_layers):
+            return None
+        original_active_layer = obj.data.uv_layers.active_index
+        original_active_obj = bpy.context.view_layer.objects.active
+        try:
+            if uv_layer_index is not None:
+                obj.data.uv_layers.active_index = uv_layer_index
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.uv.select_all(action='DESELECT')
+            bpy.ops.uv.select_overlap()
+            bpy.ops.object.mode_set(mode='OBJECT')
+            attr = obj.data.attributes.get('.uv_select_vert')
+            if attr is not None:
+                return sum(1 for d in attr.data if d.value)
+            # Older Blender fallback — .select still exists there.
+            return sum(1 for loop_uv in obj.data.uv_layers.active.data if loop_uv.select)
+        except Exception:
+            return None
+        finally:
+            try:
+                if obj.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+            try:
+                obj.data.uv_layers.active_index = original_active_layer
+            except Exception:
+                pass
+            bpy.context.view_layer.objects.active = original_active_obj
 
     # ─────────────────────────────────────────────────────────────────────────
     # SAFE CODE EXECUTION  — wraps execute_code with undo push + mode guard
@@ -444,9 +518,29 @@ class BlenderMCPServer:
         required_mode: 'OBJECT' | 'EDIT' | 'POSE' | None  (None = don't switch)
         push_undo: bool — wrap in named undo step so Ctrl+Z always works.
         FIX: undo pushed BEFORE state change; poll-safe mode switching.
+        NOTE: "safe" describes the undo-checkpoint + mode-restore guarantees
+        ONLY — `code` runs via exec() with full interpreter access (no AST
+        whitelist, no restricted builtins, no import blocking). Real
+        sandboxing is out of scope: this MCP's material-generation tooling
+        genuinely needs broad bpy/Python access to build node graphs, and a
+        naive restricted-builtins lockdown would break it. Treat this the
+        same as running any other local script with your own privileges —
+        appropriate for local single-user use, not for untrusted input.
+        FIX: when required_mode is set but there's no active object at call
+        time, the mode switch used to be silently skipped with nothing in
+        the response signaling it — `code` would run in whatever mode
+        happened to be active with no actual required_mode guarantee. A
+        hard error here was considered and rejected: several real callers
+        (e.g. server.py's _capture_plain_screenshot) intentionally pass
+        required_mode='OBJECT' while the code itself selects/activates the
+        object — erroring before the code runs would break that working
+        pattern. Instead the gap is now surfaced honestly via
+        mode_verified in the response — False whenever required_mode
+        couldn't actually be confirmed/set, True when it was.
         """
         original_mode = None
         obj = bpy.context.active_object
+        mode_verified = not required_mode  # nothing to verify if no mode was required
         try:
             # --- undo checkpoint FIRST (before any state change) ---
             if push_undo:
@@ -462,16 +556,21 @@ class BlenderMCPServer:
                     bpy.context.view_layer.objects.active = obj
                     try:
                         bpy.ops.object.mode_set(mode=required_mode)
+                        mode_verified = True
                     except RuntimeError as e:
                         return {"executed": False, "result": "",
                                 "error": f"Cannot switch to {required_mode}: {e}",
-                                "mode_before": original_mode, "undo_pushed": push_undo}
+                                "mode_before": original_mode, "undo_pushed": push_undo,
+                                "mode_verified": False}
+                else:
+                    mode_verified = True  # already in the required mode
 
             # --- execute ---
             result = self.execute_code(code)
 
             self._log("execute_code_safe", "ok")
-            return {**result, "mode_before": original_mode, "undo_pushed": push_undo}
+            return {**result, "mode_before": original_mode, "undo_pushed": push_undo,
+                    "mode_verified": mode_verified}
 
         except BaseException as e:
             # BaseException guard — mirrors execute_code; prevents SystemExit
@@ -479,7 +578,8 @@ class BlenderMCPServer:
             err_msg = f"{type(e).__name__}: {str(e)}"
             self._log("execute_code_safe", "error", err_msg)
             return {"executed": False, "result": "", "error": err_msg,
-                    "mode_before": original_mode, "undo_pushed": push_undo}
+                    "mode_before": original_mode, "undo_pushed": push_undo,
+                    "mode_verified": mode_verified}
         finally:
             # --- restore mode if we changed it ---
             if original_mode and obj:
@@ -549,12 +649,18 @@ class BlenderMCPServer:
             self._log("get_scene_hierarchy", "error", str(e))
             return {"error": str(e)}
 
-    def get_mesh_quality_report(self, name):
+    def get_mesh_quality_report(self, name, include_modifiers=False):
         """
         On-demand mesh diagnostics for a named object.
         Returns a concise problem summary — not raw geometry arrays.
         FIX: bmesh freed in finally; active object set before mode_set;
              UV overlap detection added; weight group summary added.
+        include_modifiers=False (default): stats reflect the raw BASE mesh
+        — Mirror/Solidify/Boolean/Subsurf etc. are NOT included, even
+        though they're listed under "modifiers" in the same report. Set
+        True to evaluate the depsgraph-evaluated (post-modifier) mesh
+        instead — what the report describes is now explicit either way via
+        "stats_computed_on", instead of silently ambiguous.
         """
         obj = bpy.data.objects.get(name)
         if not obj or obj.type != 'MESH':
@@ -562,7 +668,7 @@ class BlenderMCPServer:
 
         bm = None
         try:
-            bm, _ = self._build_bmesh_from_object(obj)
+            bm, _ = self._build_bmesh_from_object(obj, include_modifiers=include_modifiers)
 
             vert_count = len(bm.verts)
             edge_count = len(bm.edges)
@@ -570,7 +676,14 @@ class BlenderMCPServer:
             ngons = sum(1 for f in bm.faces if len(f.verts) > 4)
             tris  = sum(1 for f in bm.faces if len(f.verts) == 3)
             quads = sum(1 for f in bm.faces if len(f.verts) == 4)
-            non_manifold_edges = sum(1 for e in bm.edges if not e.is_manifold)
+            # e.is_manifold is False for BOTH true non-manifold edges (3+
+            # linked faces) AND ordinary open boundary edges (1 linked
+            # face) — using it directly conflates a real geometry error
+            # with completely normal open/non-watertight topology (very
+            # common on hard-surface props, unfinished parts). Boundary
+            # edges are already tracked separately below; true non-manifold
+            # must only count edges with more than 2 linked faces.
+            non_manifold_edges = sum(1 for e in bm.edges if len(e.link_faces) > 2)
             isolated_verts     = sum(1 for v in bm.verts if not v.link_edges)
             poles_n3   = sum(1 for v in bm.verts if len(v.link_edges) == 3 and not v.is_boundary)
             poles_n5   = sum(1 for v in bm.verts if len(v.link_edges) == 5 and not v.is_boundary)
@@ -595,6 +708,13 @@ class BlenderMCPServer:
                             if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
                                 uv_out_of_bounds += 1
 
+            # FIX: real UV overlap detection — the docstring already
+            # claimed this existed, but the implementation above only ever
+            # checked bounds. Two islands can overlap each other while
+            # both staying fully inside 0-1, which bounds checking cannot
+            # catch at all.
+            uv_overlap_loops = self._count_uv_overlap_loops(obj)
+
             # Vertex group count (weight paint readiness)
             vgroup_count = len(obj.vertex_groups)
 
@@ -611,6 +731,7 @@ class BlenderMCPServer:
             report = {
                 "object": name,
                 "blender_version": list(bpy.app.version[:2]),
+                "stats_computed_on": "evaluated_mesh" if include_modifiers else "base_mesh",
                 "counts": {"verts": vert_count, "edges": edge_count, "faces": face_count},
                 "face_types": {"tris": tris, "quads": quads, "ngons": ngons},
                 "problems": {
@@ -627,6 +748,7 @@ class BlenderMCPServer:
                     "has_uvs": len(uv_layers) > 0,
                     "layer_count": len(uv_layers),
                     "out_of_bounds_loops": uv_out_of_bounds,
+                    "overlapping_loops": uv_overlap_loops,
                 },
                 "rigging": {
                     "vertex_groups": vgroup_count,
@@ -818,12 +940,15 @@ class BlenderMCPServer:
     # ─────────────────────────────────────────────────────────────────────────
     # TOPOLOGY LAYER
     # ─────────────────────────────────────────────────────────────────────────
-    def analyze_topology(self, name, context='generic'):
+    def analyze_topology(self, name, context='generic', include_modifiers=False):
         """
         Professional topology analysis with context-aware scoring.
         context: 'generic' | 'character_body' | 'face' | 'hand' | 'hard_surface'
         FIX: pole_map keys serialized as strings (JSON-safe); context scoring;
              bmesh freed in finally; active object set before mode_set.
+        include_modifiers=False (default): stats reflect the raw BASE mesh,
+        same caveat/opt-in as get_mesh_quality_report — see
+        "stats_computed_on" in the result.
         """
         obj = bpy.data.objects.get(name)
         if not obj or obj.type != 'MESH':
@@ -831,7 +956,7 @@ class BlenderMCPServer:
 
         bm = None
         try:
-            bm, _ = self._build_bmesh_from_object(obj)
+            bm, _ = self._build_bmesh_from_object(obj, include_modifiers=include_modifiers)
 
             total_faces = len(bm.faces)
             total_verts = len(bm.verts)
@@ -852,7 +977,18 @@ class BlenderMCPServer:
 
             avg_valence = round(sum(len(v.link_edges) for v in bm.verts) / total_verts, 2)
             boundary_edges = sum(1 for e in bm.edges if e.is_boundary)
-            non_manifold   = sum(1 for e in bm.edges if not e.is_manifold)
+            # Same real fix as get_mesh_quality_report: e.is_manifold is
+            # False for both true non-manifold (3+ linked faces) AND
+            # ordinary boundary edges (1 linked face) — count only the
+            # former, so boundary_edges/non_manifold no longer double-
+            # penalize the same edges below.
+            non_manifold   = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+            # High-valence pole count must exclude boundary verts (they
+            # naturally have irregular valence that isn't a real topology
+            # problem) — same convention get_mesh_quality_report already
+            # uses; deriving this from pole_map alone (which includes
+            # boundary verts) double-counted them as "poles."
+            high_poles_real = sum(1 for v in bm.verts if len(v.link_edges) >= 6 and not v.is_boundary)
 
             bad_normals = 0
             for f in bm.faces:
@@ -883,7 +1019,7 @@ class BlenderMCPServer:
             if tris_pct > thresholds['max_tris_pct']:
                 issues.append(f"High tri count ({tris_pct}%) — may limit subdivision and animation quality")
                 score -= 10
-            high_poles = int(pole_map.get("6", 0)) + int(pole_map.get("7", 0)) + int(pole_map.get("8", 0))
+            high_poles = high_poles_real
             if high_poles > 5:
                 issues.append(f"{high_poles} high-valence poles (6+) — complex topology, may cause pinching")
                 score -= 10
@@ -903,6 +1039,7 @@ class BlenderMCPServer:
             result = {
                 "object": name,
                 "context": context,
+                "stats_computed_on": "evaluated_mesh" if include_modifiers else "base_mesh",
                 "topology_score": max(score, 0),
                 "rating": rating,
                 "stats": {
@@ -968,7 +1105,10 @@ class BlenderMCPServer:
             bm, _ = self._build_bmesh_from_object(obj)
 
             problems = []
-            nm = sum(1 for e in bm.edges if not e.is_manifold)
+            # Same real fix as get_mesh_quality_report/analyze_topology:
+            # e.is_manifold is False for ordinary boundary edges too, not
+            # just true non-manifold geometry (3+ linked faces).
+            nm = sum(1 for e in bm.edges if len(e.link_faces) > 2)
             if nm: problems.append({"type": "non_manifold_edges", "count": nm,
                                     "fix": "Mesh > Clean Up > Fill Holes"})
             iso = sum(1 for v in bm.verts if not v.link_edges)
@@ -1120,18 +1260,40 @@ class BlenderMCPServer:
 
             # --- FIX: Foot sliding — detect XY movement while Z is LOCKED (planted foot)
             # A foot sliding = Z constant (foot on ground) BUT XY is moving (sliding)
+            # FIX: only consider fcurves on bones matching foot/leg name
+            # patterns — previously ANY location fcurve (root motion, IK
+            # targets, held props) got evaluated, producing false-positive
+            # "foot sliding" warnings on things that aren't feet at all.
+            # This is a name-pattern heuristic, not a guaranteed-universal
+            # bone-purpose signal (rigs with non-standard bone names won't
+            # be caught) — documented, not silently assumed complete.
+            import re as _re
+            _FOOT_NAME_PATTERN = _re.compile(r'(foot|toe|ankle|heel)', _re.IGNORECASE)
+
+            def _is_foot_path(data_path):
+                m = _re.search(r'pose\.bones\["([^"]+)"\]', data_path)
+                bone_name = m.group(1) if m else data_path
+                return bool(_FOOT_NAME_PATTERN.search(bone_name))
+
             loc_curves = {}
             for fc in fcurves:
-                if 'location' in fc.data_path:
+                if 'location' in fc.data_path and _is_foot_path(fc.data_path):
                     key = fc.data_path
                     if key not in loc_curves:
                         loc_curves[key] = {}
                     loc_curves[key][fc.array_index] = fc
 
+            # FIX: previously hard-capped sampling to the first 60 frames
+            # regardless of the real f_end passed in — sliding beyond frame
+            # 60 in longer clips was never checked. Sample across the FULL
+            # range with a stride that keeps total samples bounded.
+            full_range = max(f_end - f_start, 1)
+            sample_stride = max(1, full_range // 80)
+
             for path, axes in loc_curves.items():
                 if 2 not in axes:
                     continue
-                sample_frames = range(f_start, min(f_end, f_start + 60), 3)
+                sample_frames = range(f_start, f_end + 1, sample_stride)
                 z_vals = [axes[2].evaluate(f) for f in sample_frames]
                 if not z_vals:
                     continue
@@ -1268,22 +1430,29 @@ class BlenderMCPServer:
             out  = nodes.new('ShaderNodeOutputMaterial'); out.location  = (600, 0)
             bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (300, 0)
 
-            # FIX: version-safe socket assignments
-            self._bsdf_set(bsdf, ['Base Color', 'Base_Color'], base_color)
-            self._bsdf_set(bsdf, ['Metallic'], metallic)
-            self._bsdf_set(bsdf, ['Roughness'], roughness)
-            self._bsdf_set(bsdf, ['Alpha'], alpha)
+            # FIX: version-safe socket assignments. Track each one's real
+            # success/failure — previously discarded entirely, so a socket
+            # that silently failed to set (e.g. a renamed/missing input on
+            # some future Blender version) still reported "verified": true
+            # because only the Surface link was ever checked.
+            socket_results = {
+                "base_color": self._bsdf_set(bsdf, ['Base Color', 'Base_Color'], base_color),
+                "metallic":   self._bsdf_set(bsdf, ['Metallic'], metallic),
+                "roughness":  self._bsdf_set(bsdf, ['Roughness'], roughness),
+                "alpha":      self._bsdf_set(bsdf, ['Alpha'], alpha),
+            }
 
             if use_subsurface:
                 # Blender 4.x: 'Subsurface Weight' | Blender 3.x: 'Subsurface'
-                self._bsdf_set(bsdf, ['Subsurface Weight', 'Subsurface'], 0.1)
+                socket_results["subsurface"] = self._bsdf_set(bsdf, ['Subsurface Weight', 'Subsurface'], 0.1)
                 if subsurface_radius:
-                    self._bsdf_set(bsdf, ['Subsurface Radius', 'Subsurface Color'], subsurface_radius)
+                    socket_results["subsurface_radius"] = self._bsdf_set(
+                        bsdf, ['Subsurface Radius', 'Subsurface Color'], subsurface_radius)
 
             if emission_color:
                 # Blender 4.x: 'Emission Color' | Blender 3.x: 'Emission'
-                self._bsdf_set(bsdf, ['Emission Color', 'Emission'], emission_color)
-                self._bsdf_set(bsdf, ['Emission Strength'], emission_strength)
+                socket_results["emission_color"] = self._bsdf_set(bsdf, ['Emission Color', 'Emission'], emission_color)
+                socket_results["emission_strength"] = self._bsdf_set(bsdf, ['Emission Strength'], emission_strength)
 
             main_link = links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
@@ -1324,12 +1493,21 @@ class BlenderMCPServer:
                 self._log("create_pbr_material", "error", "Surface link not created")
                 return {"error": "Material created but Surface link failed — check Blender console"}
 
+            # FIX: "verified" now means what it claims — the Surface link
+            # exists AND every requested PBR socket assignment actually
+            # succeeded, not just the former.
+            failed_sockets = [k for k, ok in socket_results.items() if not ok]
+            fully_verified = surface_connected and not failed_sockets
+
             self._log("create_pbr_material")
             return {
                 "created": name,
                 "wear_variation": wear_variation,
                 "nodes_added": len(nodes),
-                "verified": surface_connected,
+                "verified": fully_verified,
+                "surface_link_verified": surface_connected,
+                "socket_results": socket_results,
+                "failed_sockets": failed_sockets,
                 "blender_version": list(bpy.app.version[:2]),
             }
         except Exception as e:
@@ -1378,8 +1556,10 @@ class BlenderMCPServer:
             if obj.type == 'MESH':
                 bm, _ = self._build_bmesh_from_object(obj)
 
-                # Manifold
-                nm = sum(1 for e in bm.edges if not e.is_manifold)
+                # Manifold — same real fix as the other topology commands:
+                # e.is_manifold is False for ordinary boundary edges too,
+                # not just true non-manifold geometry (3+ linked faces).
+                nm = sum(1 for e in bm.edges if len(e.link_faces) > 2)
                 if nm: issues.append(f"{nm} non-manifold edges — will break export and UE5 import")
                 else:  passed.append("Manifold geometry")
 
@@ -1443,16 +1623,28 @@ class BlenderMCPServer:
                     if not blocking and not advisory:
                         passed.append("No blocking modifiers")
 
-                # Weight paint check (if rigged)
+                # Weight paint check (if rigged). FIX: `g.group < len(obj.vertex_groups)`
+                # is true almost always whenever groups exist at all — it never
+                # actually detected zero-weight vertices or over-influence, despite
+                # the pass message implying a real guarantee. Now checks what it
+                # claims to: true zero-assignment verts, and UE5's 8-influence limit
+                # (same real logic server.py's analyze_rig_weights already uses).
                 if obj.vertex_groups:
-                    unweighted = sum(
-                        1 for v in obj.data.vertices
-                        if not any(g.group < len(obj.vertex_groups) for g in v.groups)
-                    )
+                    unweighted = 0
+                    over_influence = 0
+                    sample_cap = 1000
+                    for i, v in enumerate(obj.data.vertices):
+                        n_assigned = len(v.groups)
+                        if n_assigned == 0:
+                            unweighted += 1
+                        if i < sample_cap and n_assigned > 8:
+                            over_influence += 1
                     if unweighted > 0:
-                        warnings.append(f"{unweighted} vertices have no weight — may collapse in UE5")
-                    else:
-                        passed.append(f"All vertices weighted ({len(obj.vertex_groups)} groups)")
+                        issues.append(f"{unweighted} vertices have NO weight group assignment — will snap to world origin in UE5")
+                    if over_influence > 0:
+                        warnings.append(f"{over_influence} vertices exceed UE5's 8-influence limit (sampled first {min(sample_cap, len(obj.data.vertices))}) — extras silently truncated")
+                    if unweighted == 0 and over_influence == 0:
+                        passed.append(f"All vertices weighted, none over the 8-influence limit ({len(obj.vertex_groups)} groups)")
 
             verdict = "PASS" if len(issues) == 0 else "FAIL"
             self._log("run_asset_qa")
@@ -1488,13 +1680,50 @@ class BlenderMCPServer:
         try:
             checks = {}
 
-            # Naming convention
+            # Naming convention — FIX: used to pass if ANY recognized UE5
+            # prefix was present, regardless of whether it was the RIGHT
+            # one for this object's actual type (a mesh named "SK_Foo"
+            # with no armature modifier used to pass). Now cross-checks
+            # the prefix against the object's real type/modifiers.
             ue_prefixes = ("SM_", "SK_", "T_", "M_", "MI_", "BP_", "A_", "P_", "NS_", "ABP_")
+            has_prefix = any(name.startswith(p) for p in ue_prefixes)
+            if obj.type == 'MESH':
+                has_armature_mod = any(m.type == 'ARMATURE' for m in obj.modifiers)
+                expected_prefix = "SK_" if has_armature_mod else "SM_"
+                naming_pass = name.startswith(expected_prefix)
+                naming_detail = (
+                    f"Name '{name}' — expected '{expected_prefix}' prefix for this "
+                    f"{'skeletal (has an Armature modifier)' if has_armature_mod else 'static'} mesh."
+                    + ("" if naming_pass else f" Has a recognized UE5 prefix but not the right one for this object."
+                       if has_prefix else " No recognized UE5 prefix at all.")
+                )
+            else:
+                # No well-defined single expected prefix for this object
+                # type (e.g. a top-level ARMATURE object) — fall back to
+                # the general "some recognized prefix present" check.
+                naming_pass = has_prefix
+                naming_detail = (f"Name '{name}' — UE5 naming: SM_ static mesh, SK_ skeletal, "
+                                  f"T_ texture, M_ material, MI_ material instance")
             checks["naming_convention"] = {
-                "pass": any(name.startswith(p) for p in ue_prefixes),
+                "pass": naming_pass,
                 "severity": "warning",
-                "detail": (f"Name '{name}' — UE5 naming: SM_ static mesh, SK_ skeletal, "
-                           f"T_ texture, M_ material, MI_ material instance"),
+                "detail": naming_detail,
+            }
+
+            # Unit scale — FIX: expected_unit_scale was accepted but never
+            # actually checked against anything (pure dead parameter, real
+            # gap found in audit). scene.unit_settings.scale_length is what
+            # actually determines what "1 Blender unit" means in real-world
+            # meters, and therefore what size the exported FBX ends up at
+            # in UE5 (which expects centimeters) — a mismatch here silently
+            # produces assets that import at the wrong scale.
+            actual_scale_length = bpy.context.scene.unit_settings.scale_length
+            unit_scale_ok = abs(actual_scale_length - expected_unit_scale) < 1e-6
+            checks["unit_scale"] = {
+                "pass": unit_scale_ok,
+                "severity": "warning",
+                "detail": (f"Scene unit scale_length={actual_scale_length} vs expected "
+                           f"{expected_unit_scale} — {'matches' if unit_scale_ok else 'MISMATCH: exported FBX size in UE5 will be off by ' + str(round(actual_scale_length / expected_unit_scale, 3)) + 'x'}"),
             }
 
             # Scale uniform
@@ -1543,11 +1772,30 @@ class BlenderMCPServer:
                     "severity": "error",
                     "detail": f"{uv_count} UV channel(s) — at least one required",
                 }
+                # FIX: real check on the actual lightmap channel (index 1) —
+                # this used to just be uv_count >= 2, a channel-count proxy
+                # that never verified channel 1 is actually non-overlapping
+                # and 0-1 bounded (the real UE5 lightmap requirements). A
+                # duplicate/overlapping UV2 used to pass with no warning.
+                lightmap_pass = uv_count >= 2
+                lightmap_detail = (f"{uv_count} UV channel(s) — UE5 Lumen/Lightmass needs "
+                                    f"channel index 1 dedicated to lightmaps")
+                if uv_count >= 2:
+                    lm_out_of_bounds = sum(
+                        1 for loop_uv in obj.data.uv_layers[1].data
+                        if not (0.0 <= loop_uv.uv.x <= 1.0 and 0.0 <= loop_uv.uv.y <= 1.0)
+                    )
+                    lm_overlap = self._count_uv_overlap_loops(obj, uv_layer_index=1)
+                    lightmap_pass = (lm_out_of_bounds == 0) and (lm_overlap == 0 if lm_overlap is not None else True)
+                    lightmap_detail = (
+                        f"{uv_count} UV channel(s); channel 1 (lightmap): "
+                        f"{lm_out_of_bounds} loop(s) outside 0-1 bounds, "
+                        f"{lm_overlap if lm_overlap is not None else 'unknown (check failed)'} overlapping loop(s)"
+                    )
                 checks["lightmap_uv"] = {
-                    "pass": uv_count >= 2,
+                    "pass": lightmap_pass,
                     "severity": "warning",
-                    "detail": (f"{uv_count} UV channel(s) — UE5 Lumen/Lightmass needs "
-                               f"channel index 1 dedicated to lightmaps"),
+                    "detail": lightmap_detail,
                 }
                 bm.free(); bm = None
 
@@ -1573,9 +1821,14 @@ class BlenderMCPServer:
                     "detail": f"No '{lod0_name}' — name LODs as [name]_LOD0, _LOD1 etc.",
                 }
 
-                # Modifiers that MUST be applied
+                # Modifiers that MUST be applied — only ones actually
+                # enabled in the viewport count; a disabled modifier
+                # produces no geometry to worry about at export. Matches
+                # run_asset_qa's already-correct convention (same object,
+                # same modifier list — the two used to disagree).
                 blocking_mods = [m.name for m in obj.modifiers
-                                 if m.type in ('BOOLEAN','ARRAY','MIRROR','BEVEL','SOLIDIFY')]
+                                 if m.type in ('BOOLEAN','ARRAY','MIRROR','BEVEL','SOLIDIFY')
+                                 and m.show_viewport]
                 checks["modifiers_applied"] = {
                     "pass": len(blocking_mods) == 0,
                     "severity": "error",
@@ -1868,10 +2121,18 @@ class BlenderMCPServer:
 
 
     def get_object_info(self, name):
-        """Get detailed information about a specific object"""
+        """Get detailed information about a specific object.
+        FIX: returns {"error": ...} like every sibling handler instead of
+        raising uncaught — the dispatcher wraps a raised exception as
+        status:"error" while every other handler's {"error": ...} return
+        comes back as status:"success" with the error nested inside
+        result; server.py's _send_raw already normalizes both to the same
+        {"error": ...} shape for callers, but this keeps the source
+        consistent with every other command instead of being the one
+        exception."""
         obj = bpy.data.objects.get(name)
         if not obj:
-            raise ValueError(f"Object not found: {name}")
+            return {"error": f"Object not found: {name}"}
 
         # Basic object info
         obj_info = {
@@ -2372,10 +2633,26 @@ class BlenderMCPServer:
 
             # Find all images related to this texture and ensure they're properly loaded
             texture_images = {}
+            normal_map_colorspace = None  # 'gl' | 'dx' | None — which convention the normal map uses
             for img in bpy.data.images:
                 if img.name.startswith(texture_id + "_"):
-                    # Extract the map type from the image name
-                    map_type = img.name.split('_')[-1].split('.')[0]
+                    # Extract the map type from the image name. FIX: filenames
+                    # often carry a colorspace suffix (e.g. "..._nor_gl.jpg")
+                    # that blindly taking the last underscore-separated token
+                    # discarded entirely — "nor_gl" became just "gl", losing
+                    # the real map type ("nor"). It only still routed to the
+                    # normal-map branch by accident because "gl"/"dx" were
+                    # ALSO separately listed as recognized normal-map keys —
+                    # the GL/DX distinction itself was never actually used to
+                    # correct anything, despite get_material_graph elsewhere
+                    # in this file knowing that distinction matters for UE5.
+                    stem = img.name[:-len('.' + img.name.split('.')[-1])] if '.' in img.name else img.name
+                    tokens = stem.split('_')
+                    if len(tokens) >= 2 and tokens[-1].lower() in ('gl', 'dx'):
+                        normal_map_colorspace = tokens[-1].lower()
+                        map_type = tokens[-2]
+                    else:
+                        map_type = tokens[-1] if tokens else stem
 
                     # Force a reload of the image
                     img.reload()
@@ -2479,7 +2756,35 @@ class BlenderMCPServer:
                     # Add normal map node
                     normal_map = nodes.new(type='ShaderNodeNormalMap')
                     normal_map.location = (x_pos + 200, y_pos)
-                    links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
+                    normal_src = tex_node.outputs['Color']
+                    # FIX: DirectX normal maps have an inverted Green channel
+                    # relative to OpenGL, which Blender's Normal Map node
+                    # assumes — a DX map fed in directly reads as inverted-Y
+                    # (concave reads convex). Now actually uses the
+                    # normal_map_colorspace detected from the filename
+                    # (previously parsed but never applied to anything).
+                    if normal_map_colorspace == 'dx':
+                        try:
+                            sep = nodes.new(type='ShaderNodeSeparateColor')
+                            sep.mode = 'RGB'
+                            comb = nodes.new(type='ShaderNodeCombineColor')
+                            comb.mode = 'RGB'
+                        except RuntimeError:
+                            sep = nodes.new(type='ShaderNodeSeparateRGB')
+                            comb = nodes.new(type='ShaderNodeCombineRGB')
+                        invert_g = nodes.new(type='ShaderNodeMath')
+                        invert_g.operation = 'SUBTRACT'
+                        invert_g.inputs[0].default_value = 1.0
+                        sep.location = (x_pos + 100, y_pos - 150)
+                        invert_g.location = (x_pos + 150, y_pos - 200)
+                        comb.location = (x_pos + 200, y_pos - 150)
+                        links.new(tex_node.outputs['Color'], sep.inputs[0])
+                        links.new(sep.outputs[0], comb.inputs[0])
+                        links.new(sep.outputs[1], invert_g.inputs[1])
+                        links.new(invert_g.outputs[0], comb.inputs[1])
+                        links.new(sep.outputs[2], comb.inputs[2])
+                        normal_src = comb.outputs[0]
+                    links.new(normal_src, normal_map.inputs['Color'])
                     links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
                 elif map_type.lower() in ['displacement', 'disp', 'height']:
                     # Add displacement node
@@ -2502,48 +2807,16 @@ class BlenderMCPServer:
                             texture_nodes[map_type] = node
                             break
 
-            # Now connect everything using the nodes instead of images
-            # Handle base color (diffuse)
-            for map_name in ['color', 'diffuse', 'albedo']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Base Color'])
-                    print(f"Connected {map_name} to Base Color")
-                    break
-
-            # Handle roughness
-            for map_name in ['roughness', 'rough']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Roughness'])
-                    print(f"Connected {map_name} to Roughness")
-                    break
-
-            # Handle metallic
-            for map_name in ['metallic', 'metalness', 'metal']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Metallic'])
-                    print(f"Connected {map_name} to Metallic")
-                    break
-
-            # Handle normal maps
-            for map_name in ['gl', 'dx', 'nor']:
-                if map_name in texture_nodes:
-                    normal_map_node = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map_node.location = (100, 100)
-                    links.new(texture_nodes[map_name].outputs['Color'], normal_map_node.inputs['Color'])
-                    links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                    print(f"Connected {map_name} to Normal")
-                    break
-
-            # Handle displacement
-            for map_name in ['displacement', 'disp', 'height']:
-                if map_name in texture_nodes:
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (300, -200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(texture_nodes[map_name].outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-                    print(f"Connected {map_name} to Displacement")
-                    break
+            # Base Color/Roughness/Metallic/Normal/Displacement were already
+            # connected in the first pass above. FIX: this second pass used
+            # to redundantly re-create a SECOND ShaderNodeNormalMap and
+            # ShaderNodeDisplacement node for the same map and re-link them,
+            # silently orphaning the first pass's nodes (dead, disconnected
+            # nodes left in the graph — get_material_graph's orphaned_nodes
+            # detection would flag these as authoring mistakes that were
+            # actually this function's own bug). texture_nodes (built just
+            # above) is still needed here for the ARM/AO-specific handling
+            # below, which the first pass never covers.
 
             # Handle ARM texture (Ambient Occlusion, Roughness, Metallic)
             if 'arm' in texture_nodes:

@@ -43,12 +43,15 @@ metal_recipe_fp = {"roughness_source": "texture_sampled", "roughness_avg": 0.9,
                     "normal_map_bumpiness": 0.1, "subsurface_weight": 0.0, "specular_ior_level": 0.5}
 
 
-def make_fake(material_name, roughness_sequence, object_materials=None, fingerprint_for_scan=None, faces_using_material=100):
+def make_fake(material_name, roughness_sequence, object_materials=None, fingerprint_for_scan=None,
+              faces_using_material=100, bump_stdev=0.03):
     """roughness_sequence: list of measured_roughness values returned by
     successive build_and_measure() calls (build script), popped in order.
     faces_using_material defaults to a nonzero value — these tests are about
     the calibration loop itself, not the separate 0-faces failure mode
-    (covered by its own dedicated test below)."""
+    (covered by its own dedicated test below). bump_stdev is the fixed
+    measured_bump_stdev returned on every call (pass None to simulate a
+    failed bump calibration bake)."""
     seq = list(roughness_sequence)
 
     def fake(cmd, **kwargs):
@@ -63,6 +66,7 @@ def make_fake(material_name, roughness_sequence, object_materials=None, fingerpr
                 return {"result": json.dumps({
                     "object": "X", "material": material_name,
                     "created_material": True, "measured_roughness": val,
+                    "measured_bump_stdev": bump_stdev,
                     "faces_using_material": faces_using_material, "auto_assigned_all_faces": False,
                 })}
             if "has_principled" in code:
@@ -92,12 +96,28 @@ out = json.loads(server.generate_procedural_material(object_name="X", material_n
 check("explicit target_recipe resolves category from the named recipe", out.get("category_used") == "metal")
 check("explicit target_recipe is echoed as canonical_recipe_used", out.get("canonical_recipe_used") == "test_metal")
 check("in-tolerance first-pass measurement reports calibration_status=matched", out.get("calibration_status") == "matched")
-check("bump_strength_heuristic is bumpiness x3, clamped, and labeled unverified", out.get("bump_strength_heuristic") == 0.3
-      and "unverified" in out.get("bump_strength_note", ""))
+check("bump_strength_heuristic is bumpiness x3, clamped, and the input formula is labeled a heuristic",
+      out.get("bump_strength_heuristic") == 0.3 and "heuristic" in out.get("bump_strength_note", ""))
 check("metallic_set follows the category-based constant (metal -> 0.9)", out.get("metallic_set") == 0.9)
 check("only one calibration attempt was needed", len(out.get("calibration_attempts", [])) == 1)
 check("category=metal reuses the real rust_color constant, not an invented color",
       out.get("color_source") == "reused_rust_color")
+check("a successful bump calibration bake reports bump_verification.status=measured",
+      out.get("bump_verification", {}).get("status") == "measured")
+check("bump_verification carries the real measured stdev, not the input heuristic value",
+      out.get("bump_verification", {}).get("measured_stdev") == 0.03)
+
+# ── A failed bump calibration bake is reported honestly, not silently dropped ──
+server._send_raw = make_fake("M", [0.9], bump_stdev=None)
+out = json.loads(server.generate_procedural_material(object_name="X", material_name="M", target_recipe="test_metal")[-1])
+check("a failed bump calibration bake reports bump_verification.status=unverified",
+      out.get("bump_verification", {}).get("status") == "unverified")
+
+# ── Zero faces assigned means bump can't be verified either, same honesty as roughness ──
+server._send_raw = make_fake("M", [0.6], faces_using_material=0)
+out = json.loads(server.generate_procedural_material(object_name="X", material_name="M", target_recipe="test_metal")[-1])
+check("zero faces assigned means bump_verification is also honestly unverified",
+      out.get("bump_verification", {}).get("status") == "unverified")
 
 # ── target_recipe that doesn't exist -> honest error, not a silent default ──
 server._send_raw = make_fake("M", [])

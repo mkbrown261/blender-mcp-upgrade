@@ -816,7 +816,10 @@ _PRODUCTION_RULES: list = [
         "severity": "warning",
         "predicate": lambda dna: (
             dna.get("identity", {}).get("category")
-            and dna.get("identity", {}).get("vertex_count", 0) > _PLAYBOOKS.get(dna["identity"]["category"], {}).get("vert_budget", float("inf"))
+            and dna.get("identity", {}).get("vertex_count", 0) > _studio_vert_budget(
+                dna["identity"]["category"],
+                _PLAYBOOKS.get(dna["identity"]["category"], {}).get("vert_budget", float("inf")),
+            )
         ),
         "recommendation": "Decimate before export — vertex count exceeds this playbook's budget.",
         "why": "Each playbook sets a vert_budget for its asset category based on real-time performance "
@@ -3028,7 +3031,7 @@ def set_playbook(playbook: str) -> str:
         "playbook_activated": playbook,
         "name":              pb["name"],
         "description":       pb["description"],
-        "vert_budget":       pb["vert_budget"],
+        "vert_budget":       _studio_vert_budget(playbook, pb["vert_budget"]),
         "uv_channels":       pb["uv_channels"],
         "material_limit":    pb["material_limit"],
         "topology_score_min": pb["topology_score_min"],
@@ -3056,7 +3059,7 @@ def list_playbooks() -> str:
         summary[key] = {
             "name":        pb["name"],
             "description": pb["description"],
-            "vert_budget": pb["vert_budget"],
+            "vert_budget": _studio_vert_budget(key, pb["vert_budget"]),
             "material_limit": pb["material_limit"],
             "mandatory_checks": pb["mandatory_checks"],
         }
@@ -6541,12 +6544,17 @@ def generate_procedural_material(
       nudges the formula and re-measures; still-out-of-tolerance after that
       is reported as "approximate" with the real measured number attached —
       never silently claimed as a match.
-    - Bump strength (visual bumpiness) is a documented, UNVERIFIED linear
-      heuristic (normal_map_bumpiness x3, clamped 0-1) — the knowledge layer
-      only ever recorded bumpiness as a scalar magnitude, never spatial
-      frequency, and verifying it would require baking a Normal-vector
-      output through a color-space bake that isn't reliable enough to trust
-      yet. Reported as bump_strength_heuristic, not claimed as measured.
+    - Bump strength (visual bumpiness): the INPUT formula (normal_map_
+      bumpiness x3, clamped 0-1) is still a documented heuristic — the
+      knowledge layer only ever recorded bumpiness as a scalar magnitude,
+      never spatial frequency, so there's no formula to derive exactly.
+      What IS real now: bump_verification bakes the resulting Bump.Normal
+      output (via the same safe_bake_measure used for Roughness) and
+      reports its measured stdev — a relative spatial-variance signal, the
+      same TYPE of measurement normal_map_bumpiness itself already is, not
+      a claim of decoding literal normal-vector directions from baked
+      pixels (that would be unreliable). A same-units sanity check on the
+      OUTPUT, even though the INPUT formula stays a heuristic.
     - Metallic is a category-based constant (0.9 for "metal", else 0.0) —
       the fingerprint has never recorded a metallic signal, only roughness/
       subsurface/specular/normal-bumpiness, so this is a plain, documented
@@ -6807,11 +6815,27 @@ else:
             measured_roughness, _ = sample_avg_stdev(calib_img)
             bpy.data.images.remove(calib_img)
 
+    # Bump verification — NOT a claim of reading literal normal-vector
+    # directions from baked pixel data (fragile, why this was skipped
+    # originally). Measures stdev of the baked Bump.Normal output as a
+    # relative spatial-variance signal — the SAME TYPE of measurement
+    # normal_map_bumpiness itself already is (stdev of a real normal map's
+    # channel, not an absolute physical unit) — and compares it against
+    # target_bumpiness for a same-units sanity check, not an exact match.
+    measured_bump_stdev = None
+    if output_node is not None:
+        bump_img = safe_bake_measure(obj, nt, mat_slot_index, output_node, bump.outputs["Normal"],
+                                      "TEMP_ProcMatBumpCalib", 32, 32, 8)
+        if bump_img is not None:
+            _, measured_bump_stdev = sample_avg_stdev(bump_img)
+            bpy.data.images.remove(bump_img)
+
     print(json.dumps({
         "object": '{OBJ}',
         "material": '{MAT}',
         "created_material": created_material,
         "measured_roughness": measured_roughness,
+        "measured_bump_stdev": measured_bump_stdev,
         "faces_using_material": faces_using_material,
         "auto_assigned_all_faces": auto_assigned_all_faces,
     }))
@@ -6883,6 +6907,22 @@ else:
         elif roughness_was_recorded and measured is None:
             calibration_status = "unverified"  # internal bake failed — real, not silenced
 
+        measured_bump_stdev = pass_1.get("measured_bump_stdev")
+        if faces_using_material == 0:
+            bump_verification = {"status": "unverified", "note": "no faces assigned — see faces_using_material"}
+        elif measured_bump_stdev is None:
+            bump_verification = {"status": "unverified", "note": "internal bump calibration bake failed"}
+        else:
+            bump_verification = {
+                "status": "measured",
+                "measured_stdev": measured_bump_stdev,
+                "target_bumpiness": round(target_bumpiness, 4),
+                "note": "a relative spatial-variance signal (stdev of the baked Bump.Normal output) — "
+                        "the same TYPE of measurement normal_map_bumpiness itself already is, not a "
+                        "claim of decoding literal normal-vector directions. A same-units sanity check, "
+                        "not an exact-match guarantee.",
+            }
+
         result = {
             "object": object_name,
             "material": material_name,
@@ -6894,7 +6934,9 @@ else:
             "calibration_status": calibration_status,
             "calibration_attempts": attempts,
             "bump_strength_heuristic": round(bump_strength, 4),
-            "bump_strength_note": "unverified linear heuristic (normal_map_bumpiness x3) — not re-measured",
+            "bump_strength_note": "the input formula (normal_map_bumpiness x3) is still a heuristic — "
+                                   "see bump_verification for the real measured result it produced",
+            "bump_verification": bump_verification,
             "metallic_set": metallic_const,
             "subsurface_weight_set": target_subsurface,
             "specular_ior_level_set": target_specular,
@@ -6952,11 +6994,19 @@ def split_blended_material(
     WHAT THIS ACTUALLY DOES — scoped honestly, not oversold:
     - Recomputes the same real per-island Base Color samples heterogeneity
       detection already measured, then splits them into exactly TWO groups
-      via the single largest gap in sorted island averages — a real,
-      deterministic clustering, not a guess, but coarser than an N-way
-      split. A material blending 3+ very different substances will have its
-      single most different one separated out per call; re-running this
-      tool on the remainder can peel off further groups.
+      via the largest gap in sorted island averages whose minority side is
+      at least 2% of the object's total faces — a real, deterministic
+      clustering, but coarser than an N-way split. Real fix from a live
+      incident: the largest gap ALONE, with no size floor, peeled off
+      exactly 1 face out of ~1.9M on a real test asset — technically a
+      split, practically useless. Candidate gaps are now walked
+      largest-first and any whose minority side is a stray fragment (below
+      that 2% floor) is skipped in favor of the next one; "no meaningful
+      split" is reported honestly if none qualify, rather than accepting
+      whichever gap happened to be biggest. A material blending 3+ very
+      different substances will have its single most different SUBSTANTIAL
+      group separated out per call; re-running this tool on the remainder
+      can peel off further groups.
     - The minority group (fewer islands) gets its faces reassigned
       (polygon.material_index) to a NEW material — a direct .copy() of the
       original, so it starts with the SAME shared texture. This tool does
@@ -7090,15 +7140,44 @@ else:
             island_info.sort(key=lambda x: x["avg"])
             gaps = [(island_info[i+1]["avg"] - island_info[i]["avg"], i) for i in range(len(island_info) - 1)]
             gaps.sort(reverse=True)
-            split_at = gaps[0][1]  # index of the largest gap
-            group_a = island_info[:split_at + 1]
-            group_b = island_info[split_at + 1:]
 
-            if not group_a or not group_b:
-                print(json.dumps({"error": "Could not find a meaningful split — all islands landed in one group."}))
+            # Real live incident: the single-largest-gap on its own peeled
+            # off exactly 1 face out of ~1.9M on the couch — technically a
+            # "split," practically useless. A real split needs the minority
+            # group to be a genuine chunk of the mesh, not a stray fragment.
+            # Walk candidate gaps largest-first and skip any whose minority
+            # side is below MIN_SPLIT_FRACTION of the object's total faces,
+            # rather than accepting whichever gap happens to be biggest.
+            MIN_SPLIT_FRACTION = 0.02
+            total_faces = sum(len(e["faces"]) for e in island_info)
+            minority = None
+            majority = None
+            for _, split_at in gaps:
+                cand_a = island_info[:split_at + 1]
+                cand_b = island_info[split_at + 1:]
+                if not cand_a or not cand_b:
+                    continue
+                # Real bug caught live: picking "minority" by ISLAND COUNT
+                # (fewer islands) instead of FACE COUNT reassigned 99.9998%
+                # of a real mesh's faces to the "minority" group, because
+                # that side happened to have fewer but much larger islands
+                # — backwards from what "minority" is supposed to mean.
+                faces_a = sum(len(e["faces"]) for e in cand_a)
+                faces_b = sum(len(e["faces"]) for e in cand_b)
+                cand_minority = cand_a if faces_a < faces_b else cand_b
+                cand_majority = cand_b if cand_minority is cand_a else cand_a
+                minority_faces = min(faces_a, faces_b)
+                if total_faces and (minority_faces / total_faces) >= MIN_SPLIT_FRACTION:
+                    minority, majority = cand_minority, cand_majority
+                    break
+
+            if minority is None:
+                print(json.dumps({
+                    "error": "Could not find a meaningful split — every candidate gap's minority group "
+                              "was below {}% of the object's faces (largest was a stray fragment, not a "
+                              "real substance region).".format(round(MIN_SPLIT_FRACTION * 100, 1)),
+                }))
             else:
-                minority = group_a if len(group_a) < len(group_b) else group_b
-                majority = group_b if minority is group_a else group_a
 
                 new_mat = mat.copy()
                 new_mat.name = mat.name + "_split"
@@ -7166,6 +7245,197 @@ else:
     except Exception as e:
         logger.error(f"Error in split_blended_material: {e}")
         return [json.dumps({"error": str(e)})]
+
+
+_SMOKE_TEST_OBJ = "_LiveSmokeTest_Cube"
+_SMOKE_TEST_SENTINEL_MAT = "_LiveSmokeTest_Sentinel"
+_SMOKE_TEST_TARGET_MAT = "_LiveSmokeTest_Target"
+_SMOKE_TEST_TEX = "_LiveSmokeTest_SentinelTex"
+_SMOKE_TEST_SENTINEL_RGB = (0.8, 0.2, 0.1)
+
+
+def _smoke_test_sample_sentinel() -> Optional[list]:
+    """Directly samples the sentinel texture's real pixel average — the
+    same technique that caught the live black-couch corruption bug
+    (measuring, not assuming). Returns [r, g, b] or None if the sentinel
+    doesn't exist (setup failed)."""
+    code = r"""
+import bpy, json
+img = bpy.data.images.get('{TEX}')
+if img is None:
+    print(json.dumps({"error": "sentinel image not found"}))
+else:
+    px = img.pixels[:]
+    n = len(px) // 4
+    r = sum(px[i] for i in range(0, len(px), 4)) / n
+    g = sum(px[i+1] for i in range(0, len(px), 4)) / n
+    b = sum(px[i+2] for i in range(0, len(px), 4)) / n
+    print(json.dumps({"rgb": [round(r, 4), round(g, 4), round(b, 4)]}))
+""".replace("{TEX}", _SMOKE_TEST_TEX)
+    raw = _send_raw("execute_code_safe", code=code, required_mode="OBJECT", push_undo=False)
+    if "error" in raw:
+        return None
+    for line in raw.get("result", "").strip().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            parsed = json.loads(line)
+            return parsed.get("rgb")
+    return None
+
+
+@mcp.tool()
+def live_material_smoke_test(cleanup: bool = True) -> str:
+    """
+    LIVE SMOKE TEST — the actual insurance against tonight's incident, not
+    just documentation of it. Every unit test in this codebase is mocked;
+    the black-couch corruption bug passed all 292 of them and was only
+    caught by manually creating a two-material test object, baking one
+    material, and directly sampling the OTHER material's real pixel data
+    to see if it changed. This tool formalizes exactly that process into a
+    repeatable, callable check instead of a throwaway script — run it any
+    time a change touches generate_procedural_material, bake_weathered_
+    textures, apply_weathering_recipe, or safe_bake_measure, before calling
+    that change "verified."
+
+    What it does:
+    1. Creates a disposable two-material test object far from the origin
+       (won't visually collide with real scene content): a blank TARGET
+       material, and a SENTINEL material with a known, non-black texture
+       (0.8/0.2/0.1 — the same values used to catch the real bug tonight).
+    2. Samples the sentinel's real pixels (before).
+    3. Runs generate_procedural_material on the TARGET material only.
+    4. Re-samples the sentinel — must be unchanged. This is the exact
+       regression class that shipped once already.
+    5. Runs apply_weathering_recipe then bake_weathered_textures on the
+       TARGET material — the OTHER real call site with the same historical
+       exposure — and re-samples the sentinel again.
+    6. Cleans up the disposable object (unless cleanup=False, useful for
+       manual follow-up inspection in the Blender UI).
+
+    Returns a structured report: which checks ran, the actual measured
+    sentinel RGB at each stage, and a plain PASS/FAIL verdict per check —
+    not just "no exception was raised." A smoke test that can't fail isn't
+    a real check; each stage's tolerance (0.02 per channel) is tight enough
+    that the real corruption bug (sentinel going fully black, a ~0.8 swing)
+    would have failed it immediately.
+    """
+    report = {"checks": [], "verdict": "UNKNOWN"}
+
+    setup_code = r"""
+import bpy, json
+old = bpy.data.objects.get('{OBJ}')
+if old:
+    bpy.data.objects.remove(old, do_unlink=True)
+for matname in ['{SENTINEL}', '{TARGET}']:
+    m = bpy.data.materials.get(matname)
+    if m:
+        bpy.data.materials.remove(m)
+img_existing = bpy.data.images.get('{TEX}')
+if img_existing:
+    bpy.data.images.remove(img_existing)
+
+bpy.ops.mesh.primitive_cube_add(size=2, location=(1000, 1000, 1000))
+cube = bpy.context.active_object
+cube.name = '{OBJ}'
+
+mat_target = bpy.data.materials.new(name='{TARGET}')
+mat_target.use_nodes = True
+cube.data.materials.append(mat_target)
+
+mat_sentinel = bpy.data.materials.new(name='{SENTINEL}')
+mat_sentinel.use_nodes = True
+img = bpy.data.images.new('{TEX}', width=16, height=16, alpha=False)
+px = list(img.pixels)
+for i in range(0, len(px), 4):
+    px[i] = {R}; px[i+1] = {G}; px[i+2] = {B}
+img.pixels = px
+img.update()
+tex_node = mat_sentinel.node_tree.nodes.new("ShaderNodeTexImage")
+tex_node.image = img
+principled = next(n for n in mat_sentinel.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+mat_sentinel.node_tree.links.new(tex_node.outputs["Color"], principled.inputs["Base Color"])
+tex_node.select = True
+mat_sentinel.node_tree.nodes.active = tex_node
+cube.data.materials.append(mat_sentinel)
+
+for i, p in enumerate(cube.data.polygons):
+    p.material_index = 1 if i % 2 == 0 else 0
+cube.data.update()
+print(json.dumps({"ok": True}))
+""".replace("{OBJ}", _SMOKE_TEST_OBJ).replace("{SENTINEL}", _SMOKE_TEST_SENTINEL_MAT) \
+   .replace("{TARGET}", _SMOKE_TEST_TARGET_MAT).replace("{TEX}", _SMOKE_TEST_TEX) \
+   .replace("{R}", str(_SMOKE_TEST_SENTINEL_RGB[0])).replace("{G}", str(_SMOKE_TEST_SENTINEL_RGB[1])) \
+   .replace("{B}", str(_SMOKE_TEST_SENTINEL_RGB[2]))
+
+    def cleanup_test_object():
+        cleanup_code = r"""
+import bpy, json
+obj = bpy.data.objects.get('{OBJ}')
+if obj:
+    bpy.data.objects.remove(obj, do_unlink=True)
+for matname in ['{SENTINEL}', '{TARGET}']:
+    m = bpy.data.materials.get(matname)
+    if m:
+        bpy.data.materials.remove(m)
+img = bpy.data.images.get('{TEX}')
+if img:
+    bpy.data.images.remove(img)
+print(json.dumps({"ok": True}))
+""".replace("{OBJ}", _SMOKE_TEST_OBJ).replace("{SENTINEL}", _SMOKE_TEST_SENTINEL_MAT) \
+   .replace("{TARGET}", _SMOKE_TEST_TARGET_MAT).replace("{TEX}", _SMOKE_TEST_TEX)
+        _send_raw("execute_code_safe", code=cleanup_code, required_mode="OBJECT", push_undo=False)
+
+    try:
+        raw = _send_raw("execute_code_safe", code=setup_code, required_mode="OBJECT", push_undo=True)
+        if "error" in raw:
+            report["verdict"] = "SETUP_FAILED"
+            report["error"] = raw["error"]
+            return json.dumps(report, indent=2)
+
+        def tolerance_ok(before, after):
+            if before is None or after is None:
+                return False
+            return all(abs(b - a) <= 0.02 for b, a in zip(before, after))
+
+        rgb_initial = _smoke_test_sample_sentinel()
+        report["sentinel_initial_rgb"] = rgb_initial
+
+        _invalidate_dna_cache(_SMOKE_TEST_OBJ)
+        gen_result = generate_procedural_material(
+            object_name=_SMOKE_TEST_OBJ, material_name=_SMOKE_TEST_TARGET_MAT, category="metal"
+        )
+        gen_parsed = json.loads(gen_result[-1])
+        rgb_after_gen = _smoke_test_sample_sentinel()
+        gen_ok = tolerance_ok(rgb_initial, rgb_after_gen) and "error" not in gen_parsed
+        report["checks"].append({
+            "check": "generate_procedural_material does not corrupt the sentinel material",
+            "pass": gen_ok,
+            "sentinel_rgb_after": rgb_after_gen,
+            "generate_result_had_error": "error" in gen_parsed,
+        })
+
+        weather_result = apply_weathering_recipe(object_name=_SMOKE_TEST_OBJ, material_name=_SMOKE_TEST_TARGET_MAT)
+        weather_parsed = json.loads(weather_result[-1])
+        bake_result = bake_weathered_textures(
+            object_name=_SMOKE_TEST_OBJ, material_name=_SMOKE_TEST_TARGET_MAT,
+            output_dir=_DNA_EXPORT_DIR, resolution=64, force=True,
+        )
+        bake_parsed = json.loads(bake_result[-1])
+        rgb_after_bake = _smoke_test_sample_sentinel()
+        bake_ok = tolerance_ok(rgb_initial, rgb_after_bake) and "error" not in bake_parsed
+        report["checks"].append({
+            "check": "apply_weathering_recipe + bake_weathered_textures do not corrupt the sentinel material",
+            "pass": bake_ok,
+            "sentinel_rgb_after": rgb_after_bake,
+            "weather_had_error": "error" in weather_parsed,
+            "bake_had_error": "error" in bake_parsed,
+        })
+
+        report["verdict"] = "PASS" if all(c["pass"] for c in report["checks"]) else "FAIL"
+        return json.dumps(report, indent=2)
+    finally:
+        if cleanup:
+            cleanup_test_object()
 
 
 @mcp.tool()
@@ -7700,11 +7970,14 @@ def get_session_log() -> str:
 # 1 hiding it completely). First live run measured island_count=6,
 # color_variance=0.00153 — the original 0.01 starting guess was ~6.5x too
 # high and missed it (likely_blended came back False on a case we KNOW is
-# blended). Set below that real measured value with margin. Caveat, stated
-# honestly: no known-NON-blended textured object was available live to
-# calibrate the other side (avoid false positives) — this is a
-# single-data-point calibration on the positive side only, pending a second
-# real object to bound it from below.
+# blended). Set below that real measured value with margin.
+#
+# Second data point (the negative side, closing the original single-point
+# gap): a genuinely single-substance test object (UV-seamed sphere, 3 real
+# islands, one perfectly uniform gray texture) measured color_variance=0.0
+# — correctly reports likely_blended=False at this threshold, no false
+# positive. Both real measurements now bracket 0.001 consistently: 0.0
+# (known-clean) < 0.001 (threshold) < 0.00153 (known-blended).
 _HETEROGENEITY_THRESHOLD = 0.001
 
 _PBR_SOCKET_SCAN_SCRIPT = _SAFE_MATERIAL_BAKE_SNIPPET + r"""
@@ -8091,6 +8364,10 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
 
         category = _session_get("active_playbook")
         playbook = _PLAYBOOKS.get(category) if category else None
+        effective_vert_budget = (
+            _studio_vert_budget(category, playbook.get("vert_budget", float("inf")))
+            if playbook else None
+        )
 
         # Retrieval by measured similarity, not by material name — auto-
         # generated names (tripo_mat_XXXXXXXX) never match a trigger_phrase,
@@ -8129,9 +8406,9 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
                 "rig_present": has_armature,
                 "lod_naming_present": checks.get("lod_naming", {}).get("pass", False),
                 "collision_mesh_present": checks.get("collision_mesh", {}).get("pass", False),
-                "playbook_vert_budget": playbook.get("vert_budget") if playbook else None,
+                "playbook_vert_budget": effective_vert_budget,
                 "over_budget": (
-                    bool(playbook) and counts.get("verts", 0) > playbook.get("vert_budget", float("inf"))
+                    bool(playbook) and counts.get("verts", 0) > (effective_vert_budget or float("inf"))
                 ),
             },
         }
@@ -9143,7 +9420,7 @@ def what_next(object_name: str, context: str = "") -> str:
         playbook_conflicts = []
         if pb:
             pb_name = pb["name"]
-            pb_vert = pb["vert_budget"]
+            pb_vert = _studio_vert_budget(_session_get("active_playbook"), pb["vert_budget"])
             # Vertex budget conflict check — state it, don't resolve silently
             if vertex_count > pb_vert:
                 ratio = vertex_count / pb_vert
@@ -11228,14 +11505,15 @@ def critique_mesh(
         playbook_context = None
         if pb:
             topo_min = pb.get("topology_score_min", 60)
+            pb_vert_budget = _studio_vert_budget(_session_get("active_playbook"), pb["vert_budget"])
             playbook_context = {
                 "playbook":           pb["name"],
                 "topology_score_min": topo_min,
                 "topology_pass":      topo_score >= topo_min,
                 "topology_verdict":   f"{topo_score}/100 — {'PASS' if topo_score >= topo_min else 'FAIL'} for {pb['name']} standard (min {topo_min})",
-                "vert_budget":        pb["vert_budget"],
+                "vert_budget":        pb_vert_budget,
                 "vert_count":         vert_count,
-                "vert_budget_pass":   vert_count <= pb["vert_budget"],
+                "vert_budget_pass":   vert_count <= pb_vert_budget,
             }
 
         # ── Build report ──────────────────────────────────────────────────────
@@ -11446,33 +11724,68 @@ def production_review(
             if isinstance(m, dict)
         )
 
-        # Vertex budget conflict
-        BUDGET_LIMITS = {
-            "hero_character":       80_000,
-            "character":            80_000,
-            "npc":                  30_000,
-            "background_character": 15_000,
-            "crowd_character":       8_000,
-            "weapon":               15_000,
-            "weapon_or_prop":       15_000,
-            "environment_prop":     20_000,
-            "vehicle":              60_000,
-            "creature":             60_000,
-        }
-        limit = BUDGET_LIMITS.get(effective_type)
-        if limit and vert_count > limit:
-            ratio = vert_count / limit
-            conflicts.append({
-                "conflict":       "Vertex budget exceeded",
-                "data_shows":     f"{vert_count:,} vertices — {ratio:.1f}× the typical {effective_type} limit ({limit:,})",
-                "stated_type":    effective_type,
-                "confirm_question": (
-                    f"I see {vert_count:,} vertices. That's {ratio:.1f}× the typical {effective_type} budget. "
-                    f"Is this intentional (e.g. cinematic asset, hero tier) or should I evaluate against a different asset type?"
-                ),
-            })
-            _session_append("surfaced_conflicts",
-                f"vert_budget: {vert_count:,} is {ratio:.1f}x {effective_type} limit")
+        # Granular triangle budget — checked FIRST: if effective_type names a
+        # specific tri_budgets entry (e.g. "Giant Boss", "Sword"), that's a
+        # more precise real number than the broad vertex-based table below,
+        # and triangle count is what these numbers actually mean. Falls
+        # through to the broad vertex check when no granular match exists.
+        # limit stays None on the granular path — real bug caught by the
+        # test suite: the "strengths" section further down reads `limit`
+        # unconditionally and would raise UnboundLocalError otherwise.
+        limit = None
+        tri_budget = _studio_tri_budget(effective_type)
+        if tri_budget:
+            topo_stats = raw_topology.get("stats", {}) if "error" not in raw_topology else {}
+            tri_estimate = _estimate_triangle_count(
+                raw_quality.get("counts", {}).get("faces", 0) or 0,
+                topo_stats.get("quad_ratio_pct"),
+                topo_stats.get("tris_pct"),
+            )
+            est_tris = tri_estimate["estimated_tri_count"]
+            if est_tris > tri_budget:
+                ratio = est_tris / tri_budget
+                conflicts.append({
+                    "conflict":       "Triangle budget exceeded",
+                    "data_shows":     f"~{est_tris:,} triangles ({'exact' if tri_estimate['exact'] else 'estimated — ngon portion approximated'}) "
+                                      f"— {ratio:.1f}× the studio_profile {effective_type} ceiling ({tri_budget:,})",
+                    "stated_type":    effective_type,
+                    "confirm_question": (
+                        f"I estimate ~{est_tris:,} triangles, {ratio:.1f}× the {effective_type} ceiling "
+                        f"({tri_budget:,}) from studio_profile.json. Is this intentional or should I "
+                        f"evaluate against a different asset type?"
+                    ),
+                })
+                _session_append("surfaced_conflicts",
+                    f"tri_budget: ~{est_tris:,} is {ratio:.1f}x {effective_type} ceiling")
+        else:
+            # Broad vertex budget conflict — unchanged behavior, now backed
+            # by studio_profile.json instead of a third hardcoded table.
+            BUDGET_LIMITS = {
+                "hero_character":       80_000,
+                "character":            80_000,
+                "npc":                  30_000,
+                "background_character": 15_000,
+                "crowd_character":       8_000,
+                "weapon":               15_000,
+                "weapon_or_prop":       15_000,
+                "environment_prop":     20_000,
+                "vehicle":              60_000,
+                "creature":             60_000,
+            }
+            limit = _studio_vert_budget(effective_type, BUDGET_LIMITS.get(effective_type))
+            if limit and vert_count > limit:
+                ratio = vert_count / limit
+                conflicts.append({
+                    "conflict":       "Vertex budget exceeded",
+                    "data_shows":     f"{vert_count:,} vertices — {ratio:.1f}× the typical {effective_type} limit ({limit:,})",
+                    "stated_type":    effective_type,
+                    "confirm_question": (
+                        f"I see {vert_count:,} vertices. That's {ratio:.1f}× the typical {effective_type} budget. "
+                        f"Is this intentional (e.g. cinematic asset, hero tier) or should I evaluate against a different asset type?"
+                    ),
+                })
+                _session_append("surfaced_conflicts",
+                    f"vert_budget: {vert_count:,} is {ratio:.1f}x {effective_type} limit")
 
         # Rig/no-rig conflict
         if "character" in effective_type and not has_arm:
@@ -13019,7 +13332,6 @@ def simulate_production_readiness(object_name: str, asset_type: str = "") -> str
         # Resolve asset type
         eff_type = asset_type or _session_get("asset_type") or "unknown"
         pb       = _get_active_playbook()
-        pb_budgets = pb.get("vert_budget", {}) if pb else {}
 
         # ── Extract signals ────────────────────────────────────────────────
         prob_map  = {p.get("type",""): p.get("count",0)
@@ -13093,9 +13405,14 @@ def simulate_production_readiness(object_name: str, asset_type: str = "") -> str
             "Pivot not at origin — asset will rotate/translate incorrectly in UE5.",
         )
 
-        # Vert budget check
-        budget = (pb_budgets.get(eff_type) or
-                  {"hero_character": 80000, "weapon": 15000, "env_prop": 5000}.get(eff_type, 50000))
+        # Vert budget check — real bug fixed here: pb["vert_budget"] is a
+        # single int for the active playbook, not a dict keyed by asset
+        # type; `pb.get("vert_budget", {}).get(eff_type)` would raise
+        # AttributeError on any int whenever a playbook was active. Now
+        # goes through the real studio_profile-backed lookup instead.
+        budget = _studio_vert_budget(
+            eff_type, {"hero_character": 80000, "weapon": 15000, "env_prop": 5000}.get(eff_type, 50000)
+        )
         scorecard["PERFORMANCE"] = _grade(
             vert_count > budget * 1.5,
             vert_count > budget,
@@ -13176,7 +13493,6 @@ def review_board(object_name: str, asset_type: str = "") -> str:
 
         eff_type   = asset_type or _session_get("asset_type") or "unknown"
         pb         = _get_active_playbook()
-        pb_budgets = pb.get("vert_budget", {}) if pb else {}
 
         prob_map   = {p.get("type",""): p.get("count",0)
                       for p in raw_problems.get("problems", [])}
@@ -13195,9 +13511,13 @@ def review_board(object_name: str, asset_type: str = "") -> str:
         has_arm    = any(m.get("type") == "ARMATURE"
                          for m in raw_quality.get("modifiers", []) if isinstance(m, dict))
         mat_list   = raw_obj_info.get("materials", [])
-        budget     = (pb_budgets.get(eff_type) or
-                      {"hero_character": 80000, "weapon": 15000, "env_prop": 5000
-                       }.get(eff_type, 50000))
+        # Real bug fixed here too — pb["vert_budget"] is a single int, not
+        # a dict keyed by asset type; the old pb_budgets.get(eff_type)
+        # would raise AttributeError on any int whenever a playbook was
+        # active. Now goes through the real studio_profile-backed lookup.
+        budget     = _studio_vert_budget(
+            eff_type, {"hero_character": 80000, "weapon": 15000, "env_prop": 5000}.get(eff_type, 50000)
+        )
         # run_unreal_readiness_check's real schema has no "issues" key — the
         # actual readiness flag is "ue5_ready" (bool). The old "issues" lookup
         # always returned None (falsy), so this was always True regardless of
@@ -13427,99 +13747,166 @@ def critique_artistic(object_name: str, context: str = "") -> list:
         return [{"error": str(e), "object": object_name}]
 
 
-@mcp.tool()
-def load_studio_profile(show_current: bool = False) -> str:
-    """
-    STUDIO PROFILE — loads studio_profile.json (next to server.py): vert
-    budgets, texel density, naming conventions, UV/export settings, used by
-    simulate_production_readiness/review_board/production_review instead of
-    generic defaults. Creates the file with defaults if missing.
-    """
+_STUDIO_PROFILE_DEFAULT = {
+    "_comment": "Studio QA profile — edit these values to match YOUR studio's standards.",
+    "studio_name": "My Studio",
+    "target_engine": "UE5",
+    "vert_budgets": {
+        "hero_character":      80000,
+        "background_character": 20000,
+        "crowd_character":     10000,
+        "weapon":              15000,
+        "environment_prop":     5000,
+        "vehicle":             50000,
+        "creature":            60000,
+    },
+    "tri_budgets": {},
+    "texel_density": {
+        "hero_character":   10.24,   # px/cm
+        "weapon":            5.12,
+        "environment_prop":  2.56,
+    },
+    "uv_requirements": {
+        "require_lightmap_channel": True,
+        "max_uv_overlap_pct":       5.0,
+        "min_uv_margin_px":         4,
+    },
+    "topology_standards": {
+        "min_quad_pct":         75.0,
+        "max_ngon_pct":          2.0,
+        "max_poles_per_1k_verts": 5,
+    },
+    "naming_conventions": {
+        "mesh_prefix":      "SM_",
+        "skeletal_prefix":  "SK_",
+        "material_prefix":  "M_",
+        "texture_prefix":   "T_",
+    },
+    "export": {
+        "format":              "FBX",
+        "scale":               1.0,
+        "apply_modifiers":     True,
+        "triangulate_before":  False,
+    },
+}
+
+# _PLAYBOOKS uses short keys (hero_char, env_prop); studio_profile.json's
+# vert_budgets/tri_budgets use longer, human-written keys (hero_character,
+# environment_prop) — weapon/vehicle/creature already match verbatim.
+_CATEGORY_ALIASES = {"hero_char": "hero_character", "env_prop": "environment_prop"}
+
+
+def _load_studio_profile_dict() -> dict:
+    """Load+merge studio_profile.json over the built-in defaults, creating
+    the file with defaults if missing. Reads fresh from disk every call —
+    no caching — so edits take effect on the next tool call, no restart
+    needed. Shared by load_studio_profile() (the human-facing tool) and
+    every internal consumer (_studio_vert_budget, _studio_tri_budget) so
+    there is exactly one loader, not several copies to drift out of sync."""
     profile_path = Path(__file__).parent / "studio_profile.json"
-
-    default_profile = {
-        "_comment": "Studio QA profile — edit these values to match YOUR studio's standards.",
-        "studio_name": "My Studio",
-        "target_engine": "UE5",
-        "vert_budgets": {
-            "hero_character":      80000,
-            "background_character": 20000,
-            "crowd_character":     10000,
-            "weapon":              15000,
-            "environment_prop":     5000,
-            "vehicle":             50000,
-            "creature":            60000,
-        },
-        "texel_density": {
-            "hero_character":   10.24,   # px/cm
-            "weapon":            5.12,
-            "environment_prop":  2.56,
-        },
-        "uv_requirements": {
-            "require_lightmap_channel": True,
-            "max_uv_overlap_pct":       5.0,
-            "min_uv_margin_px":         4,
-        },
-        "topology_standards": {
-            "min_quad_pct":         75.0,
-            "max_ngon_pct":          2.0,
-            "max_poles_per_1k_verts": 5,
-        },
-        "naming_conventions": {
-            "mesh_prefix":      "SM_",
-            "skeletal_prefix":  "SK_",
-            "material_prefix":  "M_",
-            "texture_prefix":   "T_",
-        },
-        "export": {
-            "format":              "FBX",
-            "scale":               1.0,
-            "apply_modifiers":     True,
-            "triangulate_before":  False,
-        },
-    }
-
-    # Try to load existing profile
-    profile_loaded = False
-    profile = default_profile.copy()
+    profile = _STUDIO_PROFILE_DEFAULT.copy()
+    profile["_profile_path"] = str(profile_path)
+    profile["_profile_loaded"] = False
     if profile_path.exists():
         try:
             disk_profile = json.loads(profile_path.read_text())
-            # Merge disk values over defaults
             for k, v in disk_profile.items():
                 if isinstance(v, dict) and isinstance(profile.get(k), dict):
                     profile[k].update(v)
                 else:
                     profile[k] = v
-            profile_loaded = True
+            profile["_profile_loaded"] = True
         except Exception as e:
             profile["_load_error"] = str(e)
     else:
-        # Write default profile to disk so user can edit it
         try:
-            profile_path.write_text(json.dumps(default_profile, indent=2))
+            profile_path.write_text(json.dumps(_STUDIO_PROFILE_DEFAULT, indent=2))
             profile["_created"] = f"Default profile written to {profile_path}"
         except Exception as e:
             profile["_write_error"] = str(e)
+    return profile
+
+
+def _studio_vert_budget(category: str, fallback: int) -> int:
+    """Real vertex budget for `category` from studio_profile.json if
+    present, else `fallback` unchanged — never breaks a category the
+    profile doesn't mention. This is the actual fix for a real gap found
+    live: the file existed, was auto-created, and its own docstring claimed
+    simulate_production_readiness/review_board/production_review read it —
+    none of them did; every one hardcoded its own numbers instead."""
+    profile = _load_studio_profile_dict()
+    key = _CATEGORY_ALIASES.get(category, category)
+    value = profile.get("vert_budgets", {}).get(key)
+    return value if isinstance(value, (int, float)) else fallback
+
+
+def _studio_tri_budget(asset_type: str) -> Optional[int]:
+    """Real triangle budget for a granular asset_type string (e.g. 'Giant
+    Boss', 'Sword') from studio_profile.json's tri_budgets, matched case-
+    insensitively with spaces/underscores normalized. None if no match —
+    never forces a category the profile doesn't have."""
+    profile = _load_studio_profile_dict()
+    tri_budgets = profile.get("tri_budgets", {})
+    normalized = asset_type.strip().lower().replace("_", " ").replace("-", " ")
+    for key, value in tri_budgets.items():
+        if key.strip().lower().replace("_", " ").replace("-", " ") == normalized:
+            return value if isinstance(value, (int, float)) else None
+    return None
+
+
+def _estimate_triangle_count(polygon_count: int, quad_ratio_pct: float, tris_pct: float) -> dict:
+    """Real effective triangle count from analyze_topology's stats — tri
+    and quad portions are exact (1 tri per tri-face, 2 per quad-face); the
+    ngon remainder is a documented approximation (3 tris/ngon) since real
+    ngon-to-tri count depends on each ngon's actual vertex count, which
+    analyze_topology's stats don't expose. exact=True only when there's no
+    ngon remainder to estimate."""
+    quad_ratio_pct = quad_ratio_pct or 0.0
+    tris_pct = tris_pct or 0.0
+    tri_faces = polygon_count * (tris_pct / 100.0)
+    quad_faces = polygon_count * (quad_ratio_pct / 100.0)
+    remainder_pct = max(0.0, 100.0 - tris_pct - quad_ratio_pct)
+    ngon_faces = polygon_count * (remainder_pct / 100.0)
+    estimated = tri_faces * 1 + quad_faces * 2 + ngon_faces * 3
+    return {
+        "estimated_tri_count": round(estimated),
+        "exact": ngon_faces < 0.5,  # sub-half-a-face rounding noise, not a real ngon remainder
+    }
+
+
+@mcp.tool()
+def load_studio_profile(show_current: bool = False) -> str:
+    """
+    STUDIO PROFILE — loads studio_profile.json (next to server.py): vert/tri
+    budgets, texel density, naming conventions, UV/export settings. vert_
+    budgets and tri_budgets are ACTUALLY wired into _PLAYBOOKS (what_next,
+    review_board, simulate_production_readiness, production_review, the
+    over_vert_budget rule) and production_review's granular asset_type
+    matching — not just readable. Creates the file with defaults if missing.
+    """
+    profile = _load_studio_profile_dict()
+    profile_loaded = profile.pop("_profile_loaded")
+    profile_path = profile.pop("_profile_path")
 
     _journal_entry("load_studio_profile", "", "ok",
                    f"Loaded={profile_loaded} path={profile_path}")
 
     return json.dumps({
-        "profile_path":   str(profile_path),
+        "profile_path":   profile_path,
         "profile_loaded": profile_loaded,
         "profile":        profile,
         "how_to_customise": (
             f"Edit {profile_path} to set your studio's specific standards. "
             "The MCP reads this file at tool call time — no restart needed. "
-            "Values here override the generic industry defaults used in "
-            "simulate_production_readiness(), review_board(), and what_next()."
+            "vert_budgets/tri_budgets override the generic industry defaults "
+            "used in simulate_production_readiness(), review_board(), "
+            "production_review(), and what_next()."
         ),
         "active_in_tools": [
             "simulate_production_readiness (vert_budgets)",
             "review_board (vert_budgets)",
             "what_next (vert_budgets via playbook)",
-            "production_review (vert_budgets)",
+            "production_review (vert_budgets + granular tri_budgets by asset_type)",
         ],
     }, indent=2, default=str)
 
