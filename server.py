@@ -880,6 +880,22 @@ _PRODUCTION_RULES: list = [
         "why": "The material knowledge layer only helps if it's actually surfaced — this makes a "
                "measured-similarity match visible in rules_fired instead of a field nobody reads.",
     },
+    {
+        "id": "blended_material_candidate",
+        "severity": "warning",
+        "predicate": lambda dna: any(
+            m.get("heterogeneity", {}).get("likely_blended") for m in dna.get("materials", [])
+        ),
+        "recommendation": "One material's Base Color varies significantly between disconnected UV "
+                           "islands — a real sign it's doing more than one job (the couch case: "
+                           "leather + wood + fabric baked into a single shared material). Consider "
+                           "split_blended_material(object_name, material_name) to separate it into "
+                           "distinct, individually-weatherable materials.",
+        "why": "material_count alone (a slot count) never catches this — a single-slot object can "
+               "still visually be several different substances blended into one baked texture, "
+               "confirmed live on a real couch asset (material_count: 1, leather/wood/blanket all "
+               "sharing one material).",
+    },
 ]
 
 
@@ -5761,6 +5777,125 @@ def _find_closest_material_recipe(fingerprint: dict, max_distance: float = 0.15)
     }
 
 
+def _find_recipe_by_canonical_name(canonical_name: str) -> Optional[dict]:
+    """Exact lookup of a recorded recipe_type='material' entry by its
+    canonical_name — used when a caller names a specific recipe to build
+    toward rather than a category."""
+    for entry in _RECIPES:
+        if entry.get("recipe_type") == "material" and entry.get("canonical_name") == canonical_name:
+            return entry
+    return None
+
+
+def _find_recipe_for_category(category: str) -> Optional[dict]:
+    """First recorded recipe_type='material' entry matching a category —
+    a representative fingerprint to calibrate toward when a caller names a
+    category but not a specific recipe. Returns None (not a guess) if
+    nothing has ever been recorded for that category."""
+    for entry in _RECIPES:
+        if entry.get("recipe_type") == "material" and entry.get("parameters", {}).get("category") == category:
+            return entry
+    return None
+
+
+# Shared across every Blender-side script that needs to bake a live node
+# value into pixels (generate_procedural_material's calibration bake,
+# bake_weathered_textures' bake_pass, and get_asset_dna's procedural-
+# roughness fallback) — embedded via string concatenation since these are
+# independent scripts sent to Blender, not importable Python modules. ONE
+# implementation, not three copies to drift out of sync.
+#
+# Real incident this fixes: bpy.ops.object.bake() bakes EVERY material with
+# faces on the object in a single pass, each writing into whichever image
+# node is "active" in THAT material's own node tree — not just the material
+# the caller intended. A calibration bake that only rewires the TARGET
+# material's Output to Emission still leaves every OTHER material's Output
+# as a plain Principled BSDF, whose built-in emission input defaults to
+# black — so Cycles legitimately bakes 0 for those materials' faces and
+# writes it into their own active image node. Caught live: this corrupted a
+# real, unrelated material's real Base Color texture (in-memory only, the
+# file on disk was untouched) during generate_procedural_material's first
+# live run, because bake_pass-style code had no face-level scoping at all.
+_SAFE_MATERIAL_BAKE_SNIPPET = r"""
+def safe_bake_measure(obj, nt, mat_slot_index, output_node, source_socket, image_name, w, h, samples):
+    '''Bakes ONLY the target material — LIVE-VERIFIED fix, arrived at after
+    TWO earlier attempts both failed live, not theoretical:
+      1. Edit-Mode face selection (material_slot_select()) — tested against
+         a real two-material object with a known, populated, non-black
+         second texture. FAILED: the bake still corrupted it.
+      2. Reassigning every face's material_index to the target slot, WITHOUT
+         removing other slots — also FAILED, and Blender's own console
+         output explained why: "Circular dependency for image
+         '...MatB_tex' from object '...'" plus TWO "Baking map saved"
+         lines for what should have been a single-material bake. Blender's
+         object.bake() processes EVERY material SLOT present on the
+         object, regardless of whether any face currently references it —
+         face assignment alone can't prevent it.
+    The actual fix, confirmed live (controlled experiment: a known 0.8 red
+    channel survived intact only with this approach, corrupted to 0.0 with
+    both earlier ones): temporarily strip every OTHER material slot off the
+    mesh entirely — not just reassign faces — so the target is the ONLY
+    material on the object during the bake, then rebuild the exact original
+    slot list (order matters: slot index is positional) and restore the
+    original per-face material_index afterward.'''
+    mesh = obj.data
+    original_materials = list(mesh.materials)
+    original_material_indices = [p.material_index for p in mesh.polygons]
+    target_material = original_materials[mat_slot_index]
+
+    bake_img = bpy.data.images.new(image_name, width=w, height=h, alpha=False)
+    bake_node = nt.nodes.new("ShaderNodeTexImage")
+    bake_node.image = bake_img
+    for n in nt.nodes:
+        n.select = False
+    bake_node.select = True
+    nt.nodes.active = bake_node
+
+    emit_node = nt.nodes.new("ShaderNodeEmission")
+    original_link = output_node.inputs["Surface"].links[0] if output_node.inputs["Surface"].links else None
+    original_from = original_link.from_socket if original_link else None
+    nt.links.new(source_socket, emit_node.inputs["Color"])
+    nt.links.new(emit_node.outputs["Emission"], output_node.inputs["Surface"])
+
+    original_engine = bpy.context.scene.render.engine
+    original_samples = bpy.context.scene.cycles.samples
+    result_img = None
+    try:
+        while len(mesh.materials) > 0:
+            mesh.materials.pop(index=0)
+        mesh.materials.append(target_material)
+        for p in mesh.polygons:
+            p.material_index = 0
+        mesh.update()
+
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+        bpy.context.scene.render.engine = 'CYCLES'
+        bpy.context.scene.cycles.samples = samples
+        bpy.ops.object.bake(type='EMIT')
+        result_img = bake_img
+    except Exception:
+        result_img = None
+    finally:
+        nt.nodes.remove(bake_node)
+        nt.nodes.remove(emit_node)
+        if original_from is not None:
+            nt.links.new(original_from, output_node.inputs["Surface"])
+        bpy.context.scene.render.engine = original_engine
+        bpy.context.scene.cycles.samples = original_samples
+        while len(mesh.materials) > 0:
+            mesh.materials.pop(index=0)
+        for m in original_materials:
+            mesh.materials.append(m)
+        for p, orig_idx in zip(mesh.polygons, original_material_indices):
+            p.material_index = orig_idx
+        mesh.update()
+    return result_img
+"""
+
+
 @mcp.tool()
 def apply_weathering_recipe(
     object_name: str,
@@ -6360,6 +6495,680 @@ else:
 
 
 @mcp.tool()
+def generate_procedural_material(
+    object_name: str,
+    material_name: str,
+    category: str = "",
+    target_recipe: str = "",
+) -> list:
+    """
+    GENERATE PROCEDURAL MATERIAL — creates a real Blender node-based PBR
+    material from noise/voronoi/bump nodes, calibrated against the material
+    knowledge layer instead of guessed. Unlike apply_weathering_recipe (which
+    modifies an EXISTING material's appearance), this REPLACES material_name's
+    Base Color/Roughness/Normal wiring entirely with a generated procedural
+    graph — call create_checkpoint() first, this is generative and not a
+    simple metric diff. If material_name doesn't exist yet on the object, it
+    is created and assigned a new slot. If that's the object's ONLY material
+    slot (unambiguous — nothing existing to overwrite), every face is
+    auto-assigned to it so there's something real to calibrate against. If
+    the object already has other materials, the new slot is left at 0
+    faces — auto-assigning would silently steal faces from an existing
+    material. calibration_status comes back "unverified_no_faces_assigned"
+    in that case (a real failure mode caught on this tool's first live run:
+    a brand-new unassigned material slot baked to a flat 0.0 regardless of
+    target, which the calibration loop was initially misreporting as a
+    generic "approximate" near-miss instead of "nothing was actually
+    there to measure") — assign the material to faces first (e.g. via
+    split_blended_material or manual selection), then call again.
+
+    Returns a list: [before_image?, after_image?, result_json_string] — same
+    convention as apply_weathering_recipe/bake_weathered_textures. Parse the
+    JSON result with json.loads(result[-1]).
+
+    Because it's procedural (no baked bitmap), the result is inherently
+    tileable/seamless — there's no image edge to hide a seam at until you
+    choose to bake one via bake_weathered_textures.
+
+    WHAT'S CALIBRATED vs. WHAT'S A HEURISTIC — stated honestly, not blurred:
+    - Roughness is calibrated AND VERIFIED: the target category/recipe's
+      recorded roughness_avg drives the generated Roughness formula, then
+      this tool immediately bakes a small internal sample (the same
+      Emission-trick technique bake_weathered_textures uses) and measures the
+      REAL resulting average — not assumed. If it lands within tolerance
+      (0.15, the same honesty-gate threshold _find_closest_material_recipe
+      uses), calibration_status is "matched". If not, ONE bounded retry
+      nudges the formula and re-measures; still-out-of-tolerance after that
+      is reported as "approximate" with the real measured number attached —
+      never silently claimed as a match.
+    - Bump strength (visual bumpiness) is a documented, UNVERIFIED linear
+      heuristic (normal_map_bumpiness x3, clamped 0-1) — the knowledge layer
+      only ever recorded bumpiness as a scalar magnitude, never spatial
+      frequency, and verifying it would require baking a Normal-vector
+      output through a color-space bake that isn't reliable enough to trust
+      yet. Reported as bump_strength_heuristic, not claimed as measured.
+    - Metallic is a category-based constant (0.9 for "metal", else 0.0) —
+      the fingerprint has never recorded a metallic signal, only roughness/
+      subsurface/specular/normal-bumpiness, so this is a plain, documented
+      default, not a measurement.
+    - subsurface_weight/specular_ior_level are set directly from the target
+      recipe's own recorded values when present (real recorded data, no
+      formula needed) — default to 0.0/0.5 when the recipe has none recorded.
+    - Base Color for category="metal" reuses rust_color, the SAME constant
+      apply_weathering_recipe already defaults to — a real, already-used
+      value, not invented. Every other category is still a flat, explicitly
+      labeled gray placeholder (color_source: "generic_gray_placeholder" in
+      the result vs. "reused_rust_color") — no color data has ever been
+      recorded for any category, and this tool won't imply otherwise for
+      categories it hasn't actually addressed yet.
+
+    Category/target resolution — same explicit > name > fingerprint
+    precedence as apply_weathering_recipe's material_category, but ending in
+    an error instead of an automatic default, since there's no existing
+    material driving a metal_factor to dispatch from:
+    1. target_recipe: exact canonical_name lookup — uses that recipe's own
+       fingerprint directly, most specific.
+    2. category: uses a representative recorded recipe for that category if
+       one exists (calibration_status "uncalibrated" with generic defaults
+       if none has ever been recorded for that category — never invents
+       numbers for a category with zero real data).
+    3. Neither given: tries _resolve_material_category(material_name) (name-
+       based), then falls back to the object's OWN current closest_known_material
+       fingerprint match (only meaningful if material_name already exists
+       with some real PBR data to compare).
+    4. Nothing resolves: returns an error asking for an explicit category or
+       target_recipe — never guesses a starting point out of thin air.
+    """
+    resolved_category = None
+    resolved_recipe = None
+
+    if target_recipe:
+        resolved_recipe = _find_recipe_by_canonical_name(target_recipe)
+        if resolved_recipe is None:
+            return [json.dumps({"error": f"No recorded recipe named '{target_recipe}'."})]
+        resolved_category = resolved_recipe.get("parameters", {}).get("category")
+    elif category:
+        resolved_category = category
+        resolved_recipe = _find_recipe_for_category(category)
+    else:
+        resolved_category = _resolve_material_category(material_name)
+        if resolved_category is None:
+            dna_lookup = _reaffirm_dna(object_name)
+            for mat in dna_lookup.get("materials", []):
+                if mat.get("name") == material_name:
+                    match = mat.get("closest_known_material")
+                    if match:
+                        resolved_category = match.get("category")
+                        resolved_recipe = _find_recipe_by_canonical_name(match.get("canonical_name"))
+                    break
+        else:
+            resolved_recipe = _find_recipe_for_category(resolved_category)
+
+    if resolved_category is None:
+        return [json.dumps({
+            "error": "Could not resolve a target category — no explicit category/target_recipe, "
+                     "no name-based match, and no existing fingerprint close enough to compare.",
+            "fix": "Pass category= (e.g. 'metal', 'organic') or target_recipe= (a recorded canonical_name) explicitly.",
+        })]
+
+    target_fp = resolved_recipe.get("parameters", {}).get("fingerprint", {}) if resolved_recipe else {}
+    target_roughness = _fingerprint_value(target_fp, "roughness_avg")
+    roughness_was_recorded = target_roughness is not None
+    if target_roughness is None:
+        target_roughness = 0.6
+    target_bumpiness = _fingerprint_value(target_fp, "normal_map_bumpiness")
+    if target_bumpiness is None:
+        target_bumpiness = 0.02
+    target_subsurface = _fingerprint_value(target_fp, "subsurface_weight")
+    if target_subsurface is None:
+        target_subsurface = 0.0
+    target_specular = _fingerprint_value(target_fp, "specular_ior_level")
+    if target_specular is None:
+        target_specular = 0.5
+    metallic_const = 0.9 if resolved_category == "metal" else 0.0
+    bump_strength = max(0.0, min(1.0, target_bumpiness * 3.0))
+
+    # Color: never invented. The knowledge layer has never recorded real
+    # color data for ANY category — only roughness/subsurface/specular/
+    # bumpiness. "metal" is the one exception: it reuses rust_color, the
+    # SAME constant apply_weathering_recipe already defaults to (server.py
+    # ~5809) and has been used/seen across many live weathering calls
+    # tonight — a real, already-approved value, not a new guess. Every
+    # other category keeps a flat, explicitly-labeled gray placeholder
+    # (color_source in the result) rather than silently implying it means
+    # something it doesn't.
+    if resolved_category == "metal":
+        rust_color = [0.35, 0.14, 0.05]
+        dark_color = [c * 0.5 for c in rust_color]
+        light_color = [min(1.0, c * 1.4) for c in rust_color]
+        color_source = "reused_rust_color"
+    else:
+        dark_color = [0.25, 0.25, 0.25]
+        light_color = [0.6, 0.6, 0.6]
+        color_source = "generic_gray_placeholder"
+
+    def build_and_measure(roughness_target: float) -> dict:
+        script = _SAFE_MATERIAL_BAKE_SNIPPET + r"""
+import bpy, json, statistics
+
+def sample_avg_stdev(image, max_samples=1500):
+    channels = image.channels
+    if channels == 0 or image.size[0] == 0 or image.size[1] == 0:
+        return None, None
+    pixels = image.pixels[:]
+    texel_count = len(pixels) // channels
+    stride = max(1, texel_count // max_samples)
+    vals = [pixels[i] for i in range(0, len(pixels), channels * stride)]
+    if not vals:
+        return None, None
+    return round(sum(vals) / len(vals), 4), round(statistics.pstdev(vals), 4)
+
+def get_input(node, names):
+    for n in names:
+        s = node.inputs.get(n)
+        if s is not None:
+            return s
+    return None
+
+def get_socket(collection, name, socket_type):
+    for s in collection:
+        if s.name == name and s.type == socket_type:
+            return s
+    return None
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+else:
+    mat = bpy.data.materials.get('{MAT}')
+    created_material = False
+    if mat is None:
+        mat = bpy.data.materials.new(name='{MAT}')
+        mat.use_nodes = True
+        obj.data.materials.append(mat)
+        created_material = True
+    elif not mat.use_nodes:
+        mat.use_nodes = True
+    if mat.name not in [s.material.name for s in obj.material_slots if s.material]:
+        obj.data.materials.append(mat)
+
+    # A freshly-appended material slot starts with ZERO faces assigned to
+    # it — baking/measuring it would sample nothing real (a genuine bug
+    # caught live: the first live run of this tool measured 0.0 roughness
+    # on a brand-new material because no face on the mesh referenced it
+    # yet). Only auto-assign when unambiguous — this is the object's ONLY
+    # material slot, so there's no existing assignment to silently
+    # overwrite. Otherwise leave it at 0 faces and report that honestly
+    # rather than guessing which faces the caller meant.
+    mat_slot_index = next((i for i, s in enumerate(obj.material_slots) if s.material == mat), None)
+    faces_using_material = sum(1 for p in obj.data.polygons if p.material_index == mat_slot_index)
+    auto_assigned_all_faces = False
+    if faces_using_material == 0 and len(obj.data.materials) == 1:
+        for p in obj.data.polygons:
+            p.material_index = mat_slot_index
+        obj.data.update()
+        faces_using_material = len(obj.data.polygons)
+        auto_assigned_all_faces = True
+
+    nt = mat.node_tree
+    principled = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if principled is None:
+        principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
+
+    prefix = "AutoProcMat_"
+    for nd in list(nt.nodes):
+        if nd.name.startswith(prefix):
+            nt.nodes.remove(nd)
+
+    base_x, base_y = principled.location.x - 900, principled.location.y
+
+    coord = nt.nodes.new("ShaderNodeTexCoord")
+    coord.name = prefix + "Coord"
+    coord.location = (base_x - 600, base_y)
+
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.name = prefix + "Noise"
+    noise.location = (base_x - 300, base_y + 200)
+    noise.inputs["Scale"].default_value = {NOISESCALE}
+    nt.links.new(coord.outputs["Generated"], noise.inputs["Vector"])
+
+    voronoi = nt.nodes.new("ShaderNodeTexVoronoi")
+    voronoi.name = prefix + "Voronoi"
+    voronoi.location = (base_x - 300, base_y - 200)
+    voronoi.inputs["Scale"].default_value = {NOISESCALE} * 0.6
+    nt.links.new(coord.outputs["Generated"], voronoi.inputs["Vector"])
+
+    combine = nt.nodes.new("ShaderNodeMix")
+    combine.name = prefix + "Combine"
+    combine.data_type = 'FLOAT'
+    combine.location = (base_x, base_y)
+    c_a = get_socket(combine.inputs, "A", "VALUE")
+    c_b = get_socket(combine.inputs, "B", "VALUE")
+    c_fac = get_socket(combine.inputs, "Factor", "VALUE")
+    c_out = get_socket(combine.outputs, "Result", "VALUE")
+    nt.links.new(noise.outputs["Fac"], c_a)
+    nt.links.new(voronoi.outputs["Distance"], c_b)
+    c_fac.default_value = 0.4
+
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.name = prefix + "ColorRamp"
+    ramp.location = (base_x + 300, base_y + 200)
+    ramp.color_ramp.elements[0].position = 0.35
+    ramp.color_ramp.elements[0].color = ({DARKR}, {DARKG}, {DARKB}, 1.0)
+    ramp.color_ramp.elements[1].position = 0.65
+    ramp.color_ramp.elements[1].color = ({LIGHTR}, {LIGHTG}, {LIGHTB}, 1.0)
+    nt.links.new(c_out, ramp.inputs["Fac"])
+    nt.links.new(ramp.outputs["Color"], principled.inputs["Base Color"])
+
+    rough_scale = nt.nodes.new("ShaderNodeMath")
+    rough_scale.name = prefix + "RoughSpread"
+    rough_scale.location = (base_x + 300, base_y)
+    rough_scale.operation = 'MULTIPLY'
+    nt.links.new(c_out, rough_scale.inputs[0])
+    rough_scale.inputs[1].default_value = {ROUGHSPREAD}
+
+    rough_add = nt.nodes.new("ShaderNodeMath")
+    rough_add.name = prefix + "RoughBase"
+    rough_add.location = (base_x + 600, base_y)
+    rough_add.operation = 'ADD'
+    rough_add.use_clamp = True
+    nt.links.new(rough_scale.outputs[0], rough_add.inputs[0])
+    rough_add.inputs[1].default_value = {ROUGHBASE}
+    nt.links.new(rough_add.outputs[0], principled.inputs["Roughness"])
+
+    bump = nt.nodes.new("ShaderNodeBump")
+    bump.name = prefix + "Bump"
+    bump.location = (base_x + 300, base_y - 200)
+    bump.inputs["Strength"].default_value = {BUMPSTRENGTH}
+    nt.links.new(noise.outputs["Fac"], bump.inputs["Height"])
+    nt.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
+
+    metallic_sock = principled.inputs.get("Metallic")
+    if metallic_sock is not None:
+        metallic_sock.default_value = {METALLIC}
+    sss_sock = get_input(principled, ["Subsurface Weight", "Subsurface"])
+    if sss_sock is not None:
+        sss_sock.default_value = {SUBSURFACE}
+    spec_sock = get_input(principled, ["Specular IOR Level", "Specular"])
+    if spec_sock is not None:
+        spec_sock.default_value = {SPECULAR}
+
+    # Internal calibration bake — same Emission-trick pattern bake_weathered_textures
+    # uses, at low resolution purely to MEASURE the real resulting Roughness average
+    # rather than assume the formula lands where intended. Scoped to ONLY this
+    # material's faces via safe_bake_measure — real fix for a live incident where
+    # an unscoped bake corrupted an unrelated material's real texture.
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    measured_roughness = None
+    if output_node is not None:
+        calib_img = safe_bake_measure(obj, nt, mat_slot_index, output_node, rough_add.outputs[0],
+                                       "TEMP_ProcMatCalib", 32, 32, 8)
+        if calib_img is not None:
+            measured_roughness, _ = sample_avg_stdev(calib_img)
+            bpy.data.images.remove(calib_img)
+
+    print(json.dumps({
+        "object": '{OBJ}',
+        "material": '{MAT}',
+        "created_material": created_material,
+        "measured_roughness": measured_roughness,
+        "faces_using_material": faces_using_material,
+        "auto_assigned_all_faces": auto_assigned_all_faces,
+    }))
+""".replace("{OBJ}", object_name.replace("'", "\\'")) \
+   .replace("{MAT}", material_name.replace("'", "\\'")) \
+   .replace("{NOISESCALE}", "8.0") \
+   .replace("{ROUGHSPREAD}", "0.24") \
+   .replace("{ROUGHBASE}", str(roughness_target - 0.12)) \
+   .replace("{BUMPSTRENGTH}", str(bump_strength)) \
+   .replace("{METALLIC}", str(metallic_const)) \
+   .replace("{SUBSURFACE}", str(target_subsurface)) \
+   .replace("{SPECULAR}", str(target_specular)) \
+   .replace("{DARKR}", str(dark_color[0])).replace("{DARKG}", str(dark_color[1])).replace("{DARKB}", str(dark_color[2])) \
+   .replace("{LIGHTR}", str(light_color[0])).replace("{LIGHTG}", str(light_color[1])).replace("{LIGHTB}", str(light_color[2]))
+
+        raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
+        if "error" in raw:
+            return {"error": raw["error"]}
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                return json.loads(line)
+        return {"error": "No JSON output from generate_procedural_material", "raw": output}
+
+    _invalidate_dna_cache(object_name)
+    _before_image = _capture_plain_screenshot(object_name)
+
+    try:
+        pass_1 = build_and_measure(target_roughness)
+        if "error" in pass_1:
+            return [json.dumps(pass_1)]
+
+        measured = pass_1.get("measured_roughness")
+        faces_using_material = pass_1.get("faces_using_material", 0)
+        calibration_status = "uncalibrated" if not roughness_was_recorded else None
+        attempts = [{"attempt": 1, "roughness_target": target_roughness, "measured_roughness": measured}]
+
+        if faces_using_material == 0:
+            # Real bug caught on the first live run of this tool: a freshly-
+            # appended material slot starts with zero faces referencing it,
+            # so the calibration bake samples nothing — it measured 0.0
+            # roughness against a 0.95 target and reported "approximate",
+            # which understated what actually happened (nothing was
+            # measured at all, not a near-miss). Ambiguous cases (an object
+            # that already has other materials) are never auto-assigned —
+            # only reported honestly here.
+            calibration_status = "unverified_no_faces_assigned"
+        elif roughness_was_recorded and measured is not None:
+            distance = abs(target_roughness - measured)
+            if distance <= 0.15:
+                calibration_status = "matched"
+            else:
+                # One bounded retry — nudge the target by the measured error
+                # and re-measure once. Never loop indefinitely.
+                adjusted_target = max(0.0, min(1.0, target_roughness + (target_roughness - measured)))
+                pass_2 = build_and_measure(adjusted_target)
+                if "error" not in pass_2:
+                    measured_2 = pass_2.get("measured_roughness")
+                    attempts.append({"attempt": 2, "roughness_target": adjusted_target, "measured_roughness": measured_2})
+                    if measured_2 is not None and abs(target_roughness - measured_2) <= 0.15:
+                        calibration_status = "matched"
+                        measured = measured_2
+                    else:
+                        calibration_status = "approximate"
+                        measured = measured_2 if measured_2 is not None else measured
+                else:
+                    calibration_status = "approximate"
+        elif roughness_was_recorded and measured is None:
+            calibration_status = "unverified"  # internal bake failed — real, not silenced
+
+        result = {
+            "object": object_name,
+            "material": material_name,
+            "category_used": resolved_category,
+            "canonical_recipe_used": resolved_recipe.get("canonical_name") if resolved_recipe else None,
+            "target_roughness": round(target_roughness, 4),
+            "roughness_was_recorded": roughness_was_recorded,
+            "measured_roughness": measured,
+            "calibration_status": calibration_status,
+            "calibration_attempts": attempts,
+            "bump_strength_heuristic": round(bump_strength, 4),
+            "bump_strength_note": "unverified linear heuristic (normal_map_bumpiness x3) — not re-measured",
+            "metallic_set": metallic_const,
+            "subsurface_weight_set": target_subsurface,
+            "specular_ior_level_set": target_specular,
+            "color_source": color_source,
+            "faces_using_material": faces_using_material,
+            "auto_assigned_all_faces": pass_1.get("auto_assigned_all_faces", False),
+        }
+        if faces_using_material == 0:
+            result["fix"] = (
+                "This material isn't assigned to any face yet (it was created new on an object "
+                "that already has other materials, so faces weren't auto-assigned to avoid "
+                "silently overwriting existing assignments). Assign it to the intended faces "
+                "(e.g. via split_blended_material, or manual face selection + material assignment "
+                "in Blender), then call again to get a real calibration measurement."
+            )
+
+        out = []
+        after_image = _capture_plain_screenshot(object_name)
+        if _before_image:
+            out.append(_before_image)
+        if after_image:
+            out.append(after_image)
+        out.append(json.dumps(result, indent=2))
+        return out
+    except Exception as e:
+        logger.error(f"Error in generate_procedural_material: {e}")
+        return [json.dumps({"error": str(e)})]
+
+
+@mcp.tool()
+def split_blended_material(
+    object_name: str,
+    material_name: str,
+    force: bool = False,
+) -> list:
+    """
+    SPLIT BLENDED MATERIAL — the fix for the couch-class problem: one shared
+    material silently doing multiple jobs (leather + wood + fabric all baked
+    into a single material, material_count: 1 hiding it completely — a real
+    case proven live tonight). MODIFIES the object — call create_checkpoint()
+    first, this changes face material assignment and is not a simple metric
+    diff.
+
+    Returns a list: [before_image?, after_image?, result_json_string] — same
+    convention as apply_weathering_recipe/bake_weathered_textures. Parse the
+    JSON result with json.loads(result[-1]).
+
+    Refuses to run unless get_asset_dna's heterogeneity.likely_blended is
+    True for this material (a fresh DNA fetch, not a stale one) — same
+    discipline as bake_weathered_textures' topology gate: this tool only
+    acts on a REAL measured signal (Base Color variance across disconnected
+    UV islands), never on a guess. force=True bypasses the gate for when a
+    human has looked and decided to split anyway.
+
+    WHAT THIS ACTUALLY DOES — scoped honestly, not oversold:
+    - Recomputes the same real per-island Base Color samples heterogeneity
+      detection already measured, then splits them into exactly TWO groups
+      via the single largest gap in sorted island averages — a real,
+      deterministic clustering, not a guess, but coarser than an N-way
+      split. A material blending 3+ very different substances will have its
+      single most different one separated out per call; re-running this
+      tool on the remainder can peel off further groups.
+    - The minority group (fewer islands) gets its faces reassigned
+      (polygon.material_index) to a NEW material — a direct .copy() of the
+      original, so it starts with the SAME shared texture. This tool does
+      NOT crop or mask the texture per group — that would require real
+      image-space UV-island cropping, out of scope for this pass. What it
+      DOES deliver: two independently-addressable materials, so
+      apply_weathering_recipe/generate_procedural_material can now be
+      pointed at just the minority group's faces going forward, which was
+      structurally impossible while everything shared one material slot.
+    - If no meaningful gap exists (every island lands in one group), refuses
+      with a clear error rather than forcing an arbitrary split.
+
+    After splitting, both materials' fingerprints are re-measured (same
+    _PBR_SOCKET_SCAN_SCRIPT scan used everywhere else) and reported — they
+    will read as IDENTICAL to each other immediately after this call (both
+    still share the same node graph/texture), which is expected and stated
+    plainly, not hidden: the split creates the ADDRESSABILITY, visual
+    differentiation is a follow-up step (weathering or regeneration) on the
+    new material specifically.
+    """
+    _invalidate_dna_cache(object_name)
+    dna_before = _reaffirm_dna(object_name)
+    mat_before = next(
+        (m for m in dna_before.get("materials", []) if m.get("name") == material_name), None
+    )
+    if mat_before is None:
+        return [json.dumps({"error": f"Material '{material_name}' not found on {object_name}."})]
+
+    heterogeneity = mat_before.get("heterogeneity", {})
+    if not heterogeneity.get("likely_blended") and not force:
+        return [json.dumps({
+            "error": "Refusing to split — heterogeneity detection did not flag this material as blended.",
+            "heterogeneity": heterogeneity,
+            "why": "This tool only acts on a real measured signal (Base Color variance across "
+                   "disconnected UV islands), never a guess — same discipline as "
+                   "bake_weathered_textures' topology gate.",
+            "fix": "If you've visually confirmed this material really is doing multiple jobs despite "
+                   "the measurement not catching it (e.g. no UV seams marked so islands couldn't be "
+                   "separated), call again with force=True.",
+        })]
+
+    script = r"""
+import bpy, json, statistics
+
+obj = bpy.data.objects.get('{OBJ}')
+mat = bpy.data.materials.get('{MAT}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+elif mat is None:
+    print(json.dumps({"error": "Material not found: {MAT}"}))
+else:
+    mesh = obj.data
+    principled = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None) if mat.node_tree else None
+    bc_sock = principled.inputs.get("Base Color") if principled else None
+    if not (bc_sock and bc_sock.links and bc_sock.links[0].from_node.type == 'TEX_IMAGE' and bc_sock.links[0].from_node.image):
+        print(json.dumps({"error": "Base Color is not texture-fed on this material — nothing to sample for a split."}))
+    elif not mesh.uv_layers.active:
+        print(json.dumps({"error": "No active UV layer — cannot determine islands."}))
+    else:
+        img = bc_sock.links[0].from_node.image
+        uv_layer = mesh.uv_layers.active.data
+
+        edge_poly_count = {}
+        poly_of_edge = {}
+        target_slot = next((i for i, s in enumerate(obj.material_slots) if s.material == mat), None)
+
+        for poly in mesh.polygons:
+            for key in poly.edge_keys:
+                edge_poly_count[key] = edge_poly_count.get(key, 0) + 1
+                poly_of_edge.setdefault(key, []).append(poly.index)
+
+        seam_edges = set()
+        for edge in mesh.edges:
+            key = tuple(sorted(edge.vertices))
+            if edge.use_seam or edge_poly_count.get(key, 0) <= 1:
+                seam_edges.add(key)
+
+        relevant_polys = [p.index for p in mesh.polygons if p.material_index == target_slot]
+        relevant_set = set(relevant_polys)
+        visited = set()
+        islands = []
+        for pidx in relevant_polys:
+            if pidx in visited:
+                continue
+            stack = [pidx]
+            island = []
+            visited.add(pidx)
+            while stack:
+                cur = stack.pop()
+                island.append(cur)
+                p = mesh.polygons[cur]
+                for key in p.edge_keys:
+                    if key in seam_edges:
+                        continue
+                    for neighbor in poly_of_edge.get(key, []):
+                        if neighbor in relevant_set and neighbor not in visited:
+                            visited.add(neighbor)
+                            stack.append(neighbor)
+            islands.append(island)
+
+        width, height = img.size
+        pixels = img.pixels[:]
+        channels = img.channels
+
+        def sample_at_uv(u, v):
+            px = min(width - 1, max(0, int(u * width)))
+            py = min(height - 1, max(0, int(v * height)))
+            idx = (py * width + px) * channels
+            if idx + 2 >= len(pixels):
+                return None
+            return (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3.0
+
+        island_info = []
+        for island in islands:
+            samples = []
+            for pidx in island[:200]:
+                p = mesh.polygons[pidx]
+                us = [uv_layer[li].uv.x for li in p.loop_indices]
+                vs = [uv_layer[li].uv.y for li in p.loop_indices]
+                if not us:
+                    continue
+                avg = sample_at_uv(sum(us) / len(us), sum(vs) / len(vs))
+                if avg is not None:
+                    samples.append(avg)
+            if samples:
+                island_info.append({"faces": island, "avg": sum(samples) / len(samples)})
+
+        if len(island_info) < 2:
+            print(json.dumps({"error": "Fewer than 2 sampleable islands — nothing to split."}))
+        else:
+            island_info.sort(key=lambda x: x["avg"])
+            gaps = [(island_info[i+1]["avg"] - island_info[i]["avg"], i) for i in range(len(island_info) - 1)]
+            gaps.sort(reverse=True)
+            split_at = gaps[0][1]  # index of the largest gap
+            group_a = island_info[:split_at + 1]
+            group_b = island_info[split_at + 1:]
+
+            if not group_a or not group_b:
+                print(json.dumps({"error": "Could not find a meaningful split — all islands landed in one group."}))
+            else:
+                minority = group_a if len(group_a) < len(group_b) else group_b
+                majority = group_b if minority is group_a else group_a
+
+                new_mat = mat.copy()
+                new_mat.name = mat.name + "_split"
+                obj.data.materials.append(new_mat)
+                new_slot = len(obj.material_slots) - 1
+
+                reassigned = 0
+                for entry in minority:
+                    for pidx in entry["faces"]:
+                        mesh.polygons[pidx].material_index = new_slot
+                        reassigned += 1
+                mesh.update()
+
+                print(json.dumps({
+                    "object": '{OBJ}',
+                    "original_material": mat.name,
+                    "new_material": new_mat.name,
+                    "island_count": len(island_info),
+                    "minority_group": {"island_count": len(minority), "faces_reassigned": reassigned,
+                                        "avg_range": [round(minority[0]["avg"], 4), round(minority[-1]["avg"], 4)]},
+                    "majority_group": {"island_count": len(majority), "faces_kept": sum(len(e["faces"]) for e in majority),
+                                        "avg_range": [round(majority[0]["avg"], 4), round(majority[-1]["avg"], 4)]},
+                }))
+""".replace("{OBJ}", object_name.replace("'", "\\'")) \
+   .replace("{MAT}", material_name.replace("'", "\\'"))
+
+    _before_image = _capture_plain_screenshot(object_name)
+
+    try:
+        raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
+        if "error" in raw:
+            return [json.dumps({"error": raw["error"]})]
+        output = raw.get("result", "")
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                parsed = json.loads(line)
+                if "error" in parsed:
+                    return [json.dumps(parsed)]
+
+                # Verify, don't assume — re-measure both materials' real
+                # fingerprints after the split, same discipline as every
+                # other mutating tool tonight.
+                dna_after = _reaffirm_dna(object_name)
+                fingerprints = {}
+                for m in dna_after.get("materials", []):
+                    if m.get("name") in (parsed.get("original_material"), parsed.get("new_material")):
+                        fingerprints[m["name"]] = m.get("fingerprint")
+                parsed["fingerprints_after_split"] = fingerprints
+                parsed["note"] = (
+                    "Both materials share the same node graph/texture immediately after a split — "
+                    "this creates addressability, not visual differentiation. Apply weathering or "
+                    "generate_procedural_material to the new material specifically for that."
+                )
+
+                after_image = _capture_plain_screenshot(object_name)
+                out = []
+                if _before_image:
+                    out.append(_before_image)
+                if after_image:
+                    out.append(after_image)
+                out.append(json.dumps(parsed, indent=2))
+                return out
+        return [json.dumps({"error": "No JSON output from split_blended_material", "raw": output})]
+    except Exception as e:
+        logger.error(f"Error in split_blended_material: {e}")
+        return [json.dumps({"error": str(e)})]
+
+
+@mcp.tool()
 def bake_weathered_textures(
     object_name: str,
     material_name: str,
@@ -6449,7 +7258,7 @@ def bake_weathered_textures(
     basecolor_path = os.path.join(output_dir, f"{safe_mat_name}_baked_basecolor.png")
     roughness_path = os.path.join(output_dir, f"{safe_mat_name}_baked_roughness.png")
 
-    script = r"""
+    script = _SAFE_MATERIAL_BAKE_SNIPPET + r"""
 import bpy, json, statistics, traceback
 
 result = {"errors": []}
@@ -6464,6 +7273,7 @@ else:
     nt = mat.node_tree
     principled = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
     output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    mat_slot_index = next((i for i, s in enumerate(obj.material_slots) if s.material == mat), None)
 
     if principled is None or output_node is None:
         print(json.dumps({"error": "Material has no Principled BSDF / Output node"}))
@@ -6494,39 +7304,19 @@ else:
         baked = {}
 
         def bake_pass(source_socket, image_name, w, h):
-            bake_img = bpy.data.images.new(image_name, width=w, height=h, alpha=False)
-            bake_node = nt.nodes.new("ShaderNodeTexImage")
-            bake_node.name = "TEMP_BakeTarget"
-            bake_node.image = bake_img
-            for n in nt.nodes:
-                n.select = False
-            bake_node.select = True
-            nt.nodes.active = bake_node
-            temp_nodes.append(bake_node)
-
-            emit_node = nt.nodes.new("ShaderNodeEmission")
-            emit_node.name = "TEMP_BakeEmission"
-            nt.links.new(source_socket, emit_node.inputs["Color"])
-            temp_nodes.append(emit_node)
-
-            nt.links.new(emit_node.outputs["Emission"], output_node.inputs["Surface"])
-
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.bake(type='EMIT')
+            # Scoped to ONLY this material's faces via safe_bake_measure —
+            # real fix for a live incident where an unscoped bake corrupted
+            # an unrelated material's real texture (Blender bakes every
+            # material with faces on the object in one pass, each into
+            # whichever image node is "active" in that material's own tree).
+            bake_img = safe_bake_measure(obj, nt, mat_slot_index, output_node, source_socket,
+                                          image_name, w, h, 16)
+            if bake_img is None:
+                raise RuntimeError(f"safe_bake_measure failed for {image_name}")
 
             pixels = bake_img.pixels[:]
             channels = bake_img.channels
             sample = [pixels[i] for i in range(0, min(len(pixels), 40000), channels)]
-
-            # Remove this pass's temp nodes immediately — before the next
-            # pass or any exception — so state never straddles two passes.
-            nt.nodes.remove(bake_node)
-            nt.nodes.remove(emit_node)
-            temp_nodes.remove(bake_node)
-            temp_nodes.remove(emit_node)
-            nt.links.new(original_surface_from, output_node.inputs["Surface"])
 
             return bake_img, {
                 "min": round(min(sample), 4), "max": round(max(sample), 4),
@@ -6904,7 +7694,20 @@ def get_session_log() -> str:
 # AI TECHNICAL DIRECTOR LAYER (v2.2) — compound tools, auto-repair, critic
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PBR_SOCKET_SCAN_SCRIPT = r"""
+# Live-calibrated from the real couch asset (tripo_node_ea89bc21,
+# tripo_mat_ea89bc21) — the concrete known-blended proof case from tonight
+# (leather body + wood trim + plaid blanket, confirmed live, material_count:
+# 1 hiding it completely). First live run measured island_count=6,
+# color_variance=0.00153 — the original 0.01 starting guess was ~6.5x too
+# high and missed it (likely_blended came back False on a case we KNOW is
+# blended). Set below that real measured value with margin. Caveat, stated
+# honestly: no known-NON-blended textured object was available live to
+# calibrate the other side (avoid false positives) — this is a
+# single-data-point calibration on the positive side only, pending a second
+# real object to bound it from below.
+_HETEROGENEITY_THRESHOLD = 0.001
+
+_PBR_SOCKET_SCAN_SCRIPT = _SAFE_MATERIAL_BAKE_SNIPPET + r"""
 import bpy, json, statistics
 
 def sample_avg_stdev(image, max_samples=1500):
@@ -6934,6 +7737,114 @@ def get_input(node, names):
             return s
     return None
 
+def compute_heterogeneity(obj, principled):
+    '''Detects a single material silently doing multiple jobs (the couch:
+    leather + wood + fabric all baked into one shared material,
+    material_count: 1 hiding it completely). material_count alone can never
+    catch this — it's a SLOT count, not a substance count. This measures
+    Base Color's real average per disconnected UV island (split at seams/
+    boundary edges, same real signal apply_weathering_recipe's fraying
+    technique already uses) and compares them — real regional variance, not
+    a guess. Returns island_count=1/no signal when there's nothing to
+    compare (single island, no texture, broken image) rather than forcing
+    a verdict with no evidence.'''
+    het = {"island_count": 0, "color_variance": None, "likely_blended": False, "note": None}
+    bc_sock = principled.inputs.get("Base Color")
+    if not (bc_sock and bc_sock.links and bc_sock.links[0].from_node.type == 'TEX_IMAGE' and bc_sock.links[0].from_node.image):
+        het["note"] = "Base Color is not texture-fed — cannot measure regional heterogeneity"
+        return het
+    img = bc_sock.links[0].from_node.image
+    if img.channels == 0 or img.size[0] == 0 or img.size[1] == 0:
+        het["note"] = "broken image reference"
+        return het
+
+    mesh = obj.data
+    if not mesh.uv_layers.active:
+        het["note"] = "no active UV layer"
+        return het
+    uv_layer = mesh.uv_layers.active.data
+
+    edge_poly_count = {}
+    poly_of_edge = {}
+    for poly in mesh.polygons:
+        for key in poly.edge_keys:
+            edge_poly_count[key] = edge_poly_count.get(key, 0) + 1
+            poly_of_edge.setdefault(key, []).append(poly.index)
+
+    # Island-breaking edges: UV seams (deliberate authoring boundaries) OR
+    # true mesh boundary edges — the same real signal the fraying weathering
+    # technique already relies on, not a new invented heuristic.
+    seam_edges = set()
+    for edge in mesh.edges:
+        key = tuple(sorted(edge.vertices))
+        if edge.use_seam or edge_poly_count.get(key, 0) <= 1:
+            seam_edges.add(key)
+
+    visited = set()
+    islands = []
+    for poly in mesh.polygons:
+        if poly.index in visited:
+            continue
+        stack = [poly.index]
+        island = []
+        visited.add(poly.index)
+        while stack:
+            pidx = stack.pop()
+            island.append(pidx)
+            p = mesh.polygons[pidx]
+            for key in p.edge_keys:
+                if key in seam_edges:
+                    continue
+                for neighbor in poly_of_edge.get(key, []):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+        islands.append(island)
+
+    het["island_count"] = len(islands)
+    if len(islands) < 2:
+        het["note"] = "single connected island (no internal seams/boundaries) — nothing to compare"
+        return het
+
+    width, height = img.size
+    pixels = img.pixels[:]
+    channels = img.channels
+
+    def sample_at_uv(u, v):
+        px = min(width - 1, max(0, int(u * width)))
+        py = min(height - 1, max(0, int(v * height)))
+        idx = (py * width + px) * channels
+        if idx + 2 >= len(pixels):
+            return None
+        return (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3.0
+
+    island_averages = []
+    for island in islands:
+        samples = []
+        for pidx in island[:200]:
+            p = mesh.polygons[pidx]
+            us, vs = [], []
+            for li in p.loop_indices:
+                uv = uv_layer[li].uv
+                us.append(uv.x)
+                vs.append(uv.y)
+            if not us:
+                continue
+            avg = sample_at_uv(sum(us) / len(us), sum(vs) / len(vs))
+            if avg is not None:
+                samples.append(avg)
+        if samples:
+            island_averages.append(sum(samples) / len(samples))
+
+    if len(island_averages) < 2:
+        het["note"] = "could not sample enough islands for a real comparison"
+        return het
+
+    variance = statistics.pvariance(island_averages)
+    het["color_variance"] = round(variance, 5)
+    het["likely_blended"] = variance > {HETEROGENEITY_THRESHOLD}
+    return het
+
 obj = bpy.data.objects.get('{OBJECT_NAME}')
 result = []
 if obj is not None:
@@ -6943,11 +7854,13 @@ if obj is not None:
         if not m:
             continue
         entry = {"name": m.name, "has_principled": False, "texture_fed": [], "missing_maps": [],
-                  "fingerprint": {}}
+                  "fingerprint": {}, "heterogeneity": {"island_count": 0, "color_variance": None,
+                  "likely_blended": False, "note": "no Principled BSDF"}}
         if m.use_nodes and m.node_tree:
             principled = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
             if principled:
                 entry["has_principled"] = True
+                entry["heterogeneity"] = compute_heterogeneity(obj, principled)
                 for socket_name in expected:
                     sock = principled.inputs.get(socket_name)
                     if socket_name == "Normal":
@@ -6984,6 +7897,27 @@ if obj is not None:
                     avg, _ = sample_avg_stdev(rough_sock.links[0].from_node.image)
                     fp["roughness_source"] = "texture_sampled" if avg is not None else "broken_image_fallback"
                     fp["roughness_avg"] = avg
+                elif rough_sock and rough_sock.links:
+                    # Linked to something other than a plain TEX_IMAGE (e.g. a
+                    # Math/Mix node chain, exactly what generate_procedural_material
+                    # builds) — the socket's own default_value is stale/meaningless
+                    # once linked, so reporting it as "constant" is a fabricated
+                    # number, not a measurement (real bug caught live: a genuinely
+                    # measured 0.9789 roughness read back as a fabricated 0.5
+                    # "constant" through this exact path). Only a real, face-scoped
+                    # bake (safe_bake_measure — same fix as the black-couch incident)
+                    # can read the TRUE current value.
+                    rough_output_node = next((n for n in m.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                    rough_slot_index = next((i for i, s in enumerate(obj.material_slots) if s.material == m), None)
+                    measured_rough = None
+                    if rough_output_node is not None and rough_slot_index is not None:
+                        calib_img = safe_bake_measure(obj, m.node_tree, rough_slot_index, rough_output_node,
+                                                       rough_sock.links[0].from_socket, "TEMP_FPRoughCalib", 16, 16, 4)
+                        if calib_img is not None:
+                            measured_rough, _ = sample_avg_stdev(calib_img)
+                            bpy.data.images.remove(calib_img)
+                    fp["roughness_source"] = "procedural_measured" if measured_rough is not None else "procedural_measure_failed"
+                    fp["roughness_avg"] = measured_rough
                 elif rough_sock:
                     fp["roughness_source"] = "constant"
                     fp["roughness_avg"] = round(float(rough_sock.default_value), 4)
@@ -7109,7 +8043,8 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
             raw_topology = _send_raw("analyze_topology", name=object_name, context="generic")
             raw_ue5      = _send_raw("run_unreal_readiness_check", name=object_name)
             raw_object   = _send_raw("get_object_info", name=object_name)
-            pbr_code     = _PBR_SOCKET_SCAN_SCRIPT.replace("{OBJECT_NAME}", object_name)
+            pbr_code     = _PBR_SOCKET_SCAN_SCRIPT.replace("{OBJECT_NAME}", object_name) \
+                                                   .replace("{HETEROGENEITY_THRESHOLD}", str(_HETEROGENEITY_THRESHOLD))
             pbr_result   = _send_raw("execute_code_safe", code=pbr_code, required_mode="OBJECT", push_undo=False)
             raw_materials = []
             for line in str(pbr_result.get("result", "")).splitlines():
@@ -8168,6 +9103,40 @@ def what_next(object_name: str, context: str = "") -> str:
             blocking_ct = 0
             after_this  = "Proceed to the next stage requirement when ready."
 
+        # ── Knowledge-layer enrichment ─────────────────────────────────────────
+        # Purely additive — never changes which action wins above. Surfaces two
+        # things the material knowledge layer now knows that this tool
+        # previously had no way to mention: a material with no active
+        # Principled BSDF at all (generate_procedural_material can now build
+        # one from scratch, calibrated — a real option that didn't exist
+        # before tonight), and a material that closely matches something
+        # already recorded (apply_weathering_recipe/generate_procedural_material
+        # can build on that instead of starting blind). Advisory only — a
+        # failure here never breaks the core recommendation above.
+        material_knowledge_notes = []
+        if has_materials:
+            try:
+                dna_for_materials = json.loads(get_asset_dna(object_name, target_engine="unreal"))
+                for mat in dna_for_materials.get("materials", []):
+                    mname = mat.get("name", "?")
+                    if not mat.get("has_principled"):
+                        material_knowledge_notes.append(
+                            f"'{mname}' has no active Principled BSDF — "
+                            f"generate_procedural_material(object_name, material_name='{mname}', "
+                            f"category=...) can build a real, calibrated PBR material from scratch."
+                        )
+                    else:
+                        match = mat.get("closest_known_material")
+                        if match:
+                            material_knowledge_notes.append(
+                                f"'{mname}' closely matches the recorded '{match['canonical_name']}' "
+                                f"recipe (distance {match['distance']}) — apply_weathering_recipe or "
+                                f"generate_procedural_material can lean on that prior knowledge "
+                                f"instead of starting blind."
+                            )
+            except Exception:
+                pass
+
         # ── Playbook context ───────────────────────────────────────────────────
         pb = _get_active_playbook()
         playbook_block = None
@@ -8233,6 +9202,8 @@ def what_next(object_name: str, context: str = "") -> str:
             result["playbook"] = playbook_block
         if playbook_conflicts:
             result["playbook_conflicts"] = playbook_conflicts
+        if material_knowledge_notes:
+            result["material_knowledge"] = material_knowledge_notes
         if verified:
             result["session_verified_checks"] = verified
 
@@ -10423,6 +11394,43 @@ def production_review(
                 _session_append("verified_checks", "critique_animation")
             except Exception as e:
                 anim_summary = {"note": f"Animation critique failed: {e}"}
+
+        # ── Step 5.5: Material knowledge layer enrichment ────────────────────
+        # Surfaces closest_known_material matches and blended-material
+        # candidates as findings — visible the same way every other finding
+        # is (feeds the existing score/recommendations pipeline below), not
+        # a buried field nobody reads. Never a hard blocker on its own:
+        # a known-recipe match is info severity, a likely-blended material
+        # is warning severity — consistent with known_material_match's
+        # info severity in get_asset_dna's own rules_fired. Advisory only;
+        # a failure here never breaks the core review.
+        try:
+            dna_for_materials = json.loads(get_asset_dna(object_name, target_engine="unreal"))
+            for mat in dna_for_materials.get("materials", []):
+                mname = mat.get("name", "?")
+                match = mat.get("closest_known_material")
+                if match:
+                    all_findings.append({
+                        "issue": f"Material '{mname}' closely matches recorded recipe "
+                                 f"'{match['canonical_name']}' (distance {match['distance']})",
+                        "severity": "info",
+                        "source": "material_knowledge",
+                        "fix": "apply_weathering_recipe or generate_procedural_material can build "
+                               "on this prior knowledge instead of starting blind.",
+                    })
+                heterogeneity = mat.get("heterogeneity")
+                if heterogeneity and heterogeneity.get("likely_blended"):
+                    all_findings.append({
+                        "issue": f"Material '{mname}' looks like it's blending multiple substances "
+                                 f"into one slot (island_count={heterogeneity.get('island_count')}, "
+                                 f"color_variance={heterogeneity.get('color_variance')})",
+                        "severity": "warning",
+                        "source": "material_knowledge",
+                        "fix": "split_blended_material(object_name, material_name) can separate it "
+                               "into distinct, individually-weatherable materials.",
+                    })
+        except Exception:
+            pass
 
         # ── Step 6: Conflict detection ────────────────────────────────────────
         # Compare stated asset_type against what the data shows.

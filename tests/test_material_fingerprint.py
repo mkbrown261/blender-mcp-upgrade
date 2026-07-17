@@ -51,6 +51,18 @@ check("script computes a real measured average+stdev via strided sampling, not a
 check("roughness fingerprint distinguishes texture-sampled from constant, same as metal_factor",
       'fp["roughness_source"] = "texture_sampled"' in code
       and 'fp["roughness_source"] = "constant"' in code)
+# Real bug caught live: a Roughness socket linked to a procedural node chain
+# (e.g. everything generate_procedural_material builds) fell into the same
+# branch as a truly-unlinked constant, reporting the socket's stale/
+# meaningless default_value as if it were real — a genuinely measured 0.9789
+# roughness read back as a fabricated 0.5 "constant" through this exact path.
+check("a Roughness socket linked to anything OTHER than TEX_IMAGE is measured via a real "
+      "face-scoped bake, not reported as a fabricated 'constant' using its stale default_value",
+      'elif rough_sock and rough_sock.links:' in code
+      and 'fp["roughness_source"] = "procedural_measured" if measured_rough is not None' in code)
+check("the procedural-roughness bake reuses the shared safe_bake_measure helper, not a "
+      "reimplemented unscoped bake",
+      "safe_bake_measure(obj, m.node_tree, rough_slot_index, rough_output_node," in code)
 check("subsurface_weight lookup is version-safe (Blender 4.x vs 3.x socket name)",
       'get_input(principled, ["Subsurface Weight", "Subsurface"])' in code)
 check("specular_ior_level lookup is version-safe (Blender 4.x vs 3.x socket name)",
@@ -62,7 +74,7 @@ check("normal map fingerprint only claims presence when a real connected TEX_IMA
       and "color_in.links[0].from_node.type == 'TEX_IMAGE'" in code)
 check("a material with no principled BSDF still gets an (empty) fingerprint key, not a missing one",
       'entry = {"name": m.name, "has_principled": False, "texture_fed": [], "missing_maps": [],' in code
-      and '"fingerprint": {}}' in code)
+      and '"fingerprint": {}, "heterogeneity":' in code)
 
 # ── Fingerprint data survives untouched through get_asset_dna's assembly ────
 _DNA_RAW = {

@@ -85,9 +85,13 @@ check("generated script parses cleanly", ok)
 
 # The exact safety properties that were missing when the real corruption
 # bug happened live — these are the regression guard, not incidental checks.
-check("original Surface source captured BEFORE any temp node is created",
-      code.index("original_surface_from = original_surface_link.from_socket")
-      < code.index('nt.nodes.new("ShaderNodeTexImage")'))
+# _SAFE_MATERIAL_BAKE_SNIPPET is prepended textually (a function DEFINITION,
+# not executed yet) so ordering checks must look at the outer script body —
+# after the snippet — not raw substring position across the whole string.
+outer_script = code[code.index("import bpy, json, statistics, traceback"):]
+check("original Surface source captured BEFORE any temp node is created (in the outer script)",
+      outer_script.index("original_surface_from = original_surface_link.from_socket")
+      < outer_script.index('nt.nodes.new("ShaderNodeTexImage")'))
 check("original render engine/samples captured before any mutation",
       "original_engine = bpy.context.scene.render.engine" in code
       and "original_samples = bpy.context.scene.cycles.samples" in code)
@@ -96,8 +100,12 @@ check("the whole bake+rewire sequence is wrapped in try/finally",
 check("finally block restores render engine and sample count unconditionally",
       "bpy.context.scene.render.engine = original_engine" in code
       and "bpy.context.scene.cycles.samples = original_samples" in code)
-check("finally block restores Surface wiring unconditionally, not just on success",
-      code.count("nt.links.new(original_surface_from, output_node.inputs") >= 2)
+check("outer finally block restores Surface wiring unconditionally as the ultimate safety net",
+      "nt.links.new(original_surface_from, output_node.inputs" in outer_script)
+check("bake_pass delegates to the shared safe_bake_measure helper instead of an unscoped bake "
+      "(the real fix: per-pass restoration + face-scoping now lives in one tested place, not "
+      "duplicated inline)",
+      "bake_img = safe_bake_measure(obj, nt, mat_slot_index, output_node, source_socket," in code)
 check("broken images (0 channels or 0x0 size) are scanned across EVERY material on the object, not just the target",
       "for slot in obj.material_slots:" in code
       and "channels == 0 or img.size[0] == 0" in code)
