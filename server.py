@@ -868,6 +868,18 @@ _PRODUCTION_RULES: list = [
         "why": "env_prop/weapon assets typically need collision before they're usable in level design, "
                "but collision generation is gated behind explicit user approval in this project.",
     },
+    {
+        "id": "known_material_match",
+        "severity": "info",
+        "predicate": lambda dna: any(
+            m.get("closest_known_material") for m in dna.get("materials", [])
+        ),
+        "recommendation": "One or more materials matched a previously-recorded material recipe — "
+                           "check materials[].closest_known_material for the matched name, category, "
+                           "and distance (lower = closer match).",
+        "why": "The material knowledge layer only helps if it's actually surfaced — this makes a "
+               "measured-similarity match visible in rules_fired instead of a field nobody reads.",
+    },
 ]
 
 
@@ -5684,6 +5696,71 @@ def _resolve_material_category(material_name: str) -> Optional[str]:
     return matches[0].get("parameters", {}).get("category")
 
 
+def _fingerprint_value(fp: dict, key: str) -> Optional[float]:
+    """A recorded fingerprint stores either a single measured value (one
+    sample) or a range (multiple samples, e.g. "roughness_avg_range": [a, b])
+    — read whichever is present and collapse a range to its midpoint."""
+    if key in fp and fp[key] is not None:
+        return float(fp[key])
+    range_key = key + "_range"
+    r = fp.get(range_key)
+    if r and len(r) == 2:
+        return (float(r[0]) + float(r[1])) / 2.0
+    return None
+
+
+def _fingerprint_distance(fp_a: dict, fp_b: dict) -> Optional[float]:
+    """Weighted distance over roughness_avg and normal_map_bumpiness — the
+    two axes with real, discriminative spread across every material recorded
+    tonight. subsurface_weight/specular_ior_level are deliberately excluded:
+    both have been constant (0.0 / 0.5) across all 14 entries recorded so
+    far, so they'd add noise, not signal, at this stage. Bumpiness is scaled
+    up (~4x) before combining since its real range (0-0.17) is much smaller
+    than roughness's (0-1) and would otherwise be drowned out. Returns None
+    if either fingerprint is missing a value on both axes — nothing to
+    compare, not a guessed distance."""
+    r_a = _fingerprint_value(fp_a, "roughness_avg")
+    r_b = _fingerprint_value(fp_b, "roughness_avg")
+    b_a = _fingerprint_value(fp_a, "normal_map_bumpiness")
+    b_b = _fingerprint_value(fp_b, "normal_map_bumpiness")
+    if r_a is None or r_b is None:
+        return None
+    r_diff = r_a - r_b
+    b_diff = (b_a - b_b) * 4.0 if (b_a is not None and b_b is not None) else 0.0
+    return (r_diff ** 2 + b_diff ** 2) ** 0.5
+
+
+def _find_closest_material_recipe(fingerprint: dict, max_distance: float = 0.15) -> Optional[dict]:
+    """Retrieval by MEASURED SIMILARITY instead of by material name — the
+    actual fix for the knowledge layer being unreachable. Auto-generated
+    material names (tripo_mat_XXXXXXXX) never match a trigger_phrase, so
+    _resolve_material_category's name-based lookup can never fire on most
+    real assets. This compares the real fingerprint instead. Returns None
+    rather than forcing a match beyond max_distance — calibrated from real
+    data: materials within the same recorded category typically land
+    0.02-0.05 apart, different categories are usually 0.15+ apart. Never
+    silently degrades to "closest of whatever exists" when nothing is
+    actually close."""
+    best = None
+    best_dist = None
+    for entry in _RECIPES:
+        if entry.get("recipe_type") != "material":
+            continue
+        candidate_fp = entry.get("parameters", {}).get("fingerprint", {})
+        dist = _fingerprint_distance(fingerprint, candidate_fp)
+        if dist is None:
+            continue
+        if best_dist is None or dist < best_dist:
+            best, best_dist = entry, dist
+    if best is None or best_dist > max_distance:
+        return None
+    return {
+        "canonical_name": best.get("canonical_name"),
+        "distance": round(best_dist, 4),
+        "category": best.get("parameters", {}).get("category"),
+    }
+
+
 @mcp.tool()
 def apply_weathering_recipe(
     object_name: str,
@@ -5785,11 +5862,17 @@ def apply_weathering_recipe(
     metal_factor_floored (>0.5 -> oxidation, else -> fraying) — a call with
     material_name="" (every material) correctly gives metal armor oxidation
     and a cloth cape fraying in the same pass. If material_category is None
-    AND material_name names one specific material, a recipe_type="material"
-    lookup by that name (query_creative_recipe) can also supply the category
-    — same explicit > recipe > automatic precedence as wear_scalar/
-    trigger_phrase. That lookup is skipped when material_name is blank
-    (applying to every material) since there's no single name to look up yet.
+    AND material_name names one specific material, resolution tries, in
+    order: (1) a recipe_type="material" lookup by NAME (query_creative_recipe)
+    — rarely fires on real assets since auto-generated material names never
+    match a trigger_phrase; (2) retrieval by MEASURED SIMILARITY instead —
+    the material's own real fingerprint compared against everything recorded
+    so far, same mechanism get_asset_dna surfaces as closest_known_material.
+    Only a real, close-enough match ever supplies a category this way — same
+    explicit > name-recipe > fingerprint-recipe > automatic precedence as
+    wear_scalar/trigger_phrase elsewhere in this tool. Both lookups are
+    skipped when material_name is blank (applying to every material) since
+    there's no single material to look up yet.
     """
     _invalidate_dna_cache(object_name)
 
@@ -5802,6 +5885,20 @@ def apply_weathering_recipe(
 
     if material_category is None and material_name:
         material_category = _resolve_material_category(material_name)
+        if material_category is None:
+            # No name-based match — the common case, since auto-generated
+            # material names never match a trigger_phrase. Fall back to
+            # retrieval by measured similarity via the same
+            # closest_known_material logic get_asset_dna already computes,
+            # instead of falling straight through to the automatic
+            # metal_factor dispatch with zero prior knowledge consulted.
+            dna_lookup = _reaffirm_dna(object_name)
+            for mat in dna_lookup.get("materials", []):
+                if mat.get("name") == material_name:
+                    match = mat.get("closest_known_material")
+                    if match:
+                        material_category = match.get("category")
+                    break
     script = r"""
 import bpy, json, mathutils, statistics
 
@@ -6995,6 +7092,13 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
     the raw material for the material knowledge layer (recipe_type="material"
     entries): record what was actually measured on a real material, not
     invented material-science facts.
+
+    Each material entry also carries closest_known_material — the material
+    knowledge layer looked up by MEASURED SIMILARITY (fingerprint distance),
+    not by name. Auto-generated material names never match a recorded
+    trigger_phrase, so this is the only retrieval path that actually works
+    on most real assets. null when nothing recorded is close enough —
+    never forces a match just because something's the least-far option.
     """
     try:
         cached = None if force_refresh else _SNAPSHOTS.get(object_name, {}).get("_dna_raw")
@@ -7052,6 +7156,16 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
 
         category = _session_get("active_playbook")
         playbook = _PLAYBOOKS.get(category) if category else None
+
+        # Retrieval by measured similarity, not by material name — auto-
+        # generated names (tripo_mat_XXXXXXXX) never match a trigger_phrase,
+        # so this is the only way the material knowledge layer is actually
+        # reachable on most real assets. Runs unconditionally on every
+        # material in every get_asset_dna call, not opt-in.
+        for mat in raw_materials:
+            mat["closest_known_material"] = _find_closest_material_recipe(
+                mat.get("fingerprint", {})
+            )
 
         dna = {
             "object": object_name,
