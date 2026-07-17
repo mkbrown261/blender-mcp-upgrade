@@ -6808,7 +6808,35 @@ def get_session_log() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PBR_SOCKET_SCAN_SCRIPT = r"""
-import bpy, json
+import bpy, json, statistics
+
+def sample_avg_stdev(image, max_samples=1500):
+    '''Strided sample of an image's first channel — real measured average AND
+    spread, not just a single number. stdev is what makes this useful for
+    normal maps: a flat/absent normal map has near-zero variance, a heavily
+    detailed one has real variance — a genuine "how bumpy is this surface"
+    signal, distinct from the Roughness (specular response) channel.'''
+    channels = image.channels
+    if channels == 0 or image.size[0] == 0 or image.size[1] == 0:
+        return None, None
+    pixels = image.pixels[:]
+    texel_count = len(pixels) // channels
+    stride = max(1, texel_count // max_samples)
+    vals = [pixels[i] for i in range(0, len(pixels), channels * stride)]
+    if not vals:
+        return None, None
+    return round(sum(vals) / len(vals), 4), round(statistics.pstdev(vals), 4)
+
+def get_input(node, names):
+    '''Version-safe socket lookup — Blender 4.x renamed several Principled
+    BSDF inputs (e.g. "Subsurface" -> "Subsurface Weight", "Specular" ->
+    "Specular IOR Level"). Try each known name, return the first that exists.'''
+    for n in names:
+        s = node.inputs.get(n)
+        if s is not None:
+            return s
+    return None
+
 obj = bpy.data.objects.get('{OBJECT_NAME}')
 result = []
 if obj is not None:
@@ -6817,7 +6845,8 @@ if obj is not None:
         m = slot.material
         if not m:
             continue
-        entry = {"name": m.name, "has_principled": False, "texture_fed": [], "missing_maps": []}
+        entry = {"name": m.name, "has_principled": False, "texture_fed": [], "missing_maps": [],
+                  "fingerprint": {}}
         if m.use_nodes and m.node_tree:
             principled = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
             if principled:
@@ -6829,6 +6858,44 @@ if obj is not None:
                         entry["texture_fed"].append(socket_name)
                     else:
                         entry["missing_maps"].append(socket_name)
+
+                # Real material fingerprint — every value here is MEASURED,
+                # never guessed, same discipline as metal_factor. This is the
+                # richer signal set beyond the single metal_factor scalar that
+                # material_category dispatch used alone before tonight.
+                fp = {}
+
+                rough_sock = principled.inputs.get("Roughness")
+                if rough_sock and rough_sock.links and rough_sock.links[0].from_node.type == 'TEX_IMAGE' and rough_sock.links[0].from_node.image:
+                    avg, _ = sample_avg_stdev(rough_sock.links[0].from_node.image)
+                    fp["roughness_source"] = "texture_sampled" if avg is not None else "broken_image_fallback"
+                    fp["roughness_avg"] = avg
+                elif rough_sock:
+                    fp["roughness_source"] = "constant"
+                    fp["roughness_avg"] = round(float(rough_sock.default_value), 4)
+                else:
+                    fp["roughness_source"] = None
+                    fp["roughness_avg"] = None
+
+                sss_sock = get_input(principled, ["Subsurface Weight", "Subsurface"])
+                fp["subsurface_weight"] = round(float(sss_sock.default_value), 4) if sss_sock else None
+
+                spec_sock = get_input(principled, ["Specular IOR Level", "Specular"])
+                fp["specular_ior_level"] = round(float(spec_sock.default_value), 4) if spec_sock else None
+
+                fp["normal_map_present"] = False
+                fp["normal_map_bumpiness"] = None
+                normal_sock = principled.inputs.get("Normal")
+                if normal_sock and normal_sock.links and normal_sock.links[0].from_node.type == 'NORMAL_MAP':
+                    normal_map_node = normal_sock.links[0].from_node
+                    color_in = normal_map_node.inputs.get("Color")
+                    if color_in and color_in.links and color_in.links[0].from_node.type == 'TEX_IMAGE' and color_in.links[0].from_node.image:
+                        _, stdev = sample_avg_stdev(color_in.links[0].from_node.image)
+                        if stdev is not None:
+                            fp["normal_map_present"] = True
+                            fp["normal_map_bumpiness"] = stdev
+
+                entry["fingerprint"] = fp
         result.append(entry)
 print(json.dumps(result))
 """
@@ -6900,6 +6967,17 @@ def get_asset_dna(object_name: str, target_engine: str = "unreal", force_refresh
     mutations made outside this MCP (raw execute_code_safe scripts, direct
     Blender UI edits) that the automatic hooks can't see. force_refresh=True
     bypasses the cache entirely when you know something changed.
+
+    Each entry in materials[] carries a "fingerprint" — real MEASURED signals
+    beyond metal_factor alone: roughness_source/roughness_avg (texture-
+    sampled or constant), subsurface_weight, specular_ior_level, and
+    normal_map_present/normal_map_bumpiness (pixel-variance of the connected
+    normal map — a genuine "how physically detailed is this surface" signal,
+    distinct from Roughness's specular-response meaning). Every value here is
+    measured, never guessed — the same discipline as metal_factor. This is
+    the raw material for the material knowledge layer (recipe_type="material"
+    entries): record what was actually measured on a real material, not
+    invented material-science facts.
     """
     try:
         cached = None if force_refresh else _SNAPSHOTS.get(object_name, {}).get("_dna_raw")
