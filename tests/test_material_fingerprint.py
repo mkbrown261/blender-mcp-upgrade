@@ -28,6 +28,22 @@ def check(name, condition):
 
 code = server._PBR_SOCKET_SCAN_SCRIPT
 
+# ── Regression: Normal's missing_maps check must walk through the Normal Map ─
+# node, not check for a direct TEX_IMAGE link like the other 3 sockets. Real
+# bug caught live: a proper Blender normal map is NEVER wired directly to
+# Principled.Normal (it always goes TEX_IMAGE -> Normal Map node ->
+# Principled.Normal), so the old "same check for all 4 sockets" logic
+# reported Normal as missing on EVERY correctly-wired material, including
+# ones that had a real, connected normal map — confirmed live on 3/3 pieces
+# of a real character where fingerprint.normal_map_present=true contradicted
+# missing_maps=["Normal"] from the same scan.
+check("Normal's texture-fed check is NOT the same direct-TEX_IMAGE check used for the other 3 sockets",
+      code.count("is_textured = bool(sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE')") == 1)
+check("Normal's texture-fed check walks through the Normal Map node to find the real source texture",
+      "sock.links[0].from_node.type == 'NORMAL_MAP'" in code
+      and 'sock.links[0].from_node.inputs.get("Color")' in code
+      and 'sock.links[0].from_node.inputs["Color"].links[0].from_node.type == \'TEX_IMAGE\'' in code)
+
 # ── Structural checks on the generated Blender-side script ──────────────────
 check("script computes a real measured average+stdev via strided sampling, not a guess",
       "def sample_avg_stdev(image, max_samples=1500):" in code

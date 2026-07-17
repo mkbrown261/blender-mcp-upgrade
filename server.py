@@ -6853,7 +6853,24 @@ if obj is not None:
                 entry["has_principled"] = True
                 for socket_name in expected:
                     sock = principled.inputs.get(socket_name)
-                    is_textured = bool(sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE')
+                    if socket_name == "Normal":
+                        # A real normal map is NEVER wired directly to
+                        # Principled.Normal — it always goes through an
+                        # intermediate Normal Map node (TEX_IMAGE -> Normal
+                        # Map -> Principled.Normal). Checking for a direct
+                        # TEX_IMAGE link here (like the other 3 sockets)
+                        # means Normal reads "missing" on EVERY correctly-
+                        # wired material — real bug caught live: a real,
+                        # correctly-connected normal map on a 3-piece
+                        # character was flagged missing by this exact check.
+                        is_textured = bool(
+                            sock and sock.links and sock.links[0].from_node.type == 'NORMAL_MAP'
+                            and sock.links[0].from_node.inputs.get("Color")
+                            and sock.links[0].from_node.inputs["Color"].links
+                            and sock.links[0].from_node.inputs["Color"].links[0].from_node.type == 'TEX_IMAGE'
+                        )
+                    else:
+                        is_textured = bool(sock and sock.links and sock.links[0].from_node.type == 'TEX_IMAGE')
                     if is_textured:
                         entry["texture_fed"].append(socket_name)
                     else:
