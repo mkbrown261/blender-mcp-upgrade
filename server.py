@@ -6497,163 +6497,33 @@ else:
         return [json.dumps({"error": str(e)})]
 
 
-@mcp.tool()
-def generate_procedural_material(
+def _calibrate_and_build_procedural_material(
     object_name: str,
     material_name: str,
-    category: str = "",
-    target_recipe: str = "",
+    target_roughness: float,
+    roughness_was_recorded: bool,
+    target_bumpiness: float,
+    target_subsurface: float,
+    target_specular: float,
+    metallic_const: float,
+    dark_color: list,
+    light_color: list,
+    color_source: str,
+    extra_result_fields: Optional[dict] = None,
 ) -> list:
     """
-    GENERATE PROCEDURAL MATERIAL — creates a real Blender node-based PBR
-    material from noise/voronoi/bump nodes, calibrated against the material
-    knowledge layer instead of guessed. Unlike apply_weathering_recipe (which
-    modifies an EXISTING material's appearance), this REPLACES material_name's
-    Base Color/Roughness/Normal wiring entirely with a generated procedural
-    graph — call create_checkpoint() first, this is generative and not a
-    simple metric diff. If material_name doesn't exist yet on the object, it
-    is created and assigned a new slot. If that's the object's ONLY material
-    slot (unambiguous — nothing existing to overwrite), every face is
-    auto-assigned to it so there's something real to calibrate against. If
-    the object already has other materials, the new slot is left at 0
-    faces — auto-assigning would silently steal faces from an existing
-    material. calibration_status comes back "unverified_no_faces_assigned"
-    in that case (a real failure mode caught on this tool's first live run:
-    a brand-new unassigned material slot baked to a flat 0.0 regardless of
-    target, which the calibration loop was initially misreporting as a
-    generic "approximate" near-miss instead of "nothing was actually
-    there to measure") — assign the material to faces first (e.g. via
-    split_blended_material or manual selection), then call again.
-
-    Returns a list: [before_image?, after_image?, result_json_string] — same
-    convention as apply_weathering_recipe/bake_weathered_textures. Parse the
-    JSON result with json.loads(result[-1]).
-
-    Because it's procedural (no baked bitmap), the result is inherently
-    tileable/seamless — there's no image edge to hide a seam at until you
-    choose to bake one via bake_weathered_textures.
-
-    WHAT'S CALIBRATED vs. WHAT'S A HEURISTIC — stated honestly, not blurred:
-    - Roughness is calibrated AND VERIFIED: the target category/recipe's
-      recorded roughness_avg drives the generated Roughness formula, then
-      this tool immediately bakes a small internal sample (the same
-      Emission-trick technique bake_weathered_textures uses) and measures the
-      REAL resulting average — not assumed. If it lands within tolerance
-      (0.15, the same honesty-gate threshold _find_closest_material_recipe
-      uses), calibration_status is "matched". If not, ONE bounded retry
-      nudges the formula and re-measures; still-out-of-tolerance after that
-      is reported as "approximate" with the real measured number attached —
-      never silently claimed as a match.
-    - Bump strength (visual bumpiness): the INPUT formula (normal_map_
-      bumpiness x3, clamped 0-1) is still a documented heuristic — the
-      knowledge layer only ever recorded bumpiness as a scalar magnitude,
-      never spatial frequency, so there's no formula to derive exactly.
-      What IS real now: bump_verification bakes the resulting Bump.Normal
-      output (via the same safe_bake_measure used for Roughness) and
-      reports its measured stdev — a relative spatial-variance signal, the
-      same TYPE of measurement normal_map_bumpiness itself already is, not
-      a claim of decoding literal normal-vector directions from baked
-      pixels (that would be unreliable). A same-units sanity check on the
-      OUTPUT, even though the INPUT formula stays a heuristic.
-    - Metallic is a category-based constant (0.9 for "metal", else 0.0) —
-      the fingerprint has never recorded a metallic signal, only roughness/
-      subsurface/specular/normal-bumpiness, so this is a plain, documented
-      default, not a measurement.
-    - subsurface_weight/specular_ior_level are set directly from the target
-      recipe's own recorded values when present (real recorded data, no
-      formula needed) — default to 0.0/0.5 when the recipe has none recorded.
-    - Base Color for category="metal" reuses rust_color, the SAME constant
-      apply_weathering_recipe already defaults to — a real, already-used
-      value, not invented. Every other category is still a flat, explicitly
-      labeled gray placeholder (color_source: "generic_gray_placeholder" in
-      the result vs. "reused_rust_color") — no color data has ever been
-      recorded for any category, and this tool won't imply otherwise for
-      categories it hasn't actually addressed yet.
-
-    Category/target resolution — same explicit > name > fingerprint
-    precedence as apply_weathering_recipe's material_category, but ending in
-    an error instead of an automatic default, since there's no existing
-    material driving a metal_factor to dispatch from:
-    1. target_recipe: exact canonical_name lookup — uses that recipe's own
-       fingerprint directly, most specific.
-    2. category: uses a representative recorded recipe for that category if
-       one exists (calibration_status "uncalibrated" with generic defaults
-       if none has ever been recorded for that category — never invents
-       numbers for a category with zero real data).
-    3. Neither given: tries _resolve_material_category(material_name) (name-
-       based), then falls back to the object's OWN current closest_known_material
-       fingerprint match (only meaningful if material_name already exists
-       with some real PBR data to compare).
-    4. Nothing resolves: returns an error asking for an explicit category or
-       target_recipe — never guesses a starting point out of thin air.
+    Shared calibration engine behind generate_procedural_material AND
+    match_material_from_photo/apply_photo_material_match — extracted so both
+    front-ends (recipe-driven and vision-driven target resolution) get the
+    IDENTICAL bake-and-measure verification loop, not two copies that could
+    drift apart. Builds a real node-based PBR material (noise/voronoi/bump),
+    bakes a small internal sample, and measures the REAL resulting Roughness/
+    Bump output rather than assuming the input formula lands where intended.
+    One bounded retry on an out-of-tolerance first pass; never loops
+    indefinitely. See generate_procedural_material's docstring for the full
+    calibrated-vs-heuristic breakdown — unchanged by this extraction.
     """
-    resolved_category = None
-    resolved_recipe = None
-
-    if target_recipe:
-        resolved_recipe = _find_recipe_by_canonical_name(target_recipe)
-        if resolved_recipe is None:
-            return [json.dumps({"error": f"No recorded recipe named '{target_recipe}'."})]
-        resolved_category = resolved_recipe.get("parameters", {}).get("category")
-    elif category:
-        resolved_category = category
-        resolved_recipe = _find_recipe_for_category(category)
-    else:
-        resolved_category = _resolve_material_category(material_name)
-        if resolved_category is None:
-            dna_lookup = _reaffirm_dna(object_name)
-            for mat in dna_lookup.get("materials", []):
-                if mat.get("name") == material_name:
-                    match = mat.get("closest_known_material")
-                    if match:
-                        resolved_category = match.get("category")
-                        resolved_recipe = _find_recipe_by_canonical_name(match.get("canonical_name"))
-                    break
-        else:
-            resolved_recipe = _find_recipe_for_category(resolved_category)
-
-    if resolved_category is None:
-        return [json.dumps({
-            "error": "Could not resolve a target category — no explicit category/target_recipe, "
-                     "no name-based match, and no existing fingerprint close enough to compare.",
-            "fix": "Pass category= (e.g. 'metal', 'organic') or target_recipe= (a recorded canonical_name) explicitly.",
-        })]
-
-    target_fp = resolved_recipe.get("parameters", {}).get("fingerprint", {}) if resolved_recipe else {}
-    target_roughness = _fingerprint_value(target_fp, "roughness_avg")
-    roughness_was_recorded = target_roughness is not None
-    if target_roughness is None:
-        target_roughness = 0.6
-    target_bumpiness = _fingerprint_value(target_fp, "normal_map_bumpiness")
-    if target_bumpiness is None:
-        target_bumpiness = 0.02
-    target_subsurface = _fingerprint_value(target_fp, "subsurface_weight")
-    if target_subsurface is None:
-        target_subsurface = 0.0
-    target_specular = _fingerprint_value(target_fp, "specular_ior_level")
-    if target_specular is None:
-        target_specular = 0.5
-    metallic_const = 0.9 if resolved_category == "metal" else 0.0
     bump_strength = max(0.0, min(1.0, target_bumpiness * 3.0))
-
-    # Color: never invented. The knowledge layer has never recorded real
-    # color data for ANY category — only roughness/subsurface/specular/
-    # bumpiness. "metal" is the one exception: it reuses rust_color, the
-    # SAME constant apply_weathering_recipe already defaults to (server.py
-    # ~5809) and has been used/seen across many live weathering calls
-    # tonight — a real, already-approved value, not a new guess. Every
-    # other category keeps a flat, explicitly-labeled gray placeholder
-    # (color_source in the result) rather than silently implying it means
-    # something it doesn't.
-    if resolved_category == "metal":
-        rust_color = [0.35, 0.14, 0.05]
-        dark_color = [c * 0.5 for c in rust_color]
-        light_color = [min(1.0, c * 1.4) for c in rust_color]
-        color_source = "reused_rust_color"
-    else:
-        dark_color = [0.25, 0.25, 0.25]
-        light_color = [0.6, 0.6, 0.6]
-        color_source = "generic_gray_placeholder"
 
     def build_and_measure(roughness_target: float) -> dict:
         script = _SAFE_MATERIAL_BAKE_SNIPPET + r"""
@@ -6926,8 +6796,6 @@ else:
         result = {
             "object": object_name,
             "material": material_name,
-            "category_used": resolved_category,
-            "canonical_recipe_used": resolved_recipe.get("canonical_name") if resolved_recipe else None,
             "target_roughness": round(target_roughness, 4),
             "roughness_was_recorded": roughness_was_recorded,
             "measured_roughness": measured,
@@ -6944,6 +6812,8 @@ else:
             "faces_using_material": faces_using_material,
             "auto_assigned_all_faces": pass_1.get("auto_assigned_all_faces", False),
         }
+        if extra_result_fields:
+            result.update(extra_result_fields)
         if faces_using_material == 0:
             result["fix"] = (
                 "This material isn't assigned to any face yet (it was created new on an object "
@@ -6962,8 +6832,366 @@ else:
         out.append(json.dumps(result, indent=2))
         return out
     except Exception as e:
-        logger.error(f"Error in generate_procedural_material: {e}")
+        logger.error(f"Error in _calibrate_and_build_procedural_material: {e}")
         return [json.dumps({"error": str(e)})]
+
+
+@mcp.tool()
+def generate_procedural_material(
+    object_name: str,
+    material_name: str,
+    category: str = "",
+    target_recipe: str = "",
+) -> list:
+    """
+    GENERATE PROCEDURAL MATERIAL — creates a real Blender node-based PBR
+    material from noise/voronoi/bump nodes, calibrated against the material
+    knowledge layer instead of guessed. Unlike apply_weathering_recipe (which
+    modifies an EXISTING material's appearance), this REPLACES material_name's
+    Base Color/Roughness/Normal wiring entirely with a generated procedural
+    graph — call create_checkpoint() first, this is generative and not a
+    simple metric diff. If material_name doesn't exist yet on the object, it
+    is created and assigned a new slot. If that's the object's ONLY material
+    slot (unambiguous — nothing existing to overwrite), every face is
+    auto-assigned to it so there's something real to calibrate against. If
+    the object already has other materials, the new slot is left at 0
+    faces — auto-assigning would silently steal faces from an existing
+    material. calibration_status comes back "unverified_no_faces_assigned"
+    in that case (a real failure mode caught on this tool's first live run:
+    a brand-new unassigned material slot baked to a flat 0.0 regardless of
+    target, which the calibration loop was initially misreporting as a
+    generic "approximate" near-miss instead of "nothing was actually
+    there to measure") — assign the material to faces first (e.g. via
+    split_blended_material or manual selection), then call again.
+
+    Returns a list: [before_image?, after_image?, result_json_string] — same
+    convention as apply_weathering_recipe/bake_weathered_textures. Parse the
+    JSON result with json.loads(result[-1]).
+
+    Because it's procedural (no baked bitmap), the result is inherently
+    tileable/seamless — there's no image edge to hide a seam at until you
+    choose to bake one via bake_weathered_textures.
+
+    WHAT'S CALIBRATED vs. WHAT'S A HEURISTIC — stated honestly, not blurred:
+    - Roughness is calibrated AND VERIFIED: the target category/recipe's
+      recorded roughness_avg drives the generated Roughness formula, then
+      this tool immediately bakes a small internal sample (the same
+      Emission-trick technique bake_weathered_textures uses) and measures the
+      REAL resulting average — not assumed. If it lands within tolerance
+      (0.15, the same honesty-gate threshold _find_closest_material_recipe
+      uses), calibration_status is "matched". If not, ONE bounded retry
+      nudges the formula and re-measures; still-out-of-tolerance after that
+      is reported as "approximate" with the real measured number attached —
+      never silently claimed as a match.
+    - Bump strength (visual bumpiness): the INPUT formula (normal_map_
+      bumpiness x3, clamped 0-1) is still a documented heuristic — the
+      knowledge layer only ever recorded bumpiness as a scalar magnitude,
+      never spatial frequency, so there's no formula to derive exactly.
+      What IS real now: bump_verification bakes the resulting Bump.Normal
+      output (via the same safe_bake_measure used for Roughness) and
+      reports its measured stdev — a relative spatial-variance signal, the
+      same TYPE of measurement normal_map_bumpiness itself already is, not
+      a claim of decoding literal normal-vector directions from baked
+      pixels (that would be unreliable). A same-units sanity check on the
+      OUTPUT, even though the INPUT formula stays a heuristic.
+    - Metallic is a category-based constant (0.9 for "metal", else 0.0) —
+      the fingerprint has never recorded a metallic signal, only roughness/
+      subsurface/specular/normal-bumpiness, so this is a plain, documented
+      default, not a measurement.
+    - subsurface_weight/specular_ior_level are set directly from the target
+      recipe's own recorded values when present (real recorded data, no
+      formula needed) — default to 0.0/0.5 when the recipe has none recorded.
+    - Base Color for category="metal" reuses rust_color, the SAME constant
+      apply_weathering_recipe already defaults to — a real, already-used
+      value, not invented. Every other category is still a flat, explicitly
+      labeled gray placeholder (color_source: "generic_gray_placeholder" in
+      the result vs. "reused_rust_color") — no color data has ever been
+      recorded for any category, and this tool won't imply otherwise for
+      categories it hasn't actually addressed yet.
+
+    Category/target resolution — same explicit > name > fingerprint
+    precedence as apply_weathering_recipe's material_category, but ending in
+    an error instead of an automatic default, since there's no existing
+    material driving a metal_factor to dispatch from:
+    1. target_recipe: exact canonical_name lookup — uses that recipe's own
+       fingerprint directly, most specific.
+    2. category: uses a representative recorded recipe for that category if
+       one exists (calibration_status "uncalibrated" with generic defaults
+       if none has ever been recorded for that category — never invents
+       numbers for a category with zero real data).
+    3. Neither given: tries _resolve_material_category(material_name) (name-
+       based), then falls back to the object's OWN current closest_known_material
+       fingerprint match (only meaningful if material_name already exists
+       with some real PBR data to compare).
+    4. Nothing resolves: returns an error asking for an explicit category or
+       target_recipe — never guesses a starting point out of thin air.
+    """
+    resolved_category = None
+    resolved_recipe = None
+
+    if target_recipe:
+        resolved_recipe = _find_recipe_by_canonical_name(target_recipe)
+        if resolved_recipe is None:
+            return [json.dumps({"error": f"No recorded recipe named '{target_recipe}'."})]
+        resolved_category = resolved_recipe.get("parameters", {}).get("category")
+    elif category:
+        resolved_category = category
+        resolved_recipe = _find_recipe_for_category(category)
+    else:
+        resolved_category = _resolve_material_category(material_name)
+        if resolved_category is None:
+            dna_lookup = _reaffirm_dna(object_name)
+            for mat in dna_lookup.get("materials", []):
+                if mat.get("name") == material_name:
+                    match = mat.get("closest_known_material")
+                    if match:
+                        resolved_category = match.get("category")
+                        resolved_recipe = _find_recipe_by_canonical_name(match.get("canonical_name"))
+                    break
+        else:
+            resolved_recipe = _find_recipe_for_category(resolved_category)
+
+    if resolved_category is None:
+        return [json.dumps({
+            "error": "Could not resolve a target category — no explicit category/target_recipe, "
+                     "no name-based match, and no existing fingerprint close enough to compare.",
+            "fix": "Pass category= (e.g. 'metal', 'organic') or target_recipe= (a recorded canonical_name) explicitly.",
+        })]
+
+    target_fp = resolved_recipe.get("parameters", {}).get("fingerprint", {}) if resolved_recipe else {}
+    target_roughness = _fingerprint_value(target_fp, "roughness_avg")
+    roughness_was_recorded = target_roughness is not None
+    if target_roughness is None:
+        target_roughness = 0.6
+    target_bumpiness = _fingerprint_value(target_fp, "normal_map_bumpiness")
+    if target_bumpiness is None:
+        target_bumpiness = 0.02
+    target_subsurface = _fingerprint_value(target_fp, "subsurface_weight")
+    if target_subsurface is None:
+        target_subsurface = 0.0
+    target_specular = _fingerprint_value(target_fp, "specular_ior_level")
+    if target_specular is None:
+        target_specular = 0.5
+    metallic_const = 0.9 if resolved_category == "metal" else 0.0
+
+    # Color: never invented. The knowledge layer has never recorded real
+    # color data for ANY category — only roughness/subsurface/specular/
+    # bumpiness. "metal" is the one exception: it reuses rust_color, the
+    # SAME constant apply_weathering_recipe already defaults to (server.py
+    # ~5809) and has been used/seen across many live weathering calls
+    # tonight — a real, already-approved value, not a new guess. Every
+    # other category keeps a flat, explicitly-labeled gray placeholder
+    # (color_source in the result) rather than silently implying it means
+    # something it doesn't.
+    if resolved_category == "metal":
+        rust_color = [0.35, 0.14, 0.05]
+        dark_color = [c * 0.5 for c in rust_color]
+        light_color = [min(1.0, c * 1.4) for c in rust_color]
+        color_source = "reused_rust_color"
+    else:
+        dark_color = [0.25, 0.25, 0.25]
+        light_color = [0.6, 0.6, 0.6]
+        color_source = "generic_gray_placeholder"
+
+    return _calibrate_and_build_procedural_material(
+        object_name, material_name,
+        target_roughness, roughness_was_recorded,
+        target_bumpiness, target_subsurface, target_specular,
+        metallic_const, dark_color, light_color, color_source,
+        extra_result_fields={
+            "category_used": resolved_category,
+            "canonical_recipe_used": resolved_recipe.get("canonical_name") if resolved_recipe else None,
+        },
+    )
+
+
+# surface_pattern x pattern_scale -> target_bumpiness heuristic table for
+# match_material_from_photo/apply_photo_material_match. A documented mapping,
+# same honesty discipline as generate_procedural_material's bump_strength_
+# heuristic — never invents a bumpiness value outside this table.
+_PHOTO_BUMPINESS_TABLE = {
+    ("smooth", "fine"): 0.005, ("smooth", "medium"): 0.008, ("smooth", "coarse"): 0.012,
+    ("grainy", "fine"): 0.015, ("grainy", "medium"): 0.025, ("grainy", "coarse"): 0.04,
+    ("woven", "fine"): 0.02, ("woven", "medium"): 0.035, ("woven", "coarse"): 0.05,
+    ("pitted", "fine"): 0.03, ("pitted", "medium"): 0.05, ("pitted", "coarse"): 0.08,
+    ("scratched", "fine"): 0.025, ("scratched", "medium"): 0.045, ("scratched", "coarse"): 0.07,
+    ("noisy", "fine"): 0.02, ("noisy", "medium"): 0.04, ("noisy", "coarse"): 0.06,
+}
+
+
+@mcp.tool()
+def match_material_from_photo(object_name: str, material_name: str, reference_image_path: str) -> list:
+    """
+    MATCH MATERIAL FROM PHOTO — step 1 of 2. Loads a real reference photo and
+    asks for a structured vision analysis of it, rather than guessing PBR
+    values from a fixed category library the way generate_procedural_material
+    does. Same two-call pattern as construction_mode() -> calculate_world_coordinates():
+    this call returns the image + a vision_prompt; read the image, answer the
+    prompt with real JSON, then call apply_photo_material_match(object_name,
+    material_name, vision_analysis_json=<your JSON response>) to actually
+    build and calibrate the material.
+
+    Returns [Image, request_dict]. No Blender calls happen in this half —
+    pure image load + prompt construction.
+    """
+    img_path = Path(reference_image_path)
+    if not img_path.exists():
+        return [json.dumps({"error": f"Reference image not found: {reference_image_path}"})]
+
+    with open(img_path, "rb") as f:
+        img_bytes = f.read()
+    suffix = img_path.suffix.lower().lstrip(".")
+    img_format = "jpeg" if suffix in ("jpg", "jpeg") else "png"
+
+    vision_prompt = """Look at the reference photo above. You're estimating PBR
+material parameters for a Blender procedural material to visually match this
+photo's surface. Respond with ONLY this JSON (no markdown fences):
+
+{"dominant_base_color_rgb": [r, g, b], "secondary_color_rgb": [r, g, b] or null,
+"perceived_roughness": 0.0-1.0, "roughness_reasoning": "str",
+"perceived_metallic": 0.0-1.0, "metallic_reasoning": "str",
+"surface_pattern": "smooth|grainy|woven|pitted|scratched|noisy",
+"pattern_scale": "fine|medium|coarse", "confidence": "high|medium|low"}
+
+Rules: r/g/b are 0-1 floats, your best visual estimate of the dominant surface
+color (not lighting/shadow color). perceived_roughness: 0=mirror-glossy,
+1=fully matte, based on how sharp/diffuse highlights look. perceived_metallic:
+0=fully dielectric, 1=fully metallic, based on whether reflections are
+colored (dielectric) or tinted by the base color (metallic). surface_pattern/
+pattern_scale describe the visible micro-texture, not the macro shape. Be
+honest in confidence — this is a visual estimate from a single photo, not a
+physical measurement; say "low" if the photo is small, blurry, or ambiguous."""
+
+    request = {
+        "status": "vision_analysis_required",
+        "object_name": object_name,
+        "material_name": material_name,
+        "reference_image_path": reference_image_path,
+        "vision_prompt": vision_prompt,
+        "instruction": (
+            "Analyze the image above using vision_prompt, then call "
+            "apply_photo_material_match(object_name, material_name, "
+            "vision_analysis_json=<your JSON response as a string>) to build "
+            "and calibrate the actual material."
+        ),
+    }
+    return [Image(data=img_bytes, format=img_format), request]
+
+
+@mcp.tool()
+def apply_photo_material_match(
+    object_name: str,
+    material_name: str,
+    vision_analysis_json: str,
+    save_as_recipe: str = "",
+) -> list:
+    """
+    APPLY PHOTO MATERIAL MATCH — step 2 of 2, follows match_material_from_photo.
+    Takes the structured vision analysis JSON and builds a real procedural PBR
+    material from it, verified through the EXACT SAME bake-and-measure
+    calibration loop generate_procedural_material uses (see
+    _calibrate_and_build_procedural_material) — so calibration_status still
+    honestly reports matched/approximate/unverified against the target,
+    even though here the target itself came from a vision estimate of a
+    photo rather than a recorded recipe.
+
+    HONESTY BOUNDARY, stated explicitly: perceived_roughness/perceived_metallic/
+    color in vision_analysis_json are Claude's visual judgment of the photo —
+    there is no reliable way to derive a physical roughness/metallic value
+    from an arbitrary photo with unknown lighting and exposure. What IS real:
+    the generated node graph is bake-verified to actually produce the
+    estimated target (color_source is reported as "vision_estimated_from_photo",
+    never blurred with a measured value). target_bumpiness comes from a fixed,
+    documented surface_pattern x pattern_scale lookup table
+    (_PHOTO_BUMPINESS_TABLE) — never invented outside that table.
+
+    If save_as_recipe is given, records the result as a real recipe_type=
+    "material" entry via record_creative_recipe (parameters.category=
+    "photo_matched") so a future generate_procedural_material(target_recipe=
+    save_as_recipe) call can reuse this match without needing the photo again.
+    """
+    try:
+        vision = json.loads(vision_analysis_json) if isinstance(vision_analysis_json, str) else vision_analysis_json
+    except (json.JSONDecodeError, TypeError) as e:
+        return [json.dumps({"error": f"vision_analysis_json is not valid JSON: {e}"})]
+
+    required = ["dominant_base_color_rgb", "perceived_roughness", "perceived_metallic",
+                "surface_pattern", "pattern_scale"]
+    missing = [k for k in required if k not in vision or vision[k] is None]
+    if missing:
+        return [json.dumps({
+            "error": f"vision_analysis_json is missing required field(s): {missing}",
+            "fix": "Call match_material_from_photo first and answer its vision_prompt in full — "
+                   "no field here is guessed if the vision analysis didn't provide it.",
+        })]
+
+    def _clamp01(v):
+        return max(0.0, min(1.0, float(v)))
+
+    base_rgb = [_clamp01(c) for c in vision["dominant_base_color_rgb"]]
+    if len(base_rgb) != 3:
+        return [json.dumps({"error": "dominant_base_color_rgb must have exactly 3 values (r, g, b)."})]
+
+    secondary_rgb = vision.get("secondary_color_rgb")
+    dark_color = [c * 0.5 for c in base_rgb]
+    if secondary_rgb and len(secondary_rgb) == 3:
+        light_color = [_clamp01(c) for c in secondary_rgb]
+    else:
+        light_color = [_clamp01(c * 1.4) for c in base_rgb]
+
+    target_roughness = _clamp01(vision["perceived_roughness"])
+    metallic_const = _clamp01(vision["perceived_metallic"])
+
+    pattern = str(vision["surface_pattern"]).lower().strip()
+    scale = str(vision["pattern_scale"]).lower().strip()
+    bumpiness_key = (pattern, scale)
+    if bumpiness_key not in _PHOTO_BUMPINESS_TABLE:
+        return [json.dumps({
+            "error": f"surface_pattern/pattern_scale combo not recognized: {bumpiness_key}",
+            "fix": f"Use one of: {sorted(set(k[0] for k in _PHOTO_BUMPINESS_TABLE))} x "
+                   f"{sorted(set(k[1] for k in _PHOTO_BUMPINESS_TABLE))}",
+        })]
+    target_bumpiness = _PHOTO_BUMPINESS_TABLE[bumpiness_key]
+
+    result_list = _calibrate_and_build_procedural_material(
+        object_name, material_name,
+        target_roughness, True,  # roughness_was_recorded — tracked as a real target here
+        target_bumpiness, 0.0, 0.5,  # no photo signal for subsurface/specular — documented defaults
+        metallic_const, dark_color, light_color, "vision_estimated_from_photo",
+        extra_result_fields={
+            "vision_confidence": vision.get("confidence"),
+            "vision_roughness_reasoning": vision.get("roughness_reasoning"),
+            "vision_metallic_reasoning": vision.get("metallic_reasoning"),
+            "vision_note": "subsurface_weight_set/specular_ior_level_set are documented defaults "
+                            "(0.0/0.5) — no photo signal exists for either.",
+        },
+    )
+
+    if save_as_recipe:
+        try:
+            result_dict = json.loads(result_list[-1])
+        except (json.JSONDecodeError, IndexError):
+            result_dict = {}
+        if "error" not in result_dict:
+            measured = result_dict.get("measured_roughness")
+            record_creative_recipe(
+                recipe_type="material",
+                canonical_name=save_as_recipe,
+                trigger_phrases=[material_name],
+                parameters={
+                    "category": "photo_matched",
+                    "fingerprint": {
+                        "roughness_avg": measured if measured is not None else target_roughness,
+                        "normal_map_bumpiness": target_bumpiness,
+                        "subsurface_weight": 0.0,
+                        "specular_ior_level": 0.5,
+                    },
+                },
+                notes=f"vision-matched from a reference photo (metallic={metallic_const}, "
+                      f"pattern={pattern}/{scale}, confidence={vision.get('confidence')})",
+            )
+
+    return result_list
 
 
 @mcp.tool()
