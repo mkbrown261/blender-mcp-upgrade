@@ -7202,6 +7202,13 @@ def apply_photo_as_texture(
     generate_roughness: bool = True,
     generate_normal: bool = True,
     normal_strength: float = 2.0,
+    generate_ao: bool = True,
+    ao_strength: float = 0.5,
+    asset_tier: str = "prop",
+    generate_displacement: bool = False,
+    displacement_strength: float = 0.03,
+    subdivision_levels: int = 2,
+    force: bool = False,
 ) -> list:
     """
     APPLY PHOTO AS TEXTURE — maps your reference photo's actual pixels onto
@@ -7214,38 +7221,63 @@ def apply_photo_as_texture(
     reference because it IS your reference, not an approximation built from
     two sampled colors.
 
-    Roughness/Normal are DERIVED from the photo's own pixel luminance, not
-    invented and not a claim of literally measured surface properties:
-    - Roughness: brighter texels -> lower roughness (a standard heuristic —
-      front-lit highlights read as brighter pixels in a photo), clamped to
-      a 0.35-0.90 range. Reported honestly as a heuristic, with the real
-      min/max it produced.
+    Roughness/Normal/AO are DERIVED from the photo's own pixel luminance,
+    not invented and not a claim of literally measured surface properties:
+    - Roughness: from LOCAL CONTRAST (photo texel vs. a blurred neighborhood
+      average), not raw brightness — a broken/cracked area reads as rougher
+      than a smooth area of the SAME brightness, which brightness alone
+      can't tell apart. Clamped to 0.35-0.90, percentile-normalized (2nd/
+      98th) so a few outlier pixels can't blow out the whole range.
+      Reported honestly as a heuristic, with the real min/max it produced.
     - Normal: a real 3x3 Sobel operator over photo luminance (the same
-      standard technique cpetry's NormalMap-Online converter uses —
-      treating brightness as height and taking the Sobel-filtered local
-      slope) — not a claim of measured depth data, just a real, common
-      technique for adding surface relief derived from a 2D photo. Sobel's
-      row-weighted kernel implicitly smooths along the perpendicular axis,
-      which is why it reads less noisy than a bare pixel-to-pixel
-      difference at the same normal_strength.
+      standard technique cpetry's NormalMap-Online converter uses) — not a
+      claim of measured depth data, a real common technique for surface
+      relief from a 2D photo.
+    - AO (ambient occlusion, when generate_ao=True): a cheap curvature-style
+      approximation — texels darker than their local neighborhood (likely
+      recessed/crevices) get multiplied darker into Base Color, clamped so
+      AO never goes below (1 - ao_strength). This is NOT ray-traced
+      occlusion, just a real, common fake-AO-from-height technique — stated
+      as such, never confused with a measured/baked AO pass.
+
+    DISPLACEMENT (generate_displacement=True) is real mesh geometry
+    deformation (Subdivision Surface + Displace modifier driven by the same
+    blurred height data), not just shading — it's the only thing here that
+    fixes silhouette/grazing-angle edges, but it adds real polygon count
+    (roughly 4^subdivision_levels x the original face count) and is only
+    worth that cost on hero/close-up assets, not background props. GATED:
+    refuses with an error if asset_tier != "hero" unless force=True is
+    passed explicitly — never silently applies expensive geometry work to
+    something that doesn't need it. Props get the identical texture-only
+    path (Base Color + Roughness + Normal + AO) either way.
 
     Requires the target object to already have UVs, or auto-unwraps via
     Smart UV Project if none exist — reported honestly via
     had_uvs_already/auto_unwrapped in the result (an unwrapped mesh would
     place the texture in an undefined way otherwise). Requires numpy in
     Blender's own Python (bundled by default since Blender 2.8+) — returns
-    an explicit error if unavailable, never silently skips roughness/normal
-    generation. reference_image_path must be a path the BLENDER PROCESS can
-    read directly (same machine as this MCP server, in the setup this tool
-    was built for) — it's loaded by bpy.data.images, not sent as bytes.
+    an explicit error if unavailable, never silently skips generation.
+    reference_image_path must be a path the BLENDER PROCESS can read
+    directly (same machine as this MCP server, in the setup this tool was
+    built for) — it's loaded by bpy.data.images, not sent as bytes.
 
     Returns [before_image?, after_image?, result_json_string] — same
     convention as generate_procedural_material. Call create_checkpoint()
-    first, this modifies material node graphs and (possibly) UVs.
+    first, this modifies material node graphs, UVs, and (if displacement is
+    used) mesh geometry via modifiers.
     """
     img_path = Path(reference_image_path)
     if not img_path.exists():
         return [json.dumps({"error": f"Reference image not found: {reference_image_path}"})]
+
+    if generate_displacement and asset_tier != "hero" and not force:
+        return [json.dumps({
+            "error": f"generate_displacement=True requested but asset_tier='{asset_tier}' -- "
+                     "displacement adds real polygon count and is only worth that cost on hero/close-up assets.",
+            "fix": "Pass asset_tier='hero' if this genuinely is a hero/close-up asset, or force=True to "
+                   "override for a prop anyway, or leave generate_displacement=False (the texture-only "
+                   "path already gives real Base Color + Roughness + Normal + AO).",
+        })]
 
     script = r"""
 import bpy, json, os
@@ -7308,12 +7340,31 @@ else:
             result = {"base_color": {"width": W, "height": H}}
             rough_img = None
             normal_img = None
+            ao_img = None
+
+            # Shared blurred-luminance neighborhood, reused by roughness
+            # (local contrast), AO (recession-from-neighborhood), and
+            # displacement (smoothed height -- raw per-pixel luminance would
+            # displace geometry noisily at low subdivision). One box blur,
+            # not three separate implementations to drift apart.
+            need_local_mean = {GENROUGH} or {GENAO} or {GENDISPLACEMENT}
+            local_mean = None
+            if need_local_mean:
+                radius = 3
+                acc = np.zeros_like(lum)
+                taps = 0
+                for _dy in range(-radius, radius + 1):
+                    for _dx in range(-radius, radius + 1):
+                        acc += np.roll(np.roll(lum, -_dy, axis=0), -_dx, axis=1)
+                        taps += 1
+                local_mean = acc / taps
 
             if {GENROUGH}:
-                lum_min, lum_max = float(lum.min()), float(lum.max())
-                span = max(1e-5, lum_max - lum_min)
-                norm_lum = (lum - lum_min) / span
-                rough_vals = 0.35 + (1.0 - norm_lum) * 0.55
+                local_contrast = np.abs(lum - local_mean)
+                c_lo, c_hi = float(np.percentile(local_contrast, 2)), float(np.percentile(local_contrast, 98))
+                span_c = max(1e-5, c_hi - c_lo)
+                norm_contrast = np.clip((local_contrast - c_lo) / span_c, 0.0, 1.0)
+                rough_vals = 0.35 + norm_contrast * 0.55
                 rough_rgba = np.stack([rough_vals, rough_vals, rough_vals, np.ones_like(rough_vals)], axis=-1)
                 rough_img = bpy.data.images.new('{MAT}' + "_Roughness_Generated", W, H, alpha=True)
                 # Colorspace MUST be set before foreach_set -- setting it on an
@@ -7328,7 +7379,29 @@ else:
                 rough_img.update()
                 result["roughness_generated"] = {
                     "min": round(float(rough_vals.min()), 4), "max": round(float(rough_vals.max()), 4),
-                    "note": "heuristic derived from photo luminance -- brighter texels read as lower roughness, not a measured reflectance value",
+                    "note": "derived from LOCAL CONTRAST (texel vs. blurred neighborhood), not raw "
+                            "brightness -- cracked/broken areas read rougher than smooth areas of the "
+                            "same brightness. A heuristic, not a measured reflectance value.",
+                }
+
+            if {GENAO}:
+                recession = np.clip(local_mean - lum, 0.0, None)
+                r_lo, r_hi = float(np.percentile(recession, 2)), float(np.percentile(recession, 98))
+                span_r = max(1e-5, r_hi - r_lo)
+                norm_recession = np.clip((recession - r_lo) / span_r, 0.0, 1.0)
+                ao_strength_clamped = max(0.0, min(1.0, {AOSTRENGTH}))
+                ao_vals = 1.0 - norm_recession * ao_strength_clamped
+                ao_rgba = np.stack([ao_vals, ao_vals, ao_vals, np.ones_like(ao_vals)], axis=-1)
+                ao_img = bpy.data.images.new('{MAT}' + "_AO_Generated", W, H, alpha=True)
+                ao_img.colorspace_settings.name = 'Non-Color'  # set BEFORE foreach_set -- see roughness note above
+                ao_img.pixels.foreach_set(ao_rgba.astype(np.float32).flatten())
+                ao_img.pack()
+                ao_img.update()
+                result["ao_generated"] = {
+                    "min": round(float(ao_vals.min()), 4), "max": round(float(ao_vals.max()), 4),
+                    "note": "cheap curvature-style fake AO -- texels darker than their local neighborhood "
+                            "(likely recessed) are multiplied darker into Base Color. NOT ray-traced/baked "
+                            "occlusion, a real common approximation technique, stated as such.",
                 }
 
             if {GENNORMAL}:
@@ -7375,6 +7448,28 @@ else:
                             "cpetry's NormalMap-Online), not measured depth data",
                 }
 
+            displacement_img = None
+            if {GENDISPLACEMENT}:
+                # Uses the SAME blurred local_mean as roughness/AO -- raw
+                # per-pixel luminance would displace geometry noisily at
+                # typical subdivision levels; the blur is what makes the
+                # relief read as intentional surface form instead of static.
+                disp_min, disp_max = float(local_mean.min()), float(local_mean.max())
+                disp_span = max(1e-5, disp_max - disp_min)
+                disp_norm = (local_mean - disp_min) / disp_span
+                disp_rgba = np.stack([disp_norm, disp_norm, disp_norm, np.ones_like(disp_norm)], axis=-1)
+                displacement_img = bpy.data.images.new('{MAT}' + "_Displacement_Generated", W, H, alpha=True)
+                displacement_img.colorspace_settings.name = 'Non-Color'  # set BEFORE foreach_set -- see roughness note above
+                displacement_img.pixels.foreach_set(disp_rgba.astype(np.float32).flatten())
+                displacement_img.pack()
+                displacement_img.update()
+                result["displacement_generated"] = {
+                    "strength": {DISPLACEMENTSTRENGTH}, "subdivision_levels": {SUBDIVLEVELS},
+                    "note": "real mesh geometry deformation (Subdivision Surface + Displace modifier) "
+                            "driven by blurred photo luminance as a height field -- not measured depth data, "
+                            "but real geometry change, not just shading.",
+                }
+
             base_img.pack()
 
             nt = mat.node_tree
@@ -7397,7 +7492,41 @@ else:
             base_tex_node.name = prefix + "BaseColor"
             base_tex_node.location = (base_x, base_y + 300)
             base_tex_node.image = base_img
-            nt.links.new(base_tex_node.outputs["Color"], principled.inputs["Base Color"])
+            base_color_output = base_tex_node.outputs["Color"]
+
+            if ao_img is not None:
+                # ShaderNodeMix exposes multiple sockets literally named "A"/
+                # "B"/"Factor"/"Result" (one set per data_type) -- a bare
+                # .inputs["A"] is ambiguous and can grab the wrong-typed
+                # socket. Same gotcha already worked around in
+                # generate_procedural_material's "combine" node; find-by-
+                # name-AND-type here too, not a plain dict lookup.
+                def find_sock(collection, sock_name, sock_type):
+                    for s in collection:
+                        if s.name == sock_name and s.type == sock_type:
+                            return s
+                    return None
+
+                ao_tex_node = nt.nodes.new("ShaderNodeTexImage")
+                ao_tex_node.name = prefix + "AO"
+                ao_tex_node.location = (base_x, base_y + 550)
+                ao_tex_node.image = ao_img
+
+                ao_mix_node = nt.nodes.new("ShaderNodeMix")
+                ao_mix_node.name = prefix + "AOMultiply"
+                ao_mix_node.data_type = 'RGBA'
+                ao_mix_node.blend_type = 'MULTIPLY'
+                ao_mix_node.location = (base_x + 300, base_y + 450)
+                ao_fac = find_sock(ao_mix_node.inputs, "Factor", "VALUE")
+                ao_a = find_sock(ao_mix_node.inputs, "A", "RGBA")
+                ao_b = find_sock(ao_mix_node.inputs, "B", "RGBA")
+                ao_out = find_sock(ao_mix_node.outputs, "Result", "RGBA")
+                ao_fac.default_value = 1.0
+                nt.links.new(base_color_output, ao_a)
+                nt.links.new(ao_tex_node.outputs["Color"], ao_b)
+                base_color_output = ao_out
+
+            nt.links.new(base_color_output, principled.inputs["Base Color"])
 
             if rough_img is not None:
                 rough_tex_node = nt.nodes.new("ShaderNodeTexImage")
@@ -7418,6 +7547,33 @@ else:
                 nt.links.new(normal_tex_node.outputs["Color"], normal_map_node.inputs["Color"])
                 nt.links.new(normal_map_node.outputs["Normal"], principled.inputs["Normal"])
 
+            # Real geometry deformation -- Subdivision Surface (to give the
+            # Displace modifier enough vertices to work with) + Displace,
+            # driven by the same blurred height data as everything else.
+            # Modifier order matters: Subsurf must run BEFORE Displace so
+            # displacement operates on the subdivided geometry, not the
+            # original low-poly cage.
+            mod_prefix = "PhotoTex_"
+            for m in list(obj.modifiers):
+                if m.name.startswith(mod_prefix):
+                    obj.modifiers.remove(m)
+
+            if displacement_img is not None:
+                subsurf_mod = obj.modifiers.new(name=mod_prefix + "Subsurf", type='SUBSURF')
+                subsurf_mod.levels = {SUBDIVLEVELS}
+                subsurf_mod.render_levels = {SUBDIVLEVELS}
+
+                disp_tex = bpy.data.textures.get('{MAT}' + "_DisplaceTex")
+                if disp_tex is None:
+                    disp_tex = bpy.data.textures.new('{MAT}' + "_DisplaceTex", type='IMAGE')
+                disp_tex.image = displacement_img
+
+                displace_mod = obj.modifiers.new(name=mod_prefix + "Displace", type='DISPLACE')
+                displace_mod.texture = disp_tex
+                displace_mod.texture_coords = 'UV'
+                displace_mod.strength = {DISPLACEMENTSTRENGTH}
+                displace_mod.mid_level = 0.5
+
             result.update({
                 "object": '{OBJ}',
                 "material": '{MAT}',
@@ -7433,7 +7589,12 @@ else:
    .replace("{IMGPATH}", str(img_path.resolve()).replace("'", "\\'")) \
    .replace("{GENROUGH}", "True" if generate_roughness else "False") \
    .replace("{GENNORMAL}", "True" if generate_normal else "False") \
-   .replace("{NORMALSTRENGTH}", str(normal_strength))
+   .replace("{NORMALSTRENGTH}", str(normal_strength)) \
+   .replace("{GENAO}", "True" if generate_ao else "False") \
+   .replace("{AOSTRENGTH}", str(ao_strength)) \
+   .replace("{GENDISPLACEMENT}", "True" if generate_displacement else "False") \
+   .replace("{DISPLACEMENTSTRENGTH}", str(displacement_strength)) \
+   .replace("{SUBDIVLEVELS}", str(subdivision_levels))
 
     _invalidate_dna_cache(object_name)
     before_image = _capture_plain_screenshot(object_name)

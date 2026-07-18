@@ -59,12 +59,64 @@ start = server_src.index("def apply_photo_as_texture(")
 end = server_src.index("\n@mcp.tool()", start)
 tool_src = server_src[start:end]
 
-for label, img_var in [("roughness", "rough_img"), ("normal", "normal_img")]:
+for label, img_var in [("roughness", "rough_img"), ("normal", "normal_img"), ("AO", "ao_img"), ("displacement", "displacement_img")]:
     colorspace_pos = tool_src.find(f"{img_var}.colorspace_settings.name")
     foreach_set_pos = tool_src.find(f"{img_var}.pixels.foreach_set")
     check(f"{label} map: colorspace_settings.name is set BEFORE pixels.foreach_set "
           f"(reversing this order silently zeros the pixel buffer -- a real bug caught live)",
           colorspace_pos != -1 and foreach_set_pos != -1 and colorspace_pos < foreach_set_pos)
+
+# ── Regression lock: ShaderNodeMix (AO multiply) uses type-safe socket lookup, not a bare .inputs["A"] ──
+# ShaderNodeMix exposes multiple same-named sockets (one set per data_type) --
+# a plain .inputs["A"] is ambiguous and can silently grab the wrong-typed
+# socket. generate_procedural_material already worked around this with a
+# find-by-name-AND-type helper; this locks in that the AO mix node does too.
+check("AO multiply node looks up sockets by name AND type, not a bare .inputs[...] (ambiguous on ShaderNodeMix)",
+      'find_sock(ao_mix_node.inputs, "A", "RGBA")' in tool_src
+      and 'find_sock(ao_mix_node.inputs, "B", "RGBA")' in tool_src)
+
+# ── Gate: generate_displacement=True on a non-hero asset_tier is refused without force ──
+def fake_should_not_be_called2(cmd, **kwargs):
+    raise AssertionError("execute_code_safe should not be called when the displacement gate refuses")
+
+
+server._send_raw = fake_should_not_be_called2
+tmp_gate = __import__("tempfile").NamedTemporaryFile(suffix=".png", delete=False)
+tmp_gate.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+tmp_gate.close()
+try:
+    out = json.loads(server.apply_photo_as_texture(
+        object_name="X", material_name="M", reference_image_path=tmp_gate.name,
+        generate_displacement=True, asset_tier="prop")[-1])
+    check("displacement on a prop-tier asset is refused without force", "error" in out)
+    check("the refusal explains the real cost (polygon count) and how to override",
+          "polygon" in out.get("error", "").lower() and "force" in out.get("fix", "").lower())
+
+    # force=True overrides the gate even on a prop
+    def fake_ok_displacement(cmd, **kwargs):
+        return {"result": json.dumps({
+            "base_color": {"width": 4, "height": 4},
+            "displacement_generated": {"strength": 0.03, "subdivision_levels": 2, "note": "..."},
+            "object": "X", "material": "M", "created_material": False,
+            "faces_using_material": 6, "auto_assigned_all_faces": False,
+            "had_uvs_already": True, "auto_unwrapped": False,
+        })}
+    server._send_raw = fake_ok_displacement
+    out = json.loads(server.apply_photo_as_texture(
+        object_name="X", material_name="M", reference_image_path=tmp_gate.name,
+        generate_displacement=True, asset_tier="prop", force=True)[-1])
+    check("force=True overrides the displacement gate even on a prop-tier asset",
+          "error" not in out and "displacement_generated" in out)
+
+    # asset_tier='hero' runs without needing force
+    server._send_raw = fake_ok_displacement
+    out = json.loads(server.apply_photo_as_texture(
+        object_name="X", material_name="M", reference_image_path=tmp_gate.name,
+        generate_displacement=True, asset_tier="hero")[-1])
+    check("asset_tier='hero' runs displacement without needing force=True",
+          "error" not in out and "displacement_generated" in out)
+finally:
+    os.unlink(tmp_gate.name)
 
 # ── Live-behavior simulation: fake Blender side, confirm result shape or Blender-error passthrough ──
 def make_fake_ok():
@@ -94,6 +146,14 @@ try:
           "roughness_generated" in out and "normal_generated" in out)
     check("UV state is reported honestly (had_uvs_already/auto_unwrapped)",
           "had_uvs_already" in out and "auto_unwrapped" in out)
+
+    import inspect
+    sig = inspect.signature(server.apply_photo_as_texture)
+    check("generate_ao parameter defaults to True", sig.parameters["generate_ao"].default is True)
+    check("generate_displacement parameter defaults to False (opt-in only)",
+          sig.parameters["generate_displacement"].default is False)
+    check("asset_tier parameter defaults to 'prop' (displacement gated off by default)",
+          sig.parameters["asset_tier"].default == "prop")
 
     # numpy unavailable in Blender's Python -> explicit error, not a silent skip
     def fake_no_numpy(cmd, **kwargs):
