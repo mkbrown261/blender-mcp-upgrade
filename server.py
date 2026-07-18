@@ -7195,6 +7195,246 @@ def apply_photo_material_match(
 
 
 @mcp.tool()
+def apply_photo_as_texture(
+    object_name: str,
+    material_name: str,
+    reference_image_path: str,
+    generate_roughness: bool = True,
+    generate_normal: bool = True,
+    normal_strength: float = 2.0,
+) -> list:
+    """
+    APPLY PHOTO AS TEXTURE — maps your reference photo's actual pixels onto
+    the mesh as a real Base Color image texture, instead of trying to
+    procedurally regenerate its look with noise/voronoi nodes (that's what
+    match_material_from_photo/apply_photo_material_match do — works fine for
+    simple flat materials, but cannot reproduce a complex multi-region photo
+    like flaking rust; a 2-color noise ramp is the wrong tool for that).
+    This is the "just use the real photo" path — visually identical to your
+    reference because it IS your reference, not an approximation built from
+    two sampled colors.
+
+    Roughness/Normal are DERIVED from the photo's own pixel luminance, not
+    invented and not a claim of literally measured surface properties:
+    - Roughness: brighter texels -> lower roughness (a standard heuristic —
+      front-lit highlights read as brighter pixels in a photo), clamped to
+      a 0.35-0.90 range. Reported honestly as a heuristic, with the real
+      min/max it produced.
+    - Normal: a standard heightmap-from-luminance central-difference
+      gradient (the same technique any diffuse-to-normal converter uses,
+      e.g. treating brightness as height and taking local slope) — not a
+      claim of measured depth data, just a real, common technique for
+      adding surface relief derived from a 2D photo.
+
+    Requires the target object to already have UVs, or auto-unwraps via
+    Smart UV Project if none exist — reported honestly via
+    had_uvs_already/auto_unwrapped in the result (an unwrapped mesh would
+    place the texture in an undefined way otherwise). Requires numpy in
+    Blender's own Python (bundled by default since Blender 2.8+) — returns
+    an explicit error if unavailable, never silently skips roughness/normal
+    generation. reference_image_path must be a path the BLENDER PROCESS can
+    read directly (same machine as this MCP server, in the setup this tool
+    was built for) — it's loaded by bpy.data.images, not sent as bytes.
+
+    Returns [before_image?, after_image?, result_json_string] — same
+    convention as generate_procedural_material. Call create_checkpoint()
+    first, this modifies material node graphs and (possibly) UVs.
+    """
+    img_path = Path(reference_image_path)
+    if not img_path.exists():
+        return [json.dumps({"error": f"Reference image not found: {reference_image_path}"})]
+
+    script = r"""
+import bpy, json, os
+
+obj = bpy.data.objects.get('{OBJ}')
+if obj is None:
+    print(json.dumps({"error": "Object not found: {OBJ}"}))
+else:
+    img_path = r'{IMGPATH}'
+    if not os.path.exists(img_path):
+        print(json.dumps({"error": "Reference image not found on the Blender process's filesystem: " + img_path}))
+    else:
+        try:
+            import numpy as np
+        except ImportError:
+            print(json.dumps({"error": "numpy not available in Blender's Python -- cannot generate roughness/normal maps."}))
+        else:
+            mat = bpy.data.materials.get('{MAT}')
+            created_material = False
+            if mat is None:
+                mat = bpy.data.materials.new(name='{MAT}')
+                mat.use_nodes = True
+                obj.data.materials.append(mat)
+                created_material = True
+            elif not mat.use_nodes:
+                mat.use_nodes = True
+            if mat.name not in [s.material.name for s in obj.material_slots if s.material]:
+                obj.data.materials.append(mat)
+
+            mat_slot_index = next((i for i, s in enumerate(obj.material_slots) if s.material == mat), None)
+            faces_using_material = sum(1 for p in obj.data.polygons if p.material_index == mat_slot_index)
+            auto_assigned_all_faces = False
+            if faces_using_material == 0 and len(obj.data.materials) == 1:
+                for p in obj.data.polygons:
+                    p.material_index = mat_slot_index
+                obj.data.update()
+                faces_using_material = len(obj.data.polygons)
+                auto_assigned_all_faces = True
+
+            had_uvs = len(obj.data.uv_layers) > 0
+            if not had_uvs:
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.uv.smart_project(angle_limit=66)
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            base_img = bpy.data.images.load(img_path, check_existing=True)
+            base_img.name = '{MAT}' + "_BaseColor"
+            base_img.colorspace_settings.name = 'sRGB'
+
+            W, H = base_img.size[0], base_img.size[1]
+            px = np.empty(W * H * 4, dtype=np.float32)
+            base_img.pixels.foreach_get(px)
+            px = px.reshape(H, W, 4)
+            lum = 0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2]
+
+            result = {"base_color": {"width": W, "height": H}}
+            rough_img = None
+            normal_img = None
+
+            if {GENROUGH}:
+                lum_min, lum_max = float(lum.min()), float(lum.max())
+                span = max(1e-5, lum_max - lum_min)
+                norm_lum = (lum - lum_min) / span
+                rough_vals = 0.35 + (1.0 - norm_lum) * 0.55
+                rough_rgba = np.stack([rough_vals, rough_vals, rough_vals, np.ones_like(rough_vals)], axis=-1)
+                rough_img = bpy.data.images.new('{MAT}' + "_Roughness_Generated", W, H, alpha=True)
+                # Colorspace MUST be set before foreach_set -- setting it on an
+                # already-populated generated image resets the pixel buffer to
+                # zero (a real Blender API quirk, confirmed live: writing pixels
+                # first then setting colorspace silently zeroed the whole image,
+                # which read as full-glossy roughness=0 and mirror-reflected the
+                # world HDRI instead of showing the intended matte texture).
+                rough_img.colorspace_settings.name = 'Non-Color'
+                rough_img.pixels.foreach_set(rough_rgba.astype(np.float32).flatten())
+                rough_img.pack()
+                rough_img.update()
+                result["roughness_generated"] = {
+                    "min": round(float(rough_vals.min()), 4), "max": round(float(rough_vals.max()), 4),
+                    "note": "heuristic derived from photo luminance -- brighter texels read as lower roughness, not a measured reflectance value",
+                }
+
+            if {GENNORMAL}:
+                strength = {NORMALSTRENGTH}
+                dx = (np.roll(lum, -1, axis=1) - np.roll(lum, 1, axis=1)) * strength
+                dy = (np.roll(lum, -1, axis=0) - np.roll(lum, 1, axis=0)) * strength
+                nz = np.ones_like(lum)
+                normal_vec = np.stack([-dx, -dy, nz], axis=-1)
+                norm_len = np.linalg.norm(normal_vec, axis=-1, keepdims=True)
+                normal_vec = normal_vec / np.clip(norm_len, 1e-5, None)
+                normal_rgb = normal_vec * 0.5 + 0.5
+                normal_rgba = np.concatenate([normal_rgb, np.ones((H, W, 1), dtype=np.float32)], axis=-1)
+                normal_img = bpy.data.images.new('{MAT}' + "_Normal_Generated", W, H, alpha=True)
+                normal_img.colorspace_settings.name = 'Non-Color'  # set BEFORE foreach_set -- see roughness note above
+                normal_img.pixels.foreach_set(normal_rgba.astype(np.float32).flatten())
+                normal_img.pack()
+                normal_img.update()
+                result["normal_generated"] = {
+                    "strength": strength,
+                    "note": "standard heightmap-from-luminance central-difference gradient, not measured depth data",
+                }
+
+            base_img.pack()
+
+            nt = mat.node_tree
+            principled = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if principled is None:
+                principled = nt.nodes.new("ShaderNodeBsdfPrincipled")
+            output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+            if output_node is None:
+                output_node = nt.nodes.new("ShaderNodeOutputMaterial")
+                nt.links.new(principled.outputs["BSDF"], output_node.inputs["Surface"])
+
+            prefix = "PhotoTex_"
+            for nd in list(nt.nodes):
+                if nd.name.startswith(prefix):
+                    nt.nodes.remove(nd)
+
+            base_x, base_y = principled.location.x - 500, principled.location.y
+
+            base_tex_node = nt.nodes.new("ShaderNodeTexImage")
+            base_tex_node.name = prefix + "BaseColor"
+            base_tex_node.location = (base_x, base_y + 300)
+            base_tex_node.image = base_img
+            nt.links.new(base_tex_node.outputs["Color"], principled.inputs["Base Color"])
+
+            if rough_img is not None:
+                rough_tex_node = nt.nodes.new("ShaderNodeTexImage")
+                rough_tex_node.name = prefix + "Roughness"
+                rough_tex_node.location = (base_x, base_y)
+                rough_tex_node.image = rough_img
+                nt.links.new(rough_tex_node.outputs["Color"], principled.inputs["Roughness"])
+
+            if normal_img is not None:
+                normal_tex_node = nt.nodes.new("ShaderNodeTexImage")
+                normal_tex_node.name = prefix + "NormalTex"
+                normal_tex_node.location = (base_x - 300, base_y - 300)
+                normal_tex_node.image = normal_img
+
+                normal_map_node = nt.nodes.new("ShaderNodeNormalMap")
+                normal_map_node.name = prefix + "NormalMap"
+                normal_map_node.location = (base_x, base_y - 300)
+                nt.links.new(normal_tex_node.outputs["Color"], normal_map_node.inputs["Color"])
+                nt.links.new(normal_map_node.outputs["Normal"], principled.inputs["Normal"])
+
+            result.update({
+                "object": '{OBJ}',
+                "material": '{MAT}',
+                "created_material": created_material,
+                "faces_using_material": faces_using_material,
+                "auto_assigned_all_faces": auto_assigned_all_faces,
+                "had_uvs_already": had_uvs,
+                "auto_unwrapped": not had_uvs,
+            })
+            print(json.dumps(result))
+""".replace("{OBJ}", object_name.replace("'", "\\'")) \
+   .replace("{MAT}", material_name.replace("'", "\\'")) \
+   .replace("{IMGPATH}", str(img_path.resolve()).replace("'", "\\'")) \
+   .replace("{GENROUGH}", "True" if generate_roughness else "False") \
+   .replace("{GENNORMAL}", "True" if generate_normal else "False") \
+   .replace("{NORMALSTRENGTH}", str(normal_strength))
+
+    _invalidate_dna_cache(object_name)
+    before_image = _capture_plain_screenshot(object_name)
+
+    raw = _send_raw("execute_code_safe", code=script, required_mode="OBJECT", push_undo=True)
+    if "error" in raw:
+        return [json.dumps({"error": raw["error"]})]
+    output = raw.get("result", "")
+    result = None
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            result = json.loads(line)
+            break
+    if result is None:
+        return [json.dumps({"error": "No JSON output from apply_photo_as_texture", "raw": output})]
+
+    out = []
+    after_image = _capture_plain_screenshot(object_name)
+    if before_image:
+        out.append(before_image)
+    if after_image:
+        out.append(after_image)
+    out.append(json.dumps(result, indent=2))
+    return out
+
+
+@mcp.tool()
 def split_blended_material(
     object_name: str,
     material_name: str,
