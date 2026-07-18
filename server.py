@@ -7220,11 +7220,14 @@ def apply_photo_as_texture(
       front-lit highlights read as brighter pixels in a photo), clamped to
       a 0.35-0.90 range. Reported honestly as a heuristic, with the real
       min/max it produced.
-    - Normal: a standard heightmap-from-luminance central-difference
-      gradient (the same technique any diffuse-to-normal converter uses,
-      e.g. treating brightness as height and taking local slope) — not a
-      claim of measured depth data, just a real, common technique for
-      adding surface relief derived from a 2D photo.
+    - Normal: a real 3x3 Sobel operator over photo luminance (the same
+      standard technique cpetry's NormalMap-Online converter uses —
+      treating brightness as height and taking the Sobel-filtered local
+      slope) — not a claim of measured depth data, just a real, common
+      technique for adding surface relief derived from a 2D photo. Sobel's
+      row-weighted kernel implicitly smooths along the perpendicular axis,
+      which is why it reads less noisy than a bare pixel-to-pixel
+      difference at the same normal_strength.
 
     Requires the target object to already have UVs, or auto-unwraps via
     Smart UV Project if none exist — reported honestly via
@@ -7330,8 +7333,31 @@ else:
 
             if {GENNORMAL}:
                 strength = {NORMALSTRENGTH}
-                dx = (np.roll(lum, -1, axis=1) - np.roll(lum, 1, axis=1)) * strength
-                dy = (np.roll(lum, -1, axis=0) - np.roll(lum, 1, axis=0)) * strength
+
+                # Full 3x3 Sobel operator (the same standard technique
+                # https://cpetry.github.io/NormalMap-Online/ uses) instead of a
+                # bare 2-tap central difference -- the extra row weighting
+                # (1,2,1) implicitly smooths along the perpendicular axis, which
+                # is exactly why a Sobel-derived normal map reads less noisy/
+                # aliased than a plain per-pixel difference at the same
+                # strength. get(dy, dx) returns the texel at (y+dy, x+dx) for
+                # every pixel via wrap-around roll (same wrap convention as the
+                # rest of this generator).
+                def get(dy, dx):
+                    return np.roll(np.roll(lum, -dy, axis=0), -dx, axis=1)
+
+                gx = (-1 * get(-1, -1) + 1 * get(-1, 1)
+                      - 2 * get(0, -1) + 2 * get(0, 1)
+                      - 1 * get(1, -1) + 1 * get(1, 1))
+                gy = (-1 * get(-1, -1) - 2 * get(-1, 0) - 1 * get(-1, 1)
+                      + 1 * get(1, -1) + 2 * get(1, 0) + 1 * get(1, 1))
+                # /4 normalization keeps `strength`'s visual meaning matched to
+                # the old central-difference version (a unit-slope ramp produced
+                # raw diff 2 there; the unnormalized Sobel sum for the same ramp
+                # is 8, so /4 brings it back to 2) -- not an arbitrary constant.
+                dx = (gx / 4.0) * strength
+                dy = (gy / 4.0) * strength
+
                 nz = np.ones_like(lum)
                 normal_vec = np.stack([-dx, -dy, nz], axis=-1)
                 norm_len = np.linalg.norm(normal_vec, axis=-1, keepdims=True)
@@ -7345,7 +7371,8 @@ else:
                 normal_img.update()
                 result["normal_generated"] = {
                     "strength": strength,
-                    "note": "standard heightmap-from-luminance central-difference gradient, not measured depth data",
+                    "note": "3x3 Sobel operator on photo luminance (the same standard technique as "
+                            "cpetry's NormalMap-Online), not measured depth data",
                 }
 
             base_img.pack()
