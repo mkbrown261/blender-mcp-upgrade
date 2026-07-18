@@ -7852,7 +7852,11 @@ def execute_code_safe(code: str, required_mode: Optional[str] = None, push_undo:
 
 @mcp.tool()
 def prepare_lod_names(base_name: str, lod_count: int = 4) -> str:
-    """Generate/validate LOD naming convention (e.g. SM_AssetName_LOD0..N) for a given base object name."""
+    """Scans the scene for existing SM_AssetName_LOD0..N objects and reports
+    which are present/missing and their face-reduction ratios. Read-only —
+    does NOT generate, rename, or create any LOD meshes; you still need to
+    build those yourself (e.g. via decimation) before this has anything
+    real to report on."""
     return _send_json("prepare_lod_names", base_name=base_name, lod_count=lod_count)
 
 

@@ -14,6 +14,7 @@ import traceback
 import os
 import shutil
 import zipfile
+import uuid
 from bpy.props import IntProperty, BoolProperty
 import io
 from datetime import datetime
@@ -92,6 +93,19 @@ def get_action_fcurves(action, obj=None):
     if hasattr(action, 'fcurves'):
         return list(action.fcurves)
     return []
+
+
+# FIX: real bug — create_hunyuan_job_local_site used to return
+# {"status": "DONE"} immediately after scheduling the deferred glb import
+# (bpy.app.timers can only run import_scene.gltf on the main thread), before
+# that import had actually happened. If the import then failed (corrupt
+# download, wrong content-type), the exception was raised inside the timer
+# callback, uncaught, and never reached the MCP caller — who already
+# believed the job succeeded. This module-level store lets the deferred
+# import handler record its REAL outcome, and poll_hunyuan_job_status_local_
+# site (new) lets a caller check it, the same way the OFFICIAL_API/FAL_AI/
+# main_site job flows already work in this file.
+_LOCAL_HUNYUAN_IMPORT_STATUS = {}
 
 
 class BlenderMCPServer:
@@ -1898,6 +1912,7 @@ class BlenderMCPServer:
         that same folder (path_mode='COPY') instead of leaving them
         referenced at their original, possibly scattered, absolute paths.
         """
+        hidden_targets_restored = []  # defined before anything that could raise, so the except's cleanup loop is always safe
         try:
             obj = bpy.data.objects.get(name)
             if not obj:
@@ -1935,17 +1950,34 @@ class BlenderMCPServer:
             # which silently dropped the rig even with export_animations=True.
             # Resolve via the ARMATURE modifier's target, not just obj.parent —
             # a mesh can be deform-linked to an armature without being parented to it.
+            #
+            # FIX (round 2 audit): obj.children was only ONE level deep — a mesh
+            # parented through an intermediate empty/organizational node was
+            # silently excluded from the export, with no warning and no way for
+            # the <100-byte file-size guard below to catch it (an armature-only
+            # FBX isn't empty). Now walks the full hierarchy via children_recursive.
+            # Also: only the FIRST Armature-modifier target was selected (a mesh
+            # double-bound to two armature modifiers silently lost the second);
+            # now collects all of them. And: hidden target objects would silently
+            # fail to select — now temporarily un-hidden for the export and
+            # restored afterward, with a warning recorded either way.
             bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
+
+            def _select_target(target_obj):
+                if target_obj.hide_get():
+                    hidden_targets_restored.append(target_obj.name)
+                    target_obj.hide_set(False)
+                target_obj.select_set(True)
+
+            _select_target(obj)
             bpy.context.view_layer.objects.active = obj
             if obj.type == 'ARMATURE':
-                for child in obj.children:
-                    child.select_set(True)
+                for child in obj.children_recursive:
+                    _select_target(child)
             elif obj.type == 'MESH':
                 for mod in obj.modifiers:
                     if mod.type == 'ARMATURE' and mod.object is not None:
-                        mod.object.select_set(True)
-                        break
+                        _select_target(mod.object)
 
             # FIX: always include ARMATURE in object_types (needed for skin weights)
             obj_types = {'MESH', 'ARMATURE'}
@@ -1973,6 +2005,14 @@ class BlenderMCPServer:
                 embed_textures=embed_textures,
             )
 
+            # Restore any target objects that were temporarily un-hidden to
+            # make the export select them — export state shouldn't leak into
+            # the scene's normal visibility.
+            for obj_name in hidden_targets_restored:
+                restore_obj = bpy.data.objects.get(obj_name)
+                if restore_obj:
+                    restore_obj.hide_set(True)
+
             # Verify file was actually created
             if not os.path.exists(export_path):
                 return {"error": f"Export appeared to succeed but file not found at: {export_path}"}
@@ -1990,6 +2030,7 @@ class BlenderMCPServer:
                 "organized_in_folder": organize_folder,
                 "file_size_kb": round(file_size / 1024, 1),
                 "pre_export_warnings": pre_export_warnings,
+                "hidden_targets_temporarily_shown": hidden_targets_restored,
                 "settings": {
                     "scale": scale,
                     "triangulate": triangulate,
@@ -2005,6 +2046,16 @@ class BlenderMCPServer:
             }
         except Exception as e:
             self._log("export_for_unreal", "error", str(e))
+            # Best-effort restoration even on failure — a hidden object
+            # temporarily shown mid-export shouldn't stay visible forever
+            # just because the export itself failed.
+            try:
+                for obj_name in hidden_targets_restored:
+                    restore_obj = bpy.data.objects.get(obj_name)
+                    if restore_obj:
+                        restore_obj.hide_set(True)
+            except Exception:
+                pass
             return {"error": str(e)}
 
     def prepare_lod_names(self, base_name, lod_count=4):
@@ -2020,10 +2071,17 @@ class BlenderMCPServer:
                 lod_name = f"{base_name}_LOD{i}"
                 lod_obj  = bpy.data.objects.get(lod_name)
                 exists   = lod_obj is not None
+                # FIX: a non-mesh object occupying a LOD-named slot (Empty,
+                # Armature, etc.) used to be indistinguishable from a real,
+                # legitimately-empty mesh — both reported faces:0 with no
+                # other signal, which could corrupt lod0_faces (used as the
+                # base for every later reduction-percentage calculation) and
+                # silently skip the reduction warning chain.
+                is_mesh = exists and lod_obj.type == 'MESH'
                 face_count = 0
                 reduction_pct = None
 
-                if exists and lod_obj.type == 'MESH':
+                if is_mesh:
                     face_count = len(lod_obj.data.polygons)
                     if prev_faces and prev_faces > 0:
                         reduction_pct = round((1 - face_count / prev_faces) * 100, 1)
@@ -2032,8 +2090,11 @@ class BlenderMCPServer:
                     "lod": i,
                     "name": lod_name,
                     "exists": exists,
+                    "is_mesh": is_mesh,
                     "faces": face_count,
                 }
+                if exists and not is_mesh:
+                    lod_entry["warning"] = f"Object exists but is a {lod_obj.type}, not a MESH — not usable as a LOD"
                 if reduction_pct is not None:
                     lod_entry["reduction_from_prev_pct"] = reduction_pct
                     # Validate reduction is meaningful
@@ -2044,7 +2105,7 @@ class BlenderMCPServer:
                     prev_faces = face_count
 
             missing = [l["name"] for l in lods if not l["exists"]]
-            lod0_faces = lods[0]["faces"] if lods and lods[0]["exists"] else 0
+            lod0_faces = lods[0]["faces"] if lods and lods[0]["is_mesh"] else 0
 
             self._log("prepare_lod_names")
             return {
@@ -2257,7 +2318,10 @@ class BlenderMCPServer:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS)
+            # FIX: no timeout previously — a stalled connection hung Blender's
+            # thread indefinitely. Matches Sketchfab's already-correct
+            # convention elsewhere in this file.
+            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS, timeout=30)
             if response.status_code == 200:
                 return {"categories": response.json()}
             else:
@@ -2279,7 +2343,7 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            response = requests.get(url, params=params, headers=REQ_HEADERS)
+            response = requests.get(url, params=params, headers=REQ_HEADERS, timeout=30)
             if response.status_code == 200:
                 # Limit the response size to avoid overwhelming Blender
                 assets = response.json()
@@ -2299,7 +2363,7 @@ class BlenderMCPServer:
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
             # First get the files information
-            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS)
+            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS, timeout=30)
             if files_response.status_code != 200:
                 return {"error": f"Failed to get asset files: {files_response.status_code}"}
 
@@ -2319,7 +2383,7 @@ class BlenderMCPServer:
                     # since Blender can't properly load HDR data directly from memory
                     with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                         # Download the file
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=60)
                         if response.status_code != 200:
                             return {"error": f"Failed to download HDRI: {response.status_code}"}
 
@@ -2383,10 +2447,21 @@ class BlenderMCPServer:
                         # Set as active world
                         bpy.context.scene.world = world
 
-                        # Clean up temporary file
+                        # FIX: real leak — tempfile._cleanup() is a no-op for a
+                        # NamedTemporaryFile(delete=False); it only processes
+                        # TemporaryDirectory finalizers, so every HDRI download
+                        # (often tens of MB) permanently leaked into the OS temp
+                        # dir, silently, since the failure was also swallowed by
+                        # a bare except. Pack the image into the .blend first
+                        # (so Blender no longer needs the temp file on disk),
+                        # then actually delete it.
                         try:
-                            tempfile._cleanup()  # This will clean up all temporary files
-                        except:
+                            env_tex.image.pack()
+                        except Exception:
+                            pass
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
                             pass
 
                         return {
@@ -2395,6 +2470,10 @@ class BlenderMCPServer:
                             "image_name": env_tex.image.name
                         }
                     except Exception as e:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
                         return {"error": f"Failed to set up HDRI in Blender: {str(e)}"}
                 else:
                     return {"error": f"Requested resolution or format not available for this HDRI"}
@@ -2404,6 +2483,15 @@ class BlenderMCPServer:
                     file_format = "jpg"  # Default format for textures
 
                 downloaded_maps = {}
+                # FIX: this loop used to only ever act on status_code == 200 —
+                # a failed map download (e.g. the normal map) just silently
+                # never landed in downloaded_maps, and the function still
+                # returned "success": True with a materially incomplete PBR
+                # setup and no signal to the caller anything was missing.
+                # Also tracks maps that aren't available at the requested
+                # resolution/format at all, previously invisible too.
+                failed_maps = []
+                unavailable_maps = []
 
                 try:
                     for map_type in files_data:
@@ -2414,11 +2502,11 @@ class BlenderMCPServer:
 
                                 # Use NamedTemporaryFile like we do for HDRIs
                                 with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
+                                    tmp_path = tmp_file.name
                                     # Download the file
-                                    response = requests.get(file_url, headers=REQ_HEADERS)
+                                    response = requests.get(file_url, headers=REQ_HEADERS, timeout=60)
                                     if response.status_code == 200:
                                         tmp_file.write(response.content)
-                                        tmp_path = tmp_file.name
 
                                         # Load image from temporary file
                                         image = bpy.data.images.load(tmp_path)
@@ -2446,6 +2534,16 @@ class BlenderMCPServer:
                                             os.unlink(tmp_path)
                                         except:
                                             pass
+                                    else:
+                                        failed_maps.append({"map_type": map_type, "status_code": response.status_code})
+                                        # Nothing was written to tmp_file in this branch — still
+                                        # a real (empty) leaked file otherwise.
+                                        try:
+                                            os.unlink(tmp_path)
+                                        except Exception:
+                                            pass
+                            else:
+                                unavailable_maps.append(map_type)
 
                     if not downloaded_maps:
                         return {"error": f"No texture maps found for the requested resolution and format"}
@@ -2524,11 +2622,20 @@ class BlenderMCPServer:
 
                         y_pos -= 250
 
+                    # FIX: "success" now honestly reflects whether every
+                    # requested map actually downloaded — a material missing
+                    # its normal/roughness map because of a failed download
+                    # is NOT the same outcome as a fully complete PBR setup,
+                    # even though both used to report success:true identically.
                     return {
-                        "success": True,
-                        "message": f"Texture {asset_id} imported as material",
+                        "success": not failed_maps,
+                        "message": (f"Texture {asset_id} imported as material"
+                                    if not failed_maps else
+                                    f"Texture {asset_id} imported as material, but {len(failed_maps)} map(s) failed to download"),
                         "material": mat.name,
-                        "maps": list(downloaded_maps.keys())
+                        "maps": list(downloaded_maps.keys()),
+                        "failed_maps": failed_maps,
+                        "unavailable_maps": unavailable_maps,
                     }
 
                 except Exception as e:
@@ -2539,20 +2646,27 @@ class BlenderMCPServer:
                 if not file_format:
                     file_format = "gltf"  # Default format for models
 
-                if file_format in files_data and resolution in files_data[file_format]:
+                # FIX: checked two dict levels exist (file_format, resolution)
+                # but indexed a THIRD ([file_format] again, for the actual file
+                # entry) without checking it — a real KeyError risk caught only
+                # by the generic outer except, producing a confusing message
+                # instead of the clean "not available" message used elsewhere.
+                if (file_format in files_data and resolution in files_data[file_format]
+                        and file_format in files_data[file_format][resolution]):
                     file_info = files_data[file_format][resolution][file_format]
                     file_url = file_info["url"]
 
                     # Create a temporary directory to store the model and its dependencies
                     temp_dir = tempfile.mkdtemp()
                     main_file_path = ""
+                    failed_includes = []
 
                     try:
                         # Download the main model file
                         main_file_name = file_url.split("/")[-1]
                         main_file_path = os.path.join(temp_dir, main_file_name)
 
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=60)
                         if response.status_code != 200:
                             return {"error": f"Failed to download model: {response.status_code}"}
 
@@ -2570,12 +2684,17 @@ class BlenderMCPServer:
                                 os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
 
                                 # Download the included file
-                                include_response = requests.get(include_url, headers=REQ_HEADERS)
+                                include_response = requests.get(include_url, headers=REQ_HEADERS, timeout=60)
                                 if include_response.status_code == 200:
                                     with open(include_file_path, "wb") as f:
                                         f.write(include_response.content)
                                 else:
-                                    print(f"Failed to download included file: {include_path}")
+                                    # FIX: previously only print()'d to the Blender
+                                    # console — never surfaced in the returned dict,
+                                    # while the final result still claimed unqualified
+                                    # success even if textures the model needs never
+                                    # downloaded.
+                                    failed_includes.append({"path": include_path, "status_code": include_response.status_code})
 
                         # Import the model into Blender
                         if file_format == "gltf" or file_format == "glb":
@@ -2600,9 +2719,12 @@ class BlenderMCPServer:
                         imported_objects = [obj.name for obj in bpy.context.selected_objects]
 
                         return {
-                            "success": True,
-                            "message": f"Model {asset_id} imported successfully",
-                            "imported_objects": imported_objects
+                            "success": not failed_includes,
+                            "message": (f"Model {asset_id} imported successfully"
+                                        if not failed_includes else
+                                        f"Model {asset_id} imported, but {len(failed_includes)} dependency file(s) failed to download — textures may be missing"),
+                            "imported_objects": imported_objects,
+                            "failed_includes": failed_includes,
                         }
                     except Exception as e:
                         return {"error": f"Failed to import model: {str(e)}"}
@@ -3001,7 +3123,7 @@ class BlenderMCPServer:
             case "FAL_AI":
                 return self.create_rodin_job_fal_ai(*args, **kwargs)
             case _:
-                return f"Error: Unknown Hyper3D Rodin mode!"
+                return {"error": "Unknown Hyper3D Rodin mode!"}  # FIX: was a bare string, breaking the {"error": ...} convention every other error path in this file uses
 
     def create_rodin_job_main_site(
             self,
@@ -3070,34 +3192,64 @@ class BlenderMCPServer:
             case "FAL_AI":
                 return self.poll_rodin_job_status_fal_ai(*args, **kwargs)
             case _:
-                return f"Error: Unknown Hyper3D Rodin mode!"
+                return {"error": "Unknown Hyper3D Rodin mode!"}  # FIX: was a bare string, breaking the {"error": ...} convention every other error path in this file uses
 
     def poll_rodin_job_status_main_site(self, subscription_key: str):
         """Call the job status API to get the job status"""
-        response = requests.post(
-            "https://hyperhuman.deemos.com/api/v2/status",
-            headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
-            },
-            json={
-                "subscription_key": subscription_key,
-            },
-        )
-        data = response.json()
-        return {
-            "status_list": [i["status"] for i in data["jobs"]]
-        }
+        # FIX: this had no try/except, unlike every sibling function in this
+        # region — an error payload without a "jobs" key (bad key, rate
+        # limit, unknown subscription) raised an uncaught KeyError instead
+        # of the {"error": ...} convention used elsewhere in this file,
+        # crashing the handler rather than reporting failure.
+        #
+        # FIX: also normalizes the outer envelope to match
+        # poll_rodin_job_status_fal_ai's shape ({"status": ..., "raw": ...})
+        # so a caller doesn't have to special-case per backend to tell
+        # "the poll request itself worked" apart from "it failed." This
+        # does NOT attempt to map Rodin's actual per-job status strings
+        # (e.g. whatever "Done"/"Generating"/"Failed" values really are)
+        # into a invented running/done/failed vocabulary — that would be
+        # guessing semantics this file has no documentation for. status_list
+        # (the real per-job values) is preserved as-is for that reason.
+        try:
+            response = requests.post(
+                "https://hyperhuman.deemos.com/api/v2/status",
+                headers={
+                    "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                },
+                json={
+                    "subscription_key": subscription_key,
+                },
+                timeout=30,
+            )
+            data = response.json()
+            return {
+                "status": "ok",
+                "status_list": [i["status"] for i in data["jobs"]],
+                "raw": data,
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def poll_rodin_job_status_fal_ai(self, request_id: str):
         """Call the job status API to get the job status"""
+        # FIX: real bug — this was "KEY" (all caps) while create_rodin_job_fal_ai
+        # and import_generated_asset_fal_ai both correctly send "Key". A likely
+        # real, live-triggerable 401 on every FAL_AI poll while creation/import
+        # worked fine — an inconsistent failure mode that would have been
+        # confusing to debug from the outside.
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}/status",
             headers={
-                "Authorization": f"KEY {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
             },
+            timeout=30,
         )
-        data = response.json()
-        return data
+        try:
+            data = response.json()
+            return {"status": "ok", "raw": data}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     @staticmethod
     def _clean_imported_glb(filepath, mesh_name=None):
@@ -3173,7 +3325,7 @@ class BlenderMCPServer:
             case "FAL_AI":
                 return self.import_generated_asset_fal_ai(*args, **kwargs)
             case _:
-                return f"Error: Unknown Hyper3D Rodin mode!"
+                return {"error": "Unknown Hyper3D Rodin mode!"}  # FIX: was a bare string, breaking the {"error": ...} convention every other error path in this file uses
 
     def import_generated_asset_main_site(self, task_uuid: str, name: str):
         """Fetch the generated asset, import into blender"""
@@ -3184,7 +3336,8 @@ class BlenderMCPServer:
             },
             json={
                 'task_uuid': task_uuid
-            }
+            },
+            timeout=30,
         )
         data_ = response.json()
         temp_file = None
@@ -3198,7 +3351,7 @@ class BlenderMCPServer:
 
                 try:
                     # Download the content
-                    response = requests.get(i["url"], stream=True)
+                    response = requests.get(i["url"], stream=True, timeout=120)
                     response.raise_for_status()  # Raise an exception for HTTP errors
 
                     # Write the content to the temporary file
@@ -3218,6 +3371,11 @@ class BlenderMCPServer:
         else:
             return {"succeed": False, "error": "Generation failed. Please first make sure that all jobs of the task are done and then try again later."}
 
+        # FIX: real leak — os.unlink only ran in the download-failure branch
+        # above; the success path (import via _clean_imported_glb) never
+        # deleted the temp file, so every successful Hyper3D generation
+        # permanently leaked a .glb on disk. Now cleaned up unconditionally
+        # once the import step has consumed it, success or failure.
         try:
             obj = self._clean_imported_glb(
                 filepath=temp_file.name,
@@ -3240,6 +3398,11 @@ class BlenderMCPServer:
             }
         except Exception as e:
             return {"succeed": False, "error": str(e)}
+        finally:
+            try:
+                os.unlink(temp_file.name)
+            except Exception:
+                pass
 
     def import_generated_asset_fal_ai(self, request_id: str, name: str):
         """Fetch the generated asset, import into blender"""
@@ -3247,7 +3410,8 @@ class BlenderMCPServer:
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}",
             headers={
                 "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
-            }
+            },
+            timeout=30,
         )
         data_ = response.json()
         temp_file = None
@@ -3260,7 +3424,7 @@ class BlenderMCPServer:
 
         try:
             # Download the content
-            response = requests.get(data_["model_mesh"]["url"], stream=True)
+            response = requests.get(data_["model_mesh"]["url"], stream=True, timeout=120)
             response.raise_for_status()  # Raise an exception for HTTP errors
 
             # Write the content to the temporary file
@@ -3276,6 +3440,8 @@ class BlenderMCPServer:
             os.unlink(temp_file.name)
             return {"succeed": False, "error": str(e)}
 
+        # FIX: same real leak as import_generated_asset_main_site — the
+        # success path never deleted the temp .glb. Now always cleaned up.
         try:
             obj = self._clean_imported_glb(
                 filepath=temp_file.name,
@@ -3298,6 +3464,11 @@ class BlenderMCPServer:
             }
         except Exception as e:
             return {"succeed": False, "error": str(e)}
+        finally:
+            try:
+                os.unlink(temp_file.name)
+            except Exception:
+                pass
     #endregion
  
     #region Sketchfab API
@@ -3870,7 +4041,7 @@ class BlenderMCPServer:
             case "LOCAL_API":
                 return self.create_hunyuan_job_local_site(*args, **kwargs)
             case _:
-                return f"Error: Unknown Hunyuan3D mode!"
+                return {"error": "Unknown Hunyuan3D mode!"}  # FIX: same bare-string bug as the Rodin dispatchers
 
     def create_hunyuan_job_main_site(
         self,
@@ -3993,29 +4164,58 @@ class BlenderMCPServer:
             response = requests.post(
                 f"{base_url}/generate",
                 json = data,
+                timeout=300,
             )
 
             if response.status_code != 200:
                 return {
                     "error": f"Generation failed: {response.text}"
                 }
-        
+
             # Decode base64 and save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as temp_file:
                 temp_file.write(response.content)
                 temp_file_name = temp_file.name
 
-            # Import the GLB file in the main thread
+            # FIX: real bug — this used to return {"status": "DONE"}
+            # immediately, before the import below (deferred to the main
+            # thread via bpy.app.timers, since bpy.ops.import_scene.gltf
+            # can't run off-thread) had actually happened. If the import
+            # then failed, the exception was raised inside the timer
+            # callback, uncaught, and never reached the caller — who
+            # already believed the job succeeded. Now returns "IMPORTING"
+            # with a job_id, and the timer callback records the REAL
+            # outcome (success or the actual exception) for
+            # poll_hunyuan_job_status_local_site to report honestly.
+            job_id = str(uuid.uuid4())
+            _LOCAL_HUNYUAN_IMPORT_STATUS[job_id] = {"status": "IMPORTING"}
+
             def import_handler():
-                bpy.ops.import_scene.gltf(filepath=temp_file_name)
-                os.unlink(temp_file.name)
+                try:
+                    bpy.ops.import_scene.gltf(filepath=temp_file_name)
+                    _LOCAL_HUNYUAN_IMPORT_STATUS[job_id] = {
+                        "status": "DONE",
+                        "message": "Generation and Import glb succeeded",
+                    }
+                except Exception as e:
+                    _LOCAL_HUNYUAN_IMPORT_STATUS[job_id] = {
+                        "status": "ERROR",
+                        "error": f"Import failed: {e}",
+                    }
+                finally:
+                    try:
+                        os.unlink(temp_file_name)
+                    except Exception:
+                        pass
                 return None
-            
+
             bpy.app.timers.register(import_handler)
 
             return {
-                "status": "DONE",
-                "message": "Generation and Import glb succeeded"
+                "status": "IMPORTING",
+                "job_id": job_id,
+                "message": "Generation succeeded; import is running on the main thread — "
+                            "poll with poll_hunyuan_job_status_local_site(job_id) for the real outcome.",
             }
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -4023,8 +4223,27 @@ class BlenderMCPServer:
         
     
     def poll_hunyuan_job_status(self, *args, **kwargs):
-        return self.poll_hunyuan_job_status_ai(*args, **kwargs)
-    
+        # FIX: this used to unconditionally call poll_hunyuan_job_status_ai
+        # regardless of mode — LOCAL_API mode's job_id (from
+        # create_hunyuan_job_local_site) is a local uuid, not a Tencent
+        # Cloud job id, and was never routable to anything that could
+        # actually answer it. Mirrors create_hunyuan_job's own mode dispatch.
+        match bpy.context.scene.blendermcp_hunyuan3d_mode:
+            case "LOCAL_API":
+                return self.poll_hunyuan_job_status_local_site(*args, **kwargs)
+            case _:
+                return self.poll_hunyuan_job_status_ai(*args, **kwargs)
+
+    def poll_hunyuan_job_status_local_site(self, job_id: str):
+        """Real status for a create_hunyuan_job_local_site job — reads the
+        outcome the deferred import's bpy.app.timers callback recorded.
+        {"status": "IMPORTING"} until the callback has actually run on the
+        main thread; "DONE" or "ERROR" (with a real error detail) after."""
+        status = _LOCAL_HUNYUAN_IMPORT_STATUS.get(job_id)
+        if status is None:
+            return {"error": f"Unknown job_id: {job_id}"}
+        return status
+
     def poll_hunyuan_job_status_ai(self, job_id: str):
         """Call the job status API to get the job status"""
         print(job_id)
@@ -4106,11 +4325,27 @@ class BlenderMCPServer:
             if not osp.exists(obj_file_path):
                 return {"succeed": False, "error": "OBJ file not found after extraction"}
 
+            # Track images that exist before import so we can pack ONLY the
+            # ones this import just added — needed before the temp dir can
+            # be safely removed below (see FIX note in the finally block).
+            images_before_import = set(bpy.data.images.keys())
+
             # Import obj file
             if bpy.app.version>=(4, 0, 0):
                 bpy.ops.wm.obj_import(filepath=obj_file_path)
             else:
                 bpy.ops.import_scene.obj(filepath=obj_file_path)
+
+            # FIX: OBJ+MTL imports reference texture files by path on disk;
+            # Blender does NOT auto-pack them. Pack the newly-imported images
+            # into the .blend now, while the temp dir (and its textures)
+            # still exist, so removing the whole temp dir in `finally` below
+            # doesn't turn them into broken/missing-file references.
+            for img_name in set(bpy.data.images.keys()) - images_before_import:
+                try:
+                    bpy.data.images[img_name].pack()
+                except Exception:
+                    pass
 
             imported_objs = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
             if not imported_objs:
@@ -4136,12 +4371,13 @@ class BlenderMCPServer:
         except Exception as e:
             return {"succeed": False, "error": str(e)}
         finally:
-            #  Clean up temporary zip and obj, save texture and mtl
+            # FIX: real leak — this only ever removed the zip and the found
+            # .obj file; the mkdtemp() directory itself (with any .mtl/
+            # texture files) was left on disk permanently, once per call.
+            # Safe now because any imported images were packed into the
+            # .blend above before this runs.
             try:
-                if os.path.exists(zip_file_path):
-                    os.remove(zip_file_path) 
-                if os.path.exists(obj_file_path):
-                    os.remove(obj_file_path)
+                shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception as e:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
     #endregion
